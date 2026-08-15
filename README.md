@@ -30,13 +30,14 @@ Milestones 1 through 5 implement deterministic workspace snapshots, isolated and
 - Captures persistent changes across the complete guest root filesystem, including content, modes, types, symlink targets, and deletions.
 - Records raw and `.agentlabignore`-filtered deltas, stdout, stderr, nonzero exit status, lifecycle events, Docker evidence, requested captures, and integrity hashes.
 - Rejects image volumes and external writable mounts that would escape complete root-filesystem observation.
-- Supports concurrent independent runs and verifies whether two results share the same workspace, resolved image, portable base, and controlled inputs.
-- Compares arbitrary factor values against explicitly expected differences, including ordinary `replicate` labels, without assigning semantics to them.
+- Runs directly from either a mutable host directory (snapshotted at invocation) or an already stored snapshot digest.
+- Derives a canonical run-input identity from the actual snapshot, resolved image, command, resource/network policy, captures, ignore rules, backend, and AgentLab version.
+- Supports concurrent independent runs and verifies exact repetitions or reports which real controlled inputs differ.
 - Retains a stable container supervisor so stop/start never reruns the original agent command.
 - Supports integrity-checked harness continuation from the exact filesystem, while explicitly reporting that process memory was not restored.
 - Creates independent filesystem-level forks and deletes only the selected run's owned container, image tag, and local artifacts.
 - Invokes arbitrary external evaluators against integrity-checked results and records their command, output, status, stdout/stderr, and named JSON observations.
-- Aligns opaque factor values and evaluator score names into Markdown or JSON rows without aggregation, ranking, statistics, or causal claims.
+- Aligns actual run-input, workspace, image, portable-base identities, and evaluator score names into Markdown or JSON rows without aggregation, ranking, statistics, or causal claims.
 
 AgentLab does not attempt to make a transactionally consistent snapshot of a workspace that is being modified concurrently. It detects changes to regular files while reading them and asks the user to retry from a stable source.
 
@@ -87,17 +88,20 @@ Repeat the snapshot without changing the source. The snapshot digest will be ide
 
 Use `--json` with `snapshot` or `inspect` for machine-readable output.
 
-Run a harmless command against a private reconstruction of a workspace:
+Run a harmless command against a private reconstruction of the snapshot you just inspected:
 
 ```bash
+SNAPSHOT=$(./target/release/agentlab snapshot \
+  --workspace /path/to/workspace --json | jq -r .digest)
+
 ./target/release/agentlab run \
-  --workspace /path/to/workspace \
+  --snapshot "$SNAPSHOT" \
   --image ubuntu:24.04 \
   --network none \
   -- /bin/sh -c 'printf "guest only\n" > /workspace/agentlab-proof.txt'
 ```
 
-The summary includes a run ID, the command's exit code, the number of portable and ignored changes, and the retained container name. Inspect and verify the result, then view its normalized delta:
+`run --workspace /path/to/workspace` remains a convenience form: it takes a new snapshot at invocation and runs that result. Use `--snapshot DIGEST` when exact repetition matters. The summary includes a run ID, a canonical run-input digest, the command's exit code, the number of portable and ignored changes, and the retained container name. Inspect and verify the result, then view its normalized delta:
 
 ```bash
 ./target/release/agentlab inspect --verify RUN_ID
@@ -105,20 +109,35 @@ The summary includes a run ID, the command's exit code, the number of portable a
 ./target/release/agentlab diff --raw RUN_ID
 ```
 
-Use `--factor KEY=VALUE` to preserve arbitrary experimental factors, `--capture /guest/path=NAME` to export a selected path as a tar artifact, and `--change-ignore PATH` to override the workspace-root `.agentlabignore`. Network access defaults to `none`; Milestone 2 also accepts `--network bridge`.
+Use `--capture /guest/path=NAME` to export a selected path as a tar artifact and `--change-ignore PATH` to override the snapshotted workspace-root `.agentlabignore`. Network access defaults to `none`; Milestone 2 also accepts `--network bridge`.
 
 The container remains running under an inert shell supervisor after the initial `docker exec` command completes. This makes later stop/start truthful: restarting the container starts only the supervisor and never reruns the original command.
 
-Launch independent runs concurrently using ordinary processes, recording every experimental label as a factor. Then verify that only the intended factors differed:
+Launch independent runs concurrently using ordinary processes. Reuse one snapshot digest for repetitions; create a new snapshot only after making a real treatment change to the host workspace:
 
 ```bash
-./target/release/agentlab compare \
-  --expect-factor variant \
-  --expect-factor replicate \
-  LEFT_RUN_ID RIGHT_RUN_ID
+# Host workspace without the skill
+A=$(./target/release/agentlab snapshot --workspace /path/to/workspace --json | jq -r .digest)
+
+# Make the real change in the host workspace, then freeze that state too
+mkdir -p /path/to/workspace/skills/review
+cp ./SKILL.md /path/to/workspace/skills/review/SKILL.md
+B=$(./target/release/agentlab snapshot --workspace /path/to/workspace --json | jq -r .digest)
+
+./target/release/agentlab run --snapshot "$A" --image IMAGE -- HARNESS TASK  # A1
+./target/release/agentlab run --snapshot "$A" --image IMAGE -- HARNESS TASK  # A2
+./target/release/agentlab run --snapshot "$B" --image IMAGE -- HARNESS TASK  # B1
+./target/release/agentlab run --snapshot "$B" --image IMAGE -- HARNESS TASK  # B2
+
+./target/release/agentlab compare RUN_A1 RUN_A2
+./target/release/agentlab compare RUN_A1 RUN_B1
 ```
 
-`compare` integrity-checks both results before reporting whether their workspace snapshot, immutable image, exported prepared base, and controlled settings agree; whether their retained container identities are distinct; the exact factor differences; and whether their portable outcomes are equal. Factors absent from one side are reported with their missing value rather than normalized away.
+`compare` integrity-checks both results before reporting whether their complete run-input identity, workspace snapshot, immutable image, exported prepared base, and controlled settings agree; whether their retained container identities are distinct; which actual controlled fields differ; and whether their portable outcomes are equal. The first comparison above is a candidate `comparable_repetition`; the second is a `different_inputs` comparison whose workspace difference is factual rather than declared.
+
+The host workspace is the primary mutable thing under development. Stored snapshots are immutable test inputs. A later accepted baseline will be a small reference to a reviewed snapshot/image/result lineage—not a second “golden” host checkout.
+
+If the treatment must change something outside the workspace, prepare that state with the isolation backend and give AgentLab its immutable identity. With Docker today, enter a disposable container, make the change, commit it as a new image, and pass that image tag to `agentlab run`; AgentLab resolves and records the content digest. VM backends can follow the same model with a VM snapshot. Environment construction is deliberately outside the current primitive.
 
 Manage retained filesystem state:
 
@@ -174,12 +193,11 @@ Produce a row table from the latest successful matching evaluation for each run:
 ```bash
 ./target/release/agentlab report \
   --evaluator result-facts \
-  --factor variant --factor replicate \
   --score exit_zero --score portable_changes \
   RUN_A1 RUN_A2 RUN_B1 RUN_B2
 ```
 
-Use `--json` for machine-readable output. Reporting performs no averaging or statistical interpretation. Agent and external-service behavior may remain nondeterministic even with identical starting inputs, so meaningful experiments should use multiple replicates and interpret variance externally. See [examples/experiments.md](examples/experiments.md).
+The report identifies each row by its real run-input, workspace, resolved-image, and portable-base digests. Use `--json` for machine-readable output. Reporting performs no averaging or statistical interpretation. Agent and external-service behavior may remain nondeterministic even with identical starting inputs, so meaningful experiments should use repeated runs from the same snapshot and interpret variance externally. See [examples/experiments.md](examples/experiments.md).
 
 `agentlab evaluate` runs the selected command directly on the host with the current user's permissions; it is not an evaluator sandbox. Run only evaluator commands you trust. Post-execution integrity verification detects changes to AgentLab's immutable inputs, but it cannot prevent a malicious command from affecting other host resources.
 
@@ -221,7 +239,7 @@ cargo test --test milestone4 -- --ignored --nocapture
 cargo test --test milestone5 -- --ignored --nocapture
 ```
 
-The ordinary test suite covers deterministic snapshots without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity. The Milestone 3 Docker test launches overlapping runs from an identical Alpine base, forces conflicting writes, and proves distinct writable layers, exact factor preservation, comparable inputs, different private outcomes, and an unchanged source. The Milestone 4 test proves stable stop/start identity, session continuation and refreshed capture, full-rootfs continuation evidence, filesystem fork divergence, explicit memory disclaimers, and exact deletion while an unrelated control container survives. The Milestone 5 test runs a supplied external evaluator across a four-run factor/replicate matrix, verifies every evaluation, records invalid output explicitly, produces Markdown and JSON score tables, and preserves source immutability.
+The ordinary test suite covers deterministic snapshots without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity. The Milestone 3 Docker test launches overlapping runs from one stored Alpine-backed snapshot, forces conflicting writes, and proves distinct writable layers, equal run-input identities, comparable repetition, different private outcomes, and an unchanged source. The Milestone 4 test proves stable stop/start identity, session continuation and refreshed capture, full-rootfs continuation evidence, filesystem fork divergence, explicit memory disclaimers, and exact deletion while an unrelated control container survives. The Milestone 5 test creates real workspace snapshots without and with a skill directory, repeats each immutable input twice, runs a supplied external evaluator, verifies every evaluation, records invalid output explicitly, produces identity-and-score tables, and preserves source immutability.
 
 Lifecycle-capable images currently need `/bin/sh`, `sleep`, and `/bin/true`; typical Ubuntu, Alpine, and agent-development images satisfy this. Minimal `scratch`-style images fail explicitly because AgentLab cannot keep a stable supervisor inside them.
 

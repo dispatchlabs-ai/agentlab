@@ -1,12 +1,11 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 
 use agentlab::rootfs::RootFsManifest;
-use agentlab::run::{self, RunOptions, RunSummary};
+use agentlab::run::{self, RunOptions, RunSummary, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -39,7 +38,7 @@ impl Drop for DockerCleanup {
 
 #[test]
 #[ignore = "requires a running Docker engine"]
-fn concurrent_runs_are_isolated_and_comparable() -> Result<()> {
+fn concurrent_runs_from_one_snapshot_are_isolated_comparable_repetitions() -> Result<()> {
     ensure!(
         Command::new("docker")
             .arg("info")
@@ -67,10 +66,9 @@ count=$(find /workspace -maxdepth 1 -name 'owner-*' | wc -l | tr -d ' ')
 test "$count" = 1
 "#;
     let base_options = RunOptions {
-        workspace: workspace.clone(),
+        workspace: WorkspaceSource::Snapshot(source_before.clone()),
         image: "alpine:3.21".to_owned(),
         command: vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
-        factors: BTreeMap::new(),
         workspace_guest_path: "/workspace".to_owned(),
         network: "none".to_owned(),
         memory: None,
@@ -78,18 +76,8 @@ test "$count" = 1
         change_ignore: None,
         captures: Vec::new(),
     };
-    let mut left_options = base_options.clone();
-    left_options.factors = BTreeMap::from([
-        ("variant".to_owned(), "A".to_owned()),
-        ("replicate".to_owned(), "1".to_owned()),
-        ("opaque-label".to_owned(), "α".to_owned()),
-    ]);
-    let mut right_options = base_options;
-    right_options.factors = BTreeMap::from([
-        ("variant".to_owned(), "B".to_owned()),
-        ("replicate".to_owned(), "2".to_owned()),
-        ("opaque-label".to_owned(), "α".to_owned()),
-    ]);
+    let left_options = base_options.clone();
+    let right_options = base_options;
 
     let barrier = Arc::new(Barrier::new(2));
     let left_store = store.clone();
@@ -119,34 +107,40 @@ test "$count" = 1
     );
     ensure!(!workspace.join("conflict.txt").exists());
 
-    let comparison = run::compare_runs(
-        &store,
-        &left.run_id,
-        &right.run_id,
-        &["variant".to_owned(), "replicate".to_owned()],
-    )?;
+    let comparison = run::compare_runs(&store, &left.run_id, &right.run_id)?;
+    ensure!(comparison.same_run_input);
     ensure!(comparison.same_workspace_snapshot);
     ensure!(comparison.same_resolved_image);
     ensure!(comparison.same_portable_base);
     ensure!(comparison.distinct_private_containers);
     ensure!(comparison.controlled_input_differences.is_empty());
-    ensure!(comparison.only_expected_factors_differ);
+    ensure!(comparison.comparison_kind == "comparable_repetition");
     ensure!(comparison.comparable_repetition);
     ensure!(!comparison.portable_outcomes_equal);
-    ensure!(
-        comparison
-            .factor_differences
-            .get("variant")
-            .is_some_and(|difference| difference.left.as_deref() == Some("A")
-                && difference.right.as_deref() == Some("B"))
-    );
-    let incorrectly_declared =
-        run::compare_runs(&store, &left.run_id, &right.run_id, &["variant".to_owned()])?;
-    ensure!(!incorrectly_declared.only_expected_factors_differ);
-    ensure!(incorrectly_declared.unexpected_factor_differences == ["replicate"]);
+
+    let left_spec = run::load_spec(&store, &left.run_id)?;
+    let right_spec = run::load_spec(&store, &right.run_id)?;
+    ensure!(left_spec.schema_version == run::RUN_SCHEMA_VERSION);
+    ensure!(left_spec.run_input_digest == right_spec.run_input_digest);
+    ensure!(left_spec.run_input_digest == left.run_input_digest);
+    ensure!(left_spec.legacy_factors.is_empty());
+    let persisted_spec = String::from_utf8(store.read_run_file(&left.run_id, "spec.json")?)?;
+    ensure!(!persisted_spec.contains("\"factors\""));
 
     let left_result = run::load_result(&store, &left.run_id)?;
     let right_result = run::load_result(&store, &right.run_id)?;
+    ensure!(
+        left_result
+            .lifecycle
+            .iter()
+            .any(|event| event.event == "workspace_snapshot_loaded")
+    );
+    ensure!(
+        right_result
+            .lifecycle
+            .iter()
+            .any(|event| event.event == "workspace_snapshot_loaded")
+    );
     let command_interval = |result: &run::RunResult| -> Result<_> {
         let started = result
             .lifecycle

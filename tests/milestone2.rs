@@ -1,13 +1,12 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::process::Command;
 
 use agentlab::rootfs::ChangeKind;
-use agentlab::run::{self, CaptureSpec, RunOptions};
+use agentlab::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -102,10 +101,9 @@ exit 23
 "#;
     let summary = run::execute(
         &RunOptions {
-            workspace: workspace.clone(),
+            workspace: WorkspaceSource::Directory(workspace.clone()),
             image: "ubuntu:24.04".to_owned(),
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
-            factors: BTreeMap::from([("fixture".to_owned(), "whole-machine".to_owned())]),
             workspace_guest_path: "/workspace".to_owned(),
             network: "bridge".to_owned(),
             memory: Some("1g".to_owned()),

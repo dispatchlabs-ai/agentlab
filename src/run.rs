@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -16,22 +16,29 @@ use crate::rootfs::{self, ChangeKind, RootFsChange, RootFsManifest};
 use crate::snapshot;
 use crate::store::{Store, hex_digest};
 
-pub const RUN_SCHEMA_VERSION: &str = "agentlab.run/v1";
+pub const RUN_SCHEMA_VERSION: &str = "agentlab.run/v2";
+pub const LEGACY_RUN_SCHEMA_VERSION: &str = "agentlab.run/v1";
+pub const RUN_INPUT_SCHEMA_VERSION: &str = "agentlab.run-input/v1";
 pub const DELTA_SCHEMA_VERSION: &str = "agentlab.delta/v1";
 pub const RESULT_SCHEMA_VERSION: &str = "agentlab.result/v1";
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
-    pub workspace: PathBuf,
+    pub workspace: WorkspaceSource,
     pub image: String,
     pub command: Vec<String>,
-    pub factors: BTreeMap<String, String>,
     pub workspace_guest_path: String,
     pub network: String,
     pub memory: Option<String>,
     pub cpus: Option<String>,
     pub change_ignore: Option<PathBuf>,
     pub captures: Vec<CaptureSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSource {
+    Directory(PathBuf),
+    Snapshot(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +66,8 @@ pub struct IgnoreIdentity {
 pub struct RunSpec {
     pub schema_version: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_input_digest: String,
     pub workspace_snapshot_digest: String,
     pub image_requested: String,
     pub image_resolved_digest: String,
@@ -67,7 +76,12 @@ pub struct RunSpec {
     pub workspace_guest_path: String,
     pub command: Vec<String>,
     pub working_directory: String,
-    pub factors: BTreeMap<String, String>,
+    #[serde(
+        default,
+        rename = "factors",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub legacy_factors: BTreeMap<String, String>,
     pub resource_limits: ResourceLimits,
     pub network_policy: String,
     pub captures: Vec<CaptureSpec>,
@@ -159,6 +173,7 @@ pub struct RunResult {
 pub struct RunSummary {
     pub run_id: String,
     pub result_digest: String,
+    pub run_input_digest: String,
     pub workspace_snapshot_digest: String,
     pub image_resolved_digest: String,
     pub exit_code: i64,
@@ -169,29 +184,40 @@ pub struct RunSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FactorDifference {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub left: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub right: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunComparison {
     pub left_run_id: String,
     pub right_run_id: String,
+    pub left_run_input_digest: String,
+    pub right_run_input_digest: String,
+    pub same_run_input: bool,
     pub same_workspace_snapshot: bool,
     pub same_resolved_image: bool,
     pub same_portable_base: bool,
     pub distinct_private_containers: bool,
     pub controlled_input_differences: Vec<String>,
-    pub factor_differences: BTreeMap<String, FactorDifference>,
-    pub expected_factor_differences: Vec<String>,
-    pub missing_expected_factor_differences: Vec<String>,
-    pub unexpected_factor_differences: Vec<String>,
-    pub only_expected_factors_differ: bool,
+    pub comparison_kind: String,
     pub comparable_repetition: bool,
     pub portable_outcomes_equal: bool,
+}
+
+#[derive(Serialize)]
+struct RunInputIdentity<'a> {
+    schema_version: &'static str,
+    workspace_snapshot_digest: &'a str,
+    image_resolved_digest: &'a str,
+    target_platform: &'a str,
+    workspace_guest_path: &'a str,
+    command: &'a [String],
+    working_directory: &'a str,
+    resource_limits: &'a ResourceLimits,
+    network_policy: &'a str,
+    captures: &'a [CaptureSpec],
+    secret_injections: &'a [String],
+    workspace_ignore_digest: &'a str,
+    change_ignore_digest: &'a str,
+    backend_name: &'a str,
+    backend_version: &'a str,
+    agentlab_version: &'a str,
 }
 
 #[derive(Serialize)]
@@ -228,6 +254,7 @@ struct ResultIdentity<'a> {
 
 struct ResolvedImage {
     resolved_digest: String,
+    execution_reference: String,
     docker_image_id: String,
     platform: String,
     inspect: Vec<u8>,
@@ -263,16 +290,29 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     let run_directory = store.create_run_directory(&run_id)?;
     let mut lifecycle = vec![event("run_created")];
 
-    let workspace_snapshot = snapshot::create(&options.workspace, store)?;
-    lifecycle.push(event("workspace_snapshotted"));
+    let (workspace_manifest, workspace_warnings) = match &options.workspace {
+        WorkspaceSource::Directory(workspace) => {
+            let captured = snapshot::create(workspace, store)?;
+            lifecycle.push(event("workspace_snapshotted"));
+            (captured.manifest, captured.warnings)
+        }
+        WorkspaceSource::Snapshot(digest) => {
+            let manifest = snapshot::load(store, digest)?;
+            snapshot::verify(store, &manifest)?;
+            lifecycle.push(event("workspace_snapshot_loaded"));
+            (manifest, Vec::new())
+        }
+    };
     let resolved_image = resolve_image(&options.image)?;
     lifecycle.push(event("image_resolved"));
-    let (change_ignore, change_ignore_rules) = resolve_change_ignore(options)?;
+    let (change_ignore, change_ignore_rules) =
+        resolve_change_ignore(options, &workspace_manifest, store)?;
 
-    let spec = RunSpec {
+    let mut spec = RunSpec {
         schema_version: RUN_SCHEMA_VERSION.to_string(),
         run_id: run_id.clone(),
-        workspace_snapshot_digest: workspace_snapshot.manifest.digest.clone(),
+        run_input_digest: String::new(),
+        workspace_snapshot_digest: workspace_manifest.digest.clone(),
         image_requested: options.image.clone(),
         image_resolved_digest: resolved_image.resolved_digest.clone(),
         docker_image_id: resolved_image.docker_image_id.clone(),
@@ -280,7 +320,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         workspace_guest_path: options.workspace_guest_path.clone(),
         command: options.command.clone(),
         working_directory: options.workspace_guest_path.clone(),
-        factors: options.factors.clone(),
+        legacy_factors: BTreeMap::new(),
         resource_limits: ResourceLimits {
             memory: options.memory.clone(),
             cpus: options.cpus.clone(),
@@ -288,12 +328,13 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         network_policy: options.network.clone(),
         captures: options.captures.clone(),
         secret_injections: Vec::new(),
-        workspace_ignore_digest: workspace_snapshot.manifest.ignore_rules_digest.clone(),
+        workspace_ignore_digest: workspace_manifest.ignore_rules_digest.clone(),
         change_ignore: change_ignore.clone(),
         backend_name: "docker-cli".to_string(),
         backend_version: docker_version()?,
         agentlab_version: VERSION.to_string(),
     };
+    spec.run_input_digest = compute_run_input_digest(&spec)?;
     let spec_bytes = pretty_json(&spec)?;
     let spec_digest = sha256_bytes(&spec_bytes);
     store.write_run_file(&run_id, "spec.json", &spec_bytes)?;
@@ -307,7 +348,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     }
 
     let materialized = tempfile::tempdir().context("create private materialization directory")?;
-    snapshot::materialize(store, &workspace_snapshot.manifest, materialized.path())?;
+    snapshot::materialize(store, &workspace_manifest, materialized.path())?;
     lifecycle.push(event("workspace_materialized"));
 
     let compact_id = run_id.replace('-', "");
@@ -326,7 +367,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         Command::new("docker")
             .args(["create", "--name", &preparation_name])
             .args(["--label", &format!("agentlab.run_id={run_id}")])
-            .args([&resolved_image.resolved_digest, "/bin/true"]),
+            .args([&resolved_image.execution_reference, "/bin/true"]),
         "create preparation container",
     )?;
     lifecycle.push(event("preparation_container_created"));
@@ -476,7 +517,10 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     lifecycle.push(event("portable_rootfs_manifests_created"));
 
     let all_changes = rootfs::compare(&base_manifest, &result_manifest);
-    let ignored_paths = evaluate_change_ignore(options, &all_changes)?;
+    let ignored_paths = match &change_ignore_rules {
+        Some(rules) => evaluate_change_ignore_bytes(rules, &all_changes)?,
+        None => HashSet::new(),
+    };
     let mut portable_changes = Vec::new();
     let mut ignored_changes = Vec::new();
     for change in &all_changes {
@@ -513,7 +557,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     let base_export = artifact_for_file("artifacts/base-rootfs.tar", &base_export_path)?;
     let result_export = artifact_for_file("artifacts/result-rootfs.tar", &result_export_path)?;
     let uncovered = uncovered_by_docker_diff(&all_changes, &docker_diff_bytes);
-    let mut warnings = workspace_snapshot.warnings;
+    let mut warnings = workspace_warnings;
     if !uncovered.is_empty() {
         warnings.push(format!(
             "{} normalized rootfs changes were not covered by a Docker diff path; see docker_diff_uncovered_changes",
@@ -626,7 +670,8 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     Ok(RunSummary {
         run_id,
         result_digest,
-        workspace_snapshot_digest: workspace_snapshot.manifest.digest,
+        run_input_digest: spec.run_input_digest,
+        workspace_snapshot_digest: workspace_manifest.digest,
         image_resolved_digest: resolved_image.resolved_digest,
         exit_code,
         changes: portable_delta.changes.len(),
@@ -642,7 +687,25 @@ pub fn load_result(store: &Store, run_id: &str) -> Result<RunResult> {
 }
 
 pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
-    serde_json::from_slice(&store.read_run_file(run_id, "spec.json")?).context("decode run spec")
+    let spec: RunSpec = serde_json::from_slice(&store.read_run_file(run_id, "spec.json")?)
+        .context("decode run spec")?;
+    if !matches!(
+        spec.schema_version.as_str(),
+        RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION
+    ) {
+        bail!(
+            "unsupported run specification schema {:?}",
+            spec.schema_version
+        );
+    }
+    let computed = compute_run_input_digest(&spec)?;
+    if spec.schema_version == RUN_SCHEMA_VERSION && spec.run_input_digest != computed {
+        bail!(
+            "run input identity mismatch: recorded {}, computed {computed}",
+            spec.run_input_digest
+        );
+    }
+    Ok(spec)
 }
 
 pub fn load_delta(store: &Store, run_id: &str, raw: bool) -> Result<DeltaManifest> {
@@ -654,6 +717,17 @@ pub fn load_delta(store: &Store, run_id: &str, raw: bool) -> Result<DeltaManifes
 pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
     if result.schema_version != RESULT_SCHEMA_VERSION {
         bail!("unsupported run result schema {:?}", result.schema_version);
+    }
+    let spec = load_spec(store, &result.run_id)?;
+    if spec.run_id != result.run_id {
+        bail!("run specification and result IDs do not agree");
+    }
+    let actual_spec_digest = sha256_bytes(&store.read_run_file(&result.run_id, "spec.json")?);
+    if actual_spec_digest != result.run_spec_digest {
+        bail!(
+            "run specification digest mismatch: result records {}, got {actual_spec_digest}",
+            result.run_spec_digest
+        );
     }
     for (relative, expected) in &result.integrity {
         let bytes = store
@@ -696,12 +770,7 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
     Ok(())
 }
 
-pub fn compare_runs(
-    store: &Store,
-    left_run_id: &str,
-    right_run_id: &str,
-    expected_factor_differences: &[String],
-) -> Result<RunComparison> {
+pub fn compare_runs(store: &Store, left_run_id: &str, right_run_id: &str) -> Result<RunComparison> {
     if left_run_id == right_run_id {
         bail!("compare requires two distinct runs");
     }
@@ -733,12 +802,6 @@ pub fn compare_runs(
         "target_platform",
         &left.target_platform,
         &right.target_platform,
-    );
-    compare_field(
-        &mut controlled,
-        "docker_image_id",
-        &left.docker_image_id,
-        &right.docker_image_id,
     );
     compare_field(
         &mut controlled,
@@ -780,9 +843,9 @@ pub fn compare_runs(
     );
     compare_field(
         &mut controlled,
-        "change_ignore",
-        &left.change_ignore,
-        &right.change_ignore,
+        "change_ignore_digest",
+        &left.change_ignore.digest,
+        &right.change_ignore.digest,
     );
     compare_field(
         &mut controlled,
@@ -803,32 +866,9 @@ pub fn compare_runs(
         &right.agentlab_version,
     );
 
-    let factor_keys: BTreeSet<_> = left.factors.keys().chain(right.factors.keys()).collect();
-    let mut factor_differences = BTreeMap::new();
-    for key in factor_keys {
-        let left_value = left.factors.get(key);
-        let right_value = right.factors.get(key);
-        if left_value != right_value {
-            factor_differences.insert(
-                key.clone(),
-                FactorDifference {
-                    left: left_value.cloned(),
-                    right: right_value.cloned(),
-                },
-            );
-        }
-    }
-    let expected: BTreeSet<_> = expected_factor_differences.iter().cloned().collect();
-    if expected.len() != expected_factor_differences.len() {
-        bail!("duplicate --expect-factor key");
-    }
-    let actual: BTreeSet<_> = factor_differences.keys().cloned().collect();
-    let missing_expected_factor_differences: Vec<_> =
-        expected.difference(&actual).cloned().collect();
-    let unexpected_factor_differences: Vec<_> = actual.difference(&expected).cloned().collect();
-    let only_expected_factors_differ = controlled.is_empty()
-        && missing_expected_factor_differences.is_empty()
-        && unexpected_factor_differences.is_empty();
+    let left_run_input_digest = compute_run_input_digest(&left)?;
+    let right_run_input_digest = compute_run_input_digest(&right)?;
+    let same_run_input = left_run_input_digest == right_run_input_digest;
     let same_workspace_snapshot = left.workspace_snapshot_digest == right.workspace_snapshot_digest;
     let same_resolved_image = left.image_resolved_digest == right.image_resolved_digest;
     let same_portable_base =
@@ -837,27 +877,57 @@ pub fn compare_runs(
         != right_result.docker.retained_container_id
         && left_result.docker.retained_container_name
             != right_result.docker.retained_container_name;
+    let comparable_repetition = same_run_input
+        && controlled.is_empty()
+        && same_workspace_snapshot
+        && same_resolved_image
+        && same_portable_base
+        && distinct_private_containers;
+    let comparison_kind = if comparable_repetition {
+        "comparable_repetition"
+    } else if !same_run_input || !controlled.is_empty() {
+        "different_inputs"
+    } else {
+        "same_inputs_not_independent"
+    };
     Ok(RunComparison {
         left_run_id: left_run_id.to_owned(),
         right_run_id: right_run_id.to_owned(),
+        left_run_input_digest,
+        right_run_input_digest,
+        same_run_input,
         same_workspace_snapshot,
         same_resolved_image,
         same_portable_base,
         distinct_private_containers,
         controlled_input_differences: controlled,
-        factor_differences,
-        expected_factor_differences: expected.into_iter().collect(),
-        missing_expected_factor_differences,
-        unexpected_factor_differences,
-        only_expected_factors_differ,
-        comparable_repetition: only_expected_factors_differ
-            && same_workspace_snapshot
-            && same_resolved_image
-            && same_portable_base
-            && distinct_private_containers,
+        comparison_kind: comparison_kind.to_owned(),
+        comparable_repetition,
         portable_outcomes_equal: left_result.result_filesystem_digest
             == right_result.result_filesystem_digest,
     })
+}
+
+pub fn compute_run_input_digest(spec: &RunSpec) -> Result<String> {
+    let identity = RunInputIdentity {
+        schema_version: RUN_INPUT_SCHEMA_VERSION,
+        workspace_snapshot_digest: &spec.workspace_snapshot_digest,
+        image_resolved_digest: &spec.image_resolved_digest,
+        target_platform: &spec.target_platform,
+        workspace_guest_path: &spec.workspace_guest_path,
+        command: &spec.command,
+        working_directory: &spec.working_directory,
+        resource_limits: &spec.resource_limits,
+        network_policy: &spec.network_policy,
+        captures: &spec.captures,
+        secret_injections: &spec.secret_injections,
+        workspace_ignore_digest: &spec.workspace_ignore_digest,
+        change_ignore_digest: &spec.change_ignore.digest,
+        backend_name: &spec.backend_name,
+        backend_version: &spec.backend_version,
+        agentlab_version: &spec.agentlab_version,
+    };
+    Ok(sha256_bytes(&serde_json::to_vec(&identity)?))
 }
 
 fn compare_field<T: PartialEq>(differences: &mut Vec<String>, name: &str, left: &T, right: &T) {
@@ -872,9 +942,6 @@ fn validate_options(options: &RunOptions) -> Result<()> {
     }
     if options.command.is_empty() {
         bail!("run requires a command after --");
-    }
-    if options.factors.keys().any(String::is_empty) {
-        bail!("factor keys cannot be empty");
     }
     validate_guest_path(&options.workspace_guest_path)?;
     if !matches!(options.network.as_str(), "none" | "bridge") {
@@ -943,15 +1010,20 @@ fn resolve_image(image: &str) -> Result<ResolvedImage> {
         .map(str::to_string)
         .collect();
     repo_digests.sort();
-    let resolved_digest = repo_digests
+    let execution_reference = repo_digests
         .into_iter()
         .next()
         .unwrap_or_else(|| docker_image_id.clone());
+    let resolved_digest = execution_reference
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.to_owned())
+        .unwrap_or_else(|| execution_reference.clone());
     let os = image_value["Os"].as_str().unwrap_or("unknown");
     let architecture = image_value["Architecture"].as_str().unwrap_or("unknown");
     let variant = image_value["Variant"].as_str().unwrap_or("");
     Ok(ResolvedImage {
         resolved_digest,
+        execution_reference,
         docker_image_id,
         platform: if variant.is_empty() {
             format!("{os}/{architecture}")
@@ -1011,9 +1083,29 @@ pub(crate) fn container_status(inspect: &[u8]) -> Result<(i64, String)> {
     ))
 }
 
-fn resolve_change_ignore(options: &RunOptions) -> Result<(IgnoreIdentity, Option<Vec<u8>>)> {
-    let path = change_ignore_path(options);
-    let Some(path) = path else {
+fn resolve_change_ignore(
+    options: &RunOptions,
+    workspace: &snapshot::Manifest,
+    store: &Store,
+) -> Result<(IgnoreIdentity, Option<Vec<u8>>)> {
+    let (source, bytes) = if let Some(path) = &options.change_ignore {
+        (
+            path.display().to_string(),
+            fs::read(path)
+                .with_context(|| format!("read change-ignore rules {}", path.display()))?,
+        )
+    } else if let Some(entry) = workspace
+        .entries
+        .iter()
+        .find(|entry| entry.path == ".agentlabignore" && entry.kind == "file")
+    {
+        let mut bytes = Vec::new();
+        store
+            .open_blob(&entry.digest)?
+            .read_to_end(&mut bytes)
+            .context("read snapshotted .agentlabignore")?;
+        ("workspace:.agentlabignore".to_owned(), bytes)
+    } else {
         return Ok((
             IgnoreIdentity {
                 source: None,
@@ -1022,32 +1114,13 @@ fn resolve_change_ignore(options: &RunOptions) -> Result<(IgnoreIdentity, Option
             None,
         ));
     };
-    let bytes =
-        fs::read(&path).with_context(|| format!("read change-ignore rules {}", path.display()))?;
     Ok((
         IgnoreIdentity {
-            source: Some(path.display().to_string()),
+            source: Some(source),
             digest: format!("sha256:{}", hex_digest(&Sha256::digest(&bytes))),
         },
         Some(bytes),
     ))
-}
-
-fn change_ignore_path(options: &RunOptions) -> Option<PathBuf> {
-    options.change_ignore.clone().or_else(|| {
-        let candidate = options.workspace.join(".agentlabignore");
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-fn evaluate_change_ignore(
-    options: &RunOptions,
-    changes: &[RootFsChange],
-) -> Result<HashSet<String>> {
-    let Some(path) = change_ignore_path(options) else {
-        return Ok(HashSet::new());
-    };
-    evaluate_change_ignore_bytes(&fs::read(path)?, changes)
 }
 
 pub(crate) fn evaluate_change_ignore_bytes(

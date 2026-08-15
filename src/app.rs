@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::VERSION;
 use crate::evaluation;
 use crate::lifecycle;
-use crate::run::{self, CaptureSpec, RunOptions};
+use crate::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
 use crate::snapshot::{self, Repository};
 use crate::store::Store;
 
@@ -132,7 +132,6 @@ fn evaluate_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> 
 
 fn report_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut evaluator_name = None;
-    let mut factors = Vec::new();
     let mut scores = Vec::new();
     let mut run_ids = Vec::new();
     let mut json = false;
@@ -143,15 +142,15 @@ fn report_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 evaluator_name =
                     Some(required_value(arguments, &mut index, "--evaluator")?.to_owned())
             }
-            "--factor" => {
-                factors.push(required_value(arguments, &mut index, "--factor")?.to_owned())
-            }
+            "--factor" => bail!(
+                "--factor was removed; reports identify real run-input, workspace, image, and portable-base identities"
+            ),
             "--score" => scores.push(required_value(arguments, &mut index, "--score")?.to_owned()),
             "--json" => json = true,
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab report [--evaluator NAME] [--factor KEY]... [--score KEY]... [--json] RUN..."
+                    "usage: agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN..."
                 )?;
                 return Ok(());
             }
@@ -161,13 +160,7 @@ fn report_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         index += 1;
     }
     let store = Store::open(None)?;
-    let table = evaluation::table(
-        &store,
-        &run_ids,
-        evaluator_name.as_deref(),
-        &factors,
-        &scores,
-    )?;
+    let table = evaluation::table(&store, &run_ids, evaluator_name.as_deref(), &scores)?;
     if json {
         serde_json::to_writer_pretty(&mut *stdout, &table)?;
         writeln!(stdout)?;
@@ -385,11 +378,12 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         bail!("run requires a command after `--`");
     }
 
+    let mut workspace = None;
+    let mut snapshot = None;
     let mut parsed = RunOptions {
-        workspace: PathBuf::from("."),
+        workspace: WorkspaceSource::Directory(PathBuf::from(".")),
         image: String::new(),
         command: command.to_vec(),
-        factors: std::collections::BTreeMap::new(),
         workspace_guest_path: "/workspace".to_owned(),
         network: "none".to_owned(),
         memory: None,
@@ -402,8 +396,20 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     while index < options.len() {
         match options[index].as_str() {
             "--workspace" => {
-                parsed.workspace =
-                    PathBuf::from(required_value(options, &mut index, "--workspace")?)
+                if snapshot.is_some() {
+                    bail!("--workspace and --snapshot are mutually exclusive");
+                }
+                workspace = Some(PathBuf::from(required_value(
+                    options,
+                    &mut index,
+                    "--workspace",
+                )?));
+            }
+            "--snapshot" => {
+                if workspace.is_some() {
+                    bail!("--workspace and --snapshot are mutually exclusive");
+                }
+                snapshot = Some(required_value(options, &mut index, "--snapshot")?.to_owned());
             }
             "--image" => parsed.image = required_value(options, &mut index, "--image")?.to_owned(),
             "--workspace-path" => {
@@ -419,22 +425,9 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--cpus" => {
                 parsed.cpus = Some(required_value(options, &mut index, "--cpus")?.to_owned())
             }
-            "--factor" => {
-                let value = required_value(options, &mut index, "--factor")?;
-                let (key, value) = value
-                    .split_once('=')
-                    .ok_or_else(|| anyhow::anyhow!("--factor requires KEY=VALUE"))?;
-                if key.is_empty() {
-                    bail!("--factor key cannot be empty");
-                }
-                if parsed
-                    .factors
-                    .insert(key.to_owned(), value.to_owned())
-                    .is_some()
-                {
-                    bail!("duplicate --factor key {key:?}");
-                }
-            }
+            "--factor" => bail!(
+                "--factor was removed; vary a real workspace snapshot, image, command, or runtime input instead"
+            ),
             "--change-ignore" => {
                 parsed.change_ignore = Some(PathBuf::from(required_value(
                     options,
@@ -456,7 +449,7 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab run --image IMAGE [--workspace PATH] [--factor KEY=VALUE] [--workspace-path PATH] [--network MODE] [--memory LIMIT] [--cpus COUNT] [--change-ignore GLOB] [--capture GUEST_PATH=NAME] [--json] -- COMMAND [ARG ...]"
+                    "usage: agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [--workspace-path PATH] [--network MODE] [--memory LIMIT] [--cpus COUNT] [--change-ignore PATH] [--capture GUEST_PATH=NAME] [--json] -- COMMAND [ARG ...]"
                 )?;
                 return Ok(());
             }
@@ -467,6 +460,10 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     if parsed.image.is_empty() {
         bail!("run requires --image IMAGE");
     }
+    parsed.workspace = match snapshot {
+        Some(digest) => WorkspaceSource::Snapshot(digest),
+        None => WorkspaceSource::Directory(workspace.unwrap_or_else(|| PathBuf::from("."))),
+    };
 
     let store = Store::open(None)?;
     let result = run::execute(&parsed, &store)?;
@@ -476,6 +473,7 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     } else {
         writeln!(stdout, "Run: {}", result.run_id)?;
         writeln!(stdout, "Exit code: {}", result.exit_code)?;
+        writeln!(stdout, "Run input: {}", result.run_input_digest)?;
         writeln!(stdout, "Snapshot: {}", result.workspace_snapshot_digest)?;
         writeln!(stdout, "Portable changes: {}", result.changes)?;
         writeln!(stdout, "Ignored changes: {}", result.ignored_changes)?;
@@ -493,17 +491,17 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut json = false;
     let mut run_ids = Vec::new();
-    let mut expected_factors = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--json" => json = true,
-            "--expect-factor" => expected_factors
-                .push(required_value(arguments, &mut index, "--expect-factor")?.to_owned()),
+            "--expect-factor" => bail!(
+                "--expect-factor was removed; compare reports differences in actual resolved inputs"
+            ),
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN"
+                    "usage: agentlab compare [--json] LEFT_RUN RIGHT_RUN"
                 )?;
                 return Ok(());
             }
@@ -515,11 +513,8 @@ fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     if run_ids.len() != 2 {
         bail!("compare requires LEFT_RUN and RIGHT_RUN");
     }
-    if expected_factors.iter().any(String::is_empty) {
-        bail!("--expect-factor key cannot be empty");
-    }
     let store = Store::open(None)?;
-    let comparison = run::compare_runs(&store, run_ids[0], run_ids[1], &expected_factors)?;
+    let comparison = run::compare_runs(&store, run_ids[0], run_ids[1])?;
     if json {
         serde_json::to_writer_pretty(&mut *stdout, &comparison)?;
         writeln!(stdout)?;
@@ -530,6 +525,8 @@ fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         "Runs: {} <> {}",
         comparison.left_run_id, comparison.right_run_id
     )?;
+    writeln!(stdout, "Comparison: {}", comparison.comparison_kind)?;
+    writeln!(stdout, "Same run input: {}", comparison.same_run_input)?;
     writeln!(
         stdout,
         "Same workspace snapshot: {}",
@@ -554,32 +551,6 @@ fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         stdout,
         "Controlled-input differences: {}",
         display_names(&comparison.controlled_input_differences)
-    )?;
-    writeln!(
-        stdout,
-        "Factor differences: {}",
-        display_names(
-            &comparison
-                .factor_differences
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-        )
-    )?;
-    writeln!(
-        stdout,
-        "Missing expected factors: {}",
-        display_names(&comparison.missing_expected_factor_differences)
-    )?;
-    writeln!(
-        stdout,
-        "Unexpected factor differences: {}",
-        display_names(&comparison.unexpected_factor_differences)
-    )?;
-    writeln!(
-        stdout,
-        "Only expected factors differ: {}",
-        comparison.only_expected_factors_differ
     )?;
     writeln!(
         stdout,
@@ -878,7 +849,7 @@ fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 fn print_help(output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
-        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--factor KEY]... [--score KEY]... [--json] RUN...\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, and evaluation metadata\n  diff        show normalized persistent filesystem changes\n  compare     verify controlled inputs and expected factor differences\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align factors and evaluator scores without interpreting them\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not. Evaluator scores are observations, not universal judgments."
+        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, and evaluation metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not. Evaluator scores are observations, not universal judgments."
     )?;
     Ok(())
 }

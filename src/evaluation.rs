@@ -48,7 +48,6 @@ pub struct EvaluationRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvaluationTable {
-    pub factor_columns: Vec<String>,
     pub score_columns: Vec<String>,
     pub rows: Vec<EvaluationTableRow>,
     pub warnings: Vec<String>,
@@ -60,7 +59,10 @@ pub struct EvaluationTableRow {
     pub evaluation_id: String,
     pub evaluator_name: String,
     pub result_digest: String,
-    pub factors: BTreeMap<String, String>,
+    pub run_input_digest: String,
+    pub workspace_snapshot_digest: String,
+    pub image_resolved_digest: String,
+    pub base_filesystem_digest: String,
     pub scores: BTreeMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -284,16 +286,13 @@ pub fn table(
     store: &Store,
     run_ids: &[String],
     evaluator_name: Option<&str>,
-    requested_factors: &[String],
     requested_scores: &[String],
 ) -> Result<EvaluationTable> {
     if run_ids.is_empty() {
         bail!("report requires at least one RUN");
     }
-    reject_duplicates("--factor", requested_factors)?;
     reject_duplicates("--score", requested_scores)?;
     let mut selected = Vec::new();
-    let mut all_factors = BTreeSet::new();
     let mut all_scores = BTreeSet::new();
     for run_id in run_ids {
         let spec: RunSpec = run::load_spec(store, run_id)?;
@@ -318,36 +317,26 @@ pub fn table(
             .output
             .as_ref()
             .context("successful evaluation omitted structured output")?;
-        all_factors.extend(spec.factors.keys().cloned());
         all_scores.extend(payload.scores.keys().cloned());
-        selected.push((spec, record));
+        selected.push((spec, result, record));
     }
-    let factor_columns = if requested_factors.is_empty() {
-        all_factors.into_iter().collect()
-    } else {
-        requested_factors.to_vec()
-    };
     let score_columns = if requested_scores.is_empty() {
         all_scores.into_iter().collect()
     } else {
         requested_scores.to_vec()
     };
     let mut rows = Vec::new();
-    for (spec, record) in selected {
+    for (spec, result, record) in selected {
         let payload = record.output.as_ref().expect("validated payload");
         rows.push(EvaluationTableRow {
             run_id: record.run_id.clone(),
             evaluation_id: record.evaluation_id.clone(),
             evaluator_name: record.evaluator_name.clone(),
             result_digest: record.result_digest.clone(),
-            factors: factor_columns
-                .iter()
-                .filter_map(|key| {
-                    spec.factors
-                        .get(key)
-                        .map(|value| (key.clone(), value.clone()))
-                })
-                .collect(),
+            run_input_digest: run::compute_run_input_digest(&spec)?,
+            workspace_snapshot_digest: spec.workspace_snapshot_digest,
+            image_resolved_digest: spec.image_resolved_digest,
+            base_filesystem_digest: result.base_filesystem_digest,
             scores: score_columns
                 .iter()
                 .filter_map(|key| {
@@ -361,20 +350,19 @@ pub fn table(
         });
     }
     rows.sort_by(|left, right| {
-        factor_columns
-            .iter()
-            .map(|key| left.factors.get(key))
-            .cmp(factor_columns.iter().map(|key| right.factors.get(key)))
+        left.run_input_digest
+            .cmp(&right.run_input_digest)
             .then_with(|| left.run_id.cmp(&right.run_id))
     });
     Ok(EvaluationTable {
-        factor_columns,
         score_columns,
         rows,
         warnings: vec![
             "scores are evaluator-specific observations, not universal AgentLab judgments"
                 .to_owned(),
-            "agent and external-service behavior may be nondeterministic; use multiple replicates and interpret variance externally"
+            "agent and external-service behavior may be nondeterministic; use multiple exact-input repetitions and interpret variance externally"
+                .to_owned(),
+            "rows sharing run-input and portable-base identities are candidate repetitions; use `agentlab compare` to verify independence"
                 .to_owned(),
             "this report aligns rows only; it performs no aggregation, statistical test, ranking, or causal inference"
                 .to_owned(),
@@ -383,13 +371,14 @@ pub fn table(
 }
 
 pub fn markdown_table(table: &EvaluationTable) -> String {
-    let mut headers = vec!["run".to_owned(), "evaluator".to_owned()];
-    headers.extend(
-        table
-            .factor_columns
-            .iter()
-            .map(|column| format!("factor:{column}")),
-    );
+    let mut headers = vec![
+        "run".to_owned(),
+        "input".to_owned(),
+        "workspace".to_owned(),
+        "image".to_owned(),
+        "base".to_owned(),
+        "evaluator".to_owned(),
+    ];
     headers.extend(
         table
             .score_columns
@@ -405,13 +394,14 @@ pub fn markdown_table(table: &EvaluationTable) -> String {
     }
     output.push('\n');
     for row in &table.rows {
-        let mut values = vec![row.run_id.clone(), row.evaluator_name.clone()];
-        values.extend(
-            table
-                .factor_columns
-                .iter()
-                .map(|key| row.factors.get(key).cloned().unwrap_or_default()),
-        );
+        let mut values = vec![
+            row.run_id.clone(),
+            row.run_input_digest.clone(),
+            row.workspace_snapshot_digest.clone(),
+            row.image_resolved_digest.clone(),
+            row.base_filesystem_digest.clone(),
+            row.evaluator_name.clone(),
+        ];
         values.extend(
             table
                 .score_columns

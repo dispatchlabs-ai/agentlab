@@ -1,12 +1,12 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 
 use agentlab::evaluation::{self, EvaluationTable};
-use agentlab::run::{self, RunOptions, RunSummary};
+use agentlab::run::{self, RunOptions, RunSummary, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -37,7 +37,7 @@ impl Drop for DockerCleanup {
 
 #[test]
 #[ignore = "requires a running Docker engine and python3 for the supplied evaluator"]
-fn external_evaluator_produces_factor_score_table() -> Result<()> {
+fn external_evaluator_reports_real_input_identities_and_scores() -> Result<()> {
     ensure!(
         Command::new("docker")
             .arg("info")
@@ -60,29 +60,36 @@ fn external_evaluator_produces_factor_score_table() -> Result<()> {
     fs::create_dir(&workspace)?;
     fs::write(workspace.join("source.txt"), "immutable\n")?;
     let store = Store::open(Some(&state))?;
-    let source_before = snapshot::create(&workspace, &store)?.manifest.digest;
+    let without_skill = snapshot::create(&workspace, &store)?.manifest.digest;
+    fs::create_dir_all(workspace.join("skills/review"))?;
+    fs::write(
+        workspace.join("skills/review/SKILL.md"),
+        "# Review skill\n\nInspect the change carefully.\n",
+    )?;
+    let with_skill = snapshot::create(&workspace, &store)?.manifest.digest;
+    ensure!(without_skill != with_skill);
 
-    let cells = [("off", "1"), ("off", "2"), ("on", "1"), ("on", "2")];
-    let barrier = Arc::new(Barrier::new(cells.len()));
+    let inputs = [
+        without_skill.clone(),
+        without_skill.clone(),
+        with_skill.clone(),
+        with_skill.clone(),
+    ];
+    let barrier = Arc::new(Barrier::new(inputs.len()));
     let mut threads = Vec::new();
-    for (skill, replicate) in cells {
+    for workspace_snapshot in inputs {
         let barrier = barrier.clone();
         let store = store.clone();
-        let workspace = workspace.clone();
         threads.push(std::thread::spawn(move || {
             let options = RunOptions {
-                workspace,
+                workspace: WorkspaceSource::Snapshot(workspace_snapshot),
                 image: "alpine:3.21".to_owned(),
                 command: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "printf '%s\\n' \"$HOSTNAME\" > /workspace/private-result.txt".to_owned(),
+                    "if test -f /workspace/skills/review/SKILL.md; then treatment=with-skill; else treatment=without-skill; fi; printf '%s:%s\\n' \"$treatment\" \"$HOSTNAME\" > /workspace/private-result.txt"
+                        .to_owned(),
                 ],
-                factors: BTreeMap::from([
-                    ("skill".to_owned(), skill.to_owned()),
-                    ("replicate".to_owned(), replicate.to_owned()),
-                    ("harness".to_owned(), "fixture".to_owned()),
-                ]),
                 workspace_guest_path: "/workspace".to_owned(),
                 network: "none".to_owned(),
                 memory: None,
@@ -151,10 +158,6 @@ fn external_evaluator_produces_factor_score_table() -> Result<()> {
             "report",
             "--evaluator",
             "result-facts",
-            "--factor",
-            "skill",
-            "--factor",
-            "replicate",
             "--score",
             "exit_zero",
             "--score",
@@ -164,8 +167,7 @@ fn external_evaluator_produces_factor_score_table() -> Result<()> {
     let output = report.output().context("run public report command")?;
     ensure!(output.status.success());
     let markdown = String::from_utf8(output.stdout)?;
-    ensure!(markdown.contains("factor:skill"));
-    ensure!(markdown.contains("factor:replicate"));
+    ensure!(markdown.contains("| run | input | workspace | image | base | evaluator |"));
     ensure!(markdown.contains("score:exit_zero"));
     ensure!(markdown.contains("score:portable_changes"));
     ensure!(markdown.matches("| result-facts |").count() == 4);
@@ -175,28 +177,35 @@ fn external_evaluator_produces_factor_score_table() -> Result<()> {
         &store,
         &run_ids,
         Some("result-facts"),
-        &["skill".to_owned(), "replicate".to_owned()],
         &["exit_zero".to_owned(), "portable_changes".to_owned()],
     )?;
     ensure!(table.rows.len() == 4);
-    ensure!(table.factor_columns == ["skill", "replicate"]);
     ensure!(table.score_columns == ["exit_zero", "portable_changes"]);
-    ensure!(
-        table
-            .rows
-            .iter()
-            .map(|row| (
-                row.factors.get("skill").map(String::as_str),
-                row.factors.get("replicate").map(String::as_str)
-            ))
-            .collect::<Vec<_>>()
-            == [
-                (Some("off"), Some("1")),
-                (Some("off"), Some("2")),
-                (Some("on"), Some("1")),
-                (Some("on"), Some("2")),
-            ]
-    );
+    let mut input_counts = BTreeMap::new();
+    let mut workspace_inputs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in &table.rows {
+        *input_counts
+            .entry(row.run_input_digest.clone())
+            .or_insert(0_usize) += 1;
+        workspace_inputs
+            .entry(row.workspace_snapshot_digest.clone())
+            .or_default()
+            .insert(row.run_input_digest.clone());
+    }
+    ensure!(input_counts.len() == 2);
+    ensure!(input_counts.values().all(|count| *count == 2));
+    ensure!(workspace_inputs.len() == 2);
+    ensure!(workspace_inputs.values().all(|inputs| inputs.len() == 1));
+    ensure!(workspace_inputs.contains_key(&without_skill));
+    ensure!(workspace_inputs.contains_key(&with_skill));
+
+    let without_comparison = run::compare_runs(&store, &run_ids[0], &run_ids[1])?;
+    let with_comparison = run::compare_runs(&store, &run_ids[2], &run_ids[3])?;
+    let treatment_comparison = run::compare_runs(&store, &run_ids[0], &run_ids[2])?;
+    ensure!(without_comparison.comparable_repetition);
+    ensure!(with_comparison.comparable_repetition);
+    ensure!(treatment_comparison.comparison_kind == "different_inputs");
+    ensure!(treatment_comparison.controlled_input_differences == ["workspace_snapshot_digest"]);
 
     let invalid = evaluation::evaluate(
         &store,
@@ -225,17 +234,14 @@ fn external_evaluator_produces_factor_score_table() -> Result<()> {
     ensure!(failed.exit_code == 42);
     ensure!(failed.output.is_none());
     evaluation::verify(&store, &failed)?;
-    let latest_success = evaluation::table(&store, &run_ids, Some("result-facts"), &[], &[])?;
+    let latest_success = evaluation::table(&store, &run_ids, Some("result-facts"), &[])?;
     ensure!(latest_success.rows.len() == 4);
 
     let json = serde_json::to_vec(&table)?;
     let decoded: EvaluationTable = serde_json::from_slice(&json)?;
     ensure!(decoded == table);
     let source_after = snapshot::create(&workspace, &store)?.manifest.digest;
-    ensure!(
-        source_before == source_after,
-        "source workspace was mutated"
-    );
+    ensure!(with_skill == source_after, "source workspace was mutated");
     ensure!(!workspace.join("private-result.txt").exists());
     Ok(())
 }

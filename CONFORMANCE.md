@@ -68,7 +68,7 @@ cargo test --test milestone2 -- --ignored --nocapture
 
 ## Milestone 3: isolation and repetition
 
-The Docker-gated fixture launches two commands concurrently from the same disposable workspace and `alpine:3.21` image. The commands overlap for five seconds, use byte-identical argv, and derive conflicting content from their distinct container hostnames. It proves:
+The Docker-gated fixture takes one immutable snapshot, then launches two commands concurrently from that exact digest and the same `alpine:3.21` image. The commands overlap for five seconds, use byte-identical argv, and derive conflicting content from their distinct container hostnames. It proves:
 
 1. Both runs record identical workspace snapshot and resolved OCI image identities.
 2. Independently prepared exports normalize to the same portable base identity.
@@ -77,8 +77,8 @@ The Docker-gated fixture launches two commands concurrently from the same dispos
 5. Each result contains exactly one private owner marker, and neither observes the other's marker.
 6. Conflicting writes to the same guest path produce distinct content digests.
 7. The selected source workspace remains byte-identical and contains no candidate writes.
-8. Arbitrary factors, Unicode values, and replicate labels are preserved exactly.
-9. Comparison succeeds when `variant` and `replicate` are the expected differences and detects an undeclared replicate difference when only `variant` is expected.
+8. Both version-two specifications contain the same recomputable run-input digest and do not write a factor map.
+9. Comparison derives `comparable_repetition` without user-declared labels or an expected-difference list.
 10. Both results pass complete integrity verification before comparison.
 
 Run the case explicitly:
@@ -111,17 +111,18 @@ cargo test --test milestone4 -- --ignored --nocapture
 
 ## Milestone 5: external evaluation
 
-The Docker-gated fixture launches four overlapping Alpine runs labeled `skill={off,on}` and `replicate={1,2}`, then uses only the public CLI and supplied evaluator. It proves:
+The Docker-gated fixture creates one workspace snapshot without a skill directory and one after adding that real directory, launches two exact repetitions from each snapshot, then uses the public evaluation/reporting CLI and supplied evaluator. It proves:
 
 1. Every result is machine-readable and passes integrity verification before evaluation.
 2. One arbitrary external command receives absolute result/spec/delta paths through the documented environment contract.
 3. The supplied evaluator's JSON scores, observations, summary, stdout, stderr, command, timestamps, and exit status are preserved in `agentlab.evaluation/v1`.
 4. Every evaluation record and artifact passes independent integrity verification.
-5. The public report contains exactly four rows with the requested factor and score columns in deterministic order.
+5. The public report contains exactly four rows with actual run-input, workspace, resolved-image, portable-base, evaluator, and requested score columns in deterministic order.
 6. JSON report output round-trips through the public data model.
 7. Malformed evaluator stdout and an intentional exit `42` are retained as `invalid_output` and `command_failed`, never promoted to scores, and do not hide earlier successful evaluations.
 8. Reports explicitly disclaim universal judgment, deterministic behavior, aggregation, statistics, ranking, and causal inference.
-9. The source workspace remains byte-identical and contains no run output.
+9. Each actual workspace/run-input identity occurs exactly twice, within-cell comparison reports comparable repetition, and cross-treatment comparison reports the workspace snapshot as the real controlled difference.
+10. The source workspace remains byte-identical after its deliberate skill addition and contains no run output.
 
 Run the case explicitly:
 

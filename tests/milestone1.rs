@@ -4,6 +4,7 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use agentlab::run;
 use agentlab::snapshot::{self, Manifest};
 use agentlab::store::{Store, hex_digest};
 use serde_json::Value;
@@ -289,6 +290,92 @@ fn cli_and_machine_global_excludes() {
             .any(|entry| entry.path == "machine-global.txt")
     );
     assert!(!String::from_utf8_lossy(&inspect.stdout).contains("must be included"));
+}
+
+#[test]
+fn removed_factor_flags_fail_with_real_input_guidance() {
+    let binary = env!("CARGO_BIN_EXE_agentlab");
+    let cases = [
+        (
+            vec![
+                "run",
+                "--image",
+                "unused",
+                "--factor",
+                "skill=on",
+                "--",
+                "/bin/true",
+            ],
+            "vary a real workspace snapshot, image, command, or runtime input",
+        ),
+        (
+            vec!["compare", "--expect-factor", "skill", "left", "right"],
+            "differences in actual resolved inputs",
+        ),
+        (
+            vec!["report", "--factor", "skill", "run"],
+            "real run-input, workspace, image, and portable-base identities",
+        ),
+    ];
+    for (arguments, guidance) in cases {
+        let output = Command::new(binary).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(guidance), "unexpected error: {stderr}");
+    }
+}
+
+#[test]
+fn legacy_v1_specs_remain_readable_but_factors_do_not_define_input_identity() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(Some(state.path())).unwrap();
+    let run_id = "00000000-0000-4000-8000-000000000001";
+    store.create_run_directory(run_id).unwrap();
+    let spec = serde_json::json!({
+        "schema_version": "agentlab.run/v1",
+        "run_id": run_id,
+        "workspace_snapshot_digest": format!("sha256:{}", "1".repeat(64)),
+        "image_requested": "alpine:3.21",
+        "image_resolved_digest": "alpine@sha256:fixture",
+        "docker_image_id": "sha256:fixture",
+        "target_platform": "linux/arm64",
+        "workspace_guest_path": "/workspace",
+        "command": ["/bin/true"],
+        "working_directory": "/workspace",
+        "factors": {"skill": "on", "replicate": "1"},
+        "resource_limits": {"memory": null, "cpus": null},
+        "network_policy": "none",
+        "captures": [],
+        "secret_injections": [],
+        "workspace_ignore_digest": format!("sha256:{}", "2".repeat(64)),
+        "change_ignore": {
+            "source": null,
+            "digest": format!("sha256:{}", "3".repeat(64))
+        },
+        "backend_name": "docker-cli",
+        "backend_version": "fixture",
+        "agentlab_version": "0.1.0-dev"
+    });
+    store
+        .write_run_file(
+            run_id,
+            "spec.json",
+            &serde_json::to_vec_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+    let loaded = run::load_spec(&store, run_id).unwrap();
+    assert_eq!(
+        loaded.legacy_factors.get("skill").map(String::as_str),
+        Some("on")
+    );
+    let identity_with_legacy_labels = run::compute_run_input_digest(&loaded).unwrap();
+    let mut without_legacy_labels = loaded;
+    without_legacy_labels.legacy_factors.clear();
+    assert_eq!(
+        identity_with_legacy_labels,
+        run::compute_run_input_digest(&without_legacy_labels).unwrap()
+    );
 }
 
 fn assert_materialized(root: &Path, manifest: &Manifest) {

@@ -1,12 +1,11 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::process::Command;
 
 use agentlab::lifecycle;
-use agentlab::run::{self, CaptureSpec, RunOptions};
+use agentlab::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -76,7 +75,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
 
     let summary = run::execute(
         &RunOptions {
-            workspace: workspace.clone(),
+            workspace: WorkspaceSource::Directory(workspace.clone()),
             image: "alpine:3.21".to_owned(),
             command: vec![
                 "/bin/sh".to_owned(),
@@ -84,7 +83,6 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
                 "printf '1\\n' > /root/session.txt; printf 'initial\\n' > /workspace/initial.txt; exit 19"
                     .to_owned(),
             ],
-            factors: BTreeMap::from([("harness".to_owned(), "fixture".to_owned())]),
             workspace_guest_path: "/workspace".to_owned(),
             network: "none".to_owned(),
             memory: None,

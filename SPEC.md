@@ -2,7 +2,8 @@
 
 Status: Milestones 1–5 working contract
 Snapshot schema: `agentlab.snapshot/v1`
-Run schema: `agentlab.run/v1`
+Run schema: `agentlab.run/v2` (`agentlab.run/v1` read compatibility)
+Run-input schema: `agentlab.run-input/v1`
 Delta schema: `agentlab.delta/v1`
 Result schema: `agentlab.result/v1`
 Continuation schema: `agentlab.continuation/v1`
@@ -118,7 +119,7 @@ Snapshot artifacts may contain credentials or other sensitive content. Local-onl
 
 ## 7. Run contract
 
-`agentlab run` combines a workspace snapshot, immutable OCI image resolution, materialization settings, an opaque command, resource and network policy, arbitrary factors, change-ignore identity, and requested captures. The implementation MUST:
+`agentlab run` combines a workspace snapshot, immutable OCI image resolution, materialization settings, an opaque command, resource and network policy, change-ignore identity, and requested captures. `--workspace PATH` captures the directory at invocation; `--snapshot DIGEST` loads and verifies an existing immutable snapshot. They are mutually exclusive. The implementation MUST:
 
 1. Reconstruct the workspace from its snapshot in private storage at `/workspace` by default, never through a writable source mount.
 2. Establish and export a prepared base root filesystem after materialization and before command execution.
@@ -128,7 +129,11 @@ Snapshot artifacts may contain credentials or other sensitive content. Local-onl
 6. retain the running supervisor container for direct inspection and later filesystem continuation; and
 7. state explicitly that pseudo-filesystems and live process memory are not portable persistent state.
 
-The run specification contains the snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, factors, resource limits, network policy, capture declarations, workspace- and change-ignore identities, backend evidence, and AgentLab version. Factors are recorded verbatim and have no core semantics.
+The version-two run specification contains a canonical run-input digest, snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, resource limits, network policy, capture declarations, workspace- and change-ignore identities, backend evidence, and AgentLab version.
+
+`agentlab.run-input/v1` is SHA-256 over canonical compact JSON containing the actual resolved snapshot and immutable image identities; target platform; materialization and working paths; argv; resource/network policy; captures; secret-injection names when supported; workspace- and change-ignore digests; backend name/version; and AgentLab version. It excludes run ID, timestamps, requested image alias, backend-native image/container evidence, outcome, and descriptive labels. A version-two specification MUST store this digest and verification MUST recompute it.
+
+Version-one run specifications remain readable. Their legacy `factors` map is retained only during deserialization and is excluded from derived run-input identity, comparison, and reporting. Version-two writers MUST NOT emit it.
 
 The Docker image and container identifiers are evidence, not AgentLab's portable run identity. A prepared Docker image ID may be nondeterministic without changing the meaning of the declared input.
 
@@ -166,23 +171,19 @@ Run artifacts and complete rootfs exports may contain credentials or other sensi
 
 ## 11. Comparable repetition
 
-Independent `agentlab run` invocations may execute concurrently against the same source workspace and image. Each MUST reconstruct its own snapshot and receive a distinct private Docker writable layer and retained container. Concurrent snapshot/content-store writes MUST preserve immutable content-addressed semantics.
-
-Factors are an ordered string-to-string map recorded unchanged in `agentlab.run/v1`. AgentLab does not interpret names such as `variant`, `replicate`, `model`, or `thinking`. Empty keys and duplicate CLI keys are rejected rather than normalized or silently overwritten.
+Independent `agentlab run` invocations may execute concurrently against the same stored snapshot and image. Each MUST verify and reconstruct the snapshot independently and receive a distinct private Docker writable layer and retained container. Concurrent snapshot/content-store writes MUST preserve immutable content-addressed semantics. Reusing an explicit snapshot digest is the authoritative way to request byte-identical workspace input; independently reading a mutable host directory twice is not.
 
 `agentlab compare LEFT RIGHT` loads and integrity-verifies both results and specifications. It reports:
 
-- equality of workspace snapshot and resolved image identities;
+- equality of complete run-input, workspace snapshot, and resolved image identities;
 - equality of the exported prepared-base rootfs identity;
 - distinct retained container IDs and names;
 - controlled-input differences across command, workspace materialization, resource/network settings, captures, ignore identities, backend evidence, and AgentLab version;
-- exact left/right factor values, including a missing value on either side;
-- missing or unexpected differences relative to repeated `--expect-factor KEY` declarations; and
 - equality or difference of portable result-rootfs identities.
 
-A comparison is a `comparable_repetition` only when workspace, resolved image, and prepared base are identical; retained containers are distinct; controlled inputs are equal; and the actual factor-difference key set exactly matches the expected set. Image request aliases are not treated as controlled differences when they resolve to the same immutable image; resolved identity is authoritative.
+A comparison is a `comparable_repetition` only when complete run-input, workspace, resolved image, and prepared-base identities are identical; retained containers are distinct; and no controlled input differs. It is `different_inputs` when actual controlled inputs differ, and `same_inputs_not_independent` when recorded inputs match but the independence/base conditions do not. Image request aliases are not treated as controlled differences when they resolve to the same immutable image; resolved identity is authoritative.
 
-Comparison is derived metadata rather than a new persisted experimental-cell object. Concurrent launch uses ordinary independent CLI processes in this milestone; AgentLab does not introduce a scheduler, daemon, automatic statistical conclusion, or factor registry.
+Comparison is derived metadata rather than a new persisted experimental-cell object. Concurrent launch uses ordinary independent CLI processes in this milestone; AgentLab does not introduce a scheduler, daemon, treatment registry, preparation DSL, automatic statistical conclusion, or label registry.
 
 ## 12. Retained lifecycle
 
@@ -228,12 +229,12 @@ Successful stdout MUST be one JSON object with optional fields:
 
 Evaluation records are immutable additions beneath the run and do not alter `agentlab.result/v1`. `agentlab inspect --verify RUN` verifies them along with the run lifecycle. Evaluator stdout, stderr, summaries, and observations may themselves be sensitive.
 
-`agentlab report` selects the latest successful evaluation, optionally by evaluator name, for each explicit run ID. It aligns requested or discovered factor keys and scalar score keys into rows. Missing factor or score values remain missing. JSON output is machine-readable; default output is a Markdown table.
+`agentlab report` selects the latest successful evaluation, optionally by evaluator name, for each explicit run ID. It aligns run, run-input, workspace-snapshot, resolved-image, portable-base, evaluator, and requested or discovered scalar score identities into rows. Missing score values remain missing. JSON output is machine-readable; default output is a Markdown table.
 
-Reporting MUST state that scores are evaluator-specific observations, model/external-service execution can be nondeterministic, multiple replicates are advisable, and AgentLab performs no aggregation, statistical test, ranking, causal inference, or universal success judgment. Factor and score names remain opaque strings.
+Reporting MUST state that scores are evaluator-specific observations, model/external-service execution can be nondeterministic, multiple exact-input repetitions are advisable, and AgentLab performs no aggregation, statistical test, ranking, causal inference, or universal success judgment. Score names remain opaque strings. Rows sharing run-input and portable-base identities are only candidate repetitions until comparison also verifies distinct containers.
 
 External evaluators run directly on the host with the invoking user's authority. This milestone does not sandbox them. Integrity checks detect mutation of AgentLab records but do not constrain other filesystem, process, credential, network, or service access; users MUST run only evaluator commands they trust.
 
 ## 14. Current boundary
 
-AgentLab does not yet provide adoption or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.
+AgentLab does not yet provide reviewed adoption or another backend. The host workspace is mutable developer state, not an AgentLab-owned golden copy; a future accepted baseline is a reference to reviewed immutable input/result lineage. Workspace treatments are ordinary host changes captured as new snapshots. A treatment outside the workspace is currently prepared through the backend—for example, by committing a changed Docker container as a new image—and supplied by immutable image identity. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.
