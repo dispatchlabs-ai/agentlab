@@ -22,7 +22,9 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - Milestone 2 is complete: one direct-Docker command is materialized privately, executed once, retained, and normalized into documented `agentlab.run/v1`, `agentlab.delta/v1`, and `agentlab.result/v1` artifacts with integrity verification.
 - The Docker-gated whole-machine conformance fixture covers repository commits, package installation, workspace and system paths, content/mode/type/symlink/delete changes, ignore selection, nonzero exit, captures, evidence, and source immutability.
 - The Pi-workspace hands-on checkpoint passed against `ubuntu:24.04`: writes under `/workspace`, `/etc`, and `/root` appeared only in the retained container and portable delta, while the source snapshot digest remained unchanged.
-- The next implementation milestone is comparable repetition and isolation (Milestone 3). Preserve the current direct implementation; do not build a generalized backend framework before a second implementation proves it is needed.
+- Milestone 3 is complete: concurrent runs receive distinct writable layers, comparisons verify identical portable inputs and bases, arbitrary/replicate factors are preserved, and expected factor differences are checked explicitly.
+- The Pi-workspace repetition checkpoint passed with two simultaneous `ubuntu:24.04` runs: identical snapshot, image, command, and portable base; distinct retained containers and private outcomes; exactly the declared `variant` and `replicate` differences; and an unchanged source snapshot.
+- The next implementation milestone is retained lifecycle management (Milestone 4). Preserve the current direct implementation; do not build a generalized backend framework before a second implementation proves it is needed.
 
 ## North-star goal
 
@@ -556,6 +558,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 **Hands-on checkpoint:** Run a harmless command through direct Docker against a chosen workspace and resolved `ubuntu:24.04` image that writes distinct files beneath `/workspace`, `/etc`, and a persistent home directory. Inspect the portable full-machine delta and Docker evidence, retain the container, and confirm that none of those writes reached the source workspace or host filesystem.
 
 ### Milestone 3: Prove isolation and comparable repetition
+
+**Status:** Complete.
 
 **Goal:** Launch multiple runs from the same resolved base and prove they cannot affect each other or the source workspace.
 

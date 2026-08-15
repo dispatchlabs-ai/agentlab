@@ -32,6 +32,7 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write) -> Result<()> {
         }
         "snapshot" => snapshot_command(&arguments[1..], stdout),
         "run" => run_command(&arguments[1..], stdout),
+        "compare" => compare_command(&arguments[1..], stdout),
         "diff" => diff_command(&arguments[1..], stdout),
         "inspect" => inspect_command(&arguments[1..], stdout),
         _ => bail!("unknown command {command:?}\n\nRun `agentlab --help` for usage."),
@@ -96,7 +97,16 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 let (key, value) = value
                     .split_once('=')
                     .ok_or_else(|| anyhow::anyhow!("--factor requires KEY=VALUE"))?;
-                parsed.factors.insert(key.to_owned(), value.to_owned());
+                if key.is_empty() {
+                    bail!("--factor key cannot be empty");
+                }
+                if parsed
+                    .factors
+                    .insert(key.to_owned(), value.to_owned())
+                    .is_some()
+                {
+                    bail!("duplicate --factor key {key:?}");
+                }
             }
             "--change-ignore" => {
                 parsed.change_ignore = Some(PathBuf::from(required_value(
@@ -151,6 +161,118 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         writeln!(stdout, "Diff: agentlab diff {}", result.run_id)?;
     }
     Ok(())
+}
+
+fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut json = false;
+    let mut run_ids = Vec::new();
+    let mut expected_factors = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--json" => json = true,
+            "--expect-factor" => expected_factors
+                .push(required_value(arguments, &mut index, "--expect-factor")?.to_owned()),
+            "--help" | "-h" => {
+                writeln!(
+                    stdout,
+                    "usage: agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN"
+                )?;
+                return Ok(());
+            }
+            value if value.starts_with('-') => bail!("unexpected compare argument {value:?}"),
+            value => run_ids.push(value),
+        }
+        index += 1;
+    }
+    if run_ids.len() != 2 {
+        bail!("compare requires LEFT_RUN and RIGHT_RUN");
+    }
+    if expected_factors.iter().any(String::is_empty) {
+        bail!("--expect-factor key cannot be empty");
+    }
+    let store = Store::open(None)?;
+    let comparison = run::compare_runs(&store, run_ids[0], run_ids[1], &expected_factors)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &comparison)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+    writeln!(
+        stdout,
+        "Runs: {} <> {}",
+        comparison.left_run_id, comparison.right_run_id
+    )?;
+    writeln!(
+        stdout,
+        "Same workspace snapshot: {}",
+        comparison.same_workspace_snapshot
+    )?;
+    writeln!(
+        stdout,
+        "Same resolved image: {}",
+        comparison.same_resolved_image
+    )?;
+    writeln!(
+        stdout,
+        "Same portable base: {}",
+        comparison.same_portable_base
+    )?;
+    writeln!(
+        stdout,
+        "Distinct private containers: {}",
+        comparison.distinct_private_containers
+    )?;
+    writeln!(
+        stdout,
+        "Controlled-input differences: {}",
+        display_names(&comparison.controlled_input_differences)
+    )?;
+    writeln!(
+        stdout,
+        "Factor differences: {}",
+        display_names(
+            &comparison
+                .factor_differences
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        )
+    )?;
+    writeln!(
+        stdout,
+        "Missing expected factors: {}",
+        display_names(&comparison.missing_expected_factor_differences)
+    )?;
+    writeln!(
+        stdout,
+        "Unexpected factor differences: {}",
+        display_names(&comparison.unexpected_factor_differences)
+    )?;
+    writeln!(
+        stdout,
+        "Only expected factors differ: {}",
+        comparison.only_expected_factors_differ
+    )?;
+    writeln!(
+        stdout,
+        "Comparable repetition: {}",
+        comparison.comparable_repetition
+    )?;
+    writeln!(
+        stdout,
+        "Portable outcomes equal: {}",
+        comparison.portable_outcomes_equal
+    )?;
+    Ok(())
+}
+
+fn display_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
 }
 
 fn snapshot_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
@@ -382,7 +504,7 @@ fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 fn print_help(output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
-        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  inspect     inspect and verify snapshot or run metadata\n  diff        show normalized persistent filesystem changes\n\nRuns retain their stopped container for direct inspection."
+        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  compare     verify controlled inputs and expected factor differences\n  inspect     inspect and verify snapshot or run metadata\n  diff        show normalized persistent filesystem changes\n\nRuns retain their stopped container for direct inspection."
     )?;
     Ok(())
 }

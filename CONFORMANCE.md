@@ -68,10 +68,24 @@ cargo test --test milestone2 -- --ignored --nocapture
 
 ## Milestone 3: isolation and repetition
 
-- Resolve two runs to the same workspace and OCI image identities.
-- Launch them concurrently with separate writable layers.
-- Produce conflicting writes and prove neither run, nor the source workspace, observes the other run's changes.
-- Preserve arbitrary factors exactly.
+The Docker-gated fixture launches two commands concurrently from the same disposable workspace and `alpine:3.21` image. The commands overlap for five seconds, use byte-identical argv, and derive conflicting content from their distinct container hostnames. It proves:
+
+1. Both runs record identical workspace snapshot and resolved OCI image identities.
+2. Independently prepared exports normalize to the same portable base identity.
+3. Retained container IDs and writable layers are distinct.
+4. Command lifecycle intervals overlap rather than merely running sequentially.
+5. Each result contains exactly one private owner marker, and neither observes the other's marker.
+6. Conflicting writes to the same guest path produce distinct content digests.
+7. The selected source workspace remains byte-identical and contains no candidate writes.
+8. Arbitrary factors, Unicode values, and replicate labels are preserved exactly.
+9. Comparison succeeds when `variant` and `replicate` are the expected differences and detects an undeclared replicate difference when only `variant` is expected.
+10. Both results pass complete integrity verification before comparison.
+
+Run the case explicitly:
+
+```bash
+cargo test --test milestone3 -- --ignored --nocapture
+```
 
 ## Milestone 4: retained lifecycle
 

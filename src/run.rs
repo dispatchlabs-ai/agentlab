@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -166,6 +166,32 @@ pub struct RunSummary {
     pub ignored_changes: usize,
     pub retained_container_name: String,
     pub retained_container_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactorDifference {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunComparison {
+    pub left_run_id: String,
+    pub right_run_id: String,
+    pub same_workspace_snapshot: bool,
+    pub same_resolved_image: bool,
+    pub same_portable_base: bool,
+    pub distinct_private_containers: bool,
+    pub controlled_input_differences: Vec<String>,
+    pub factor_differences: BTreeMap<String, FactorDifference>,
+    pub expected_factor_differences: Vec<String>,
+    pub missing_expected_factor_differences: Vec<String>,
+    pub unexpected_factor_differences: Vec<String>,
+    pub only_expected_factors_differ: bool,
+    pub comparable_repetition: bool,
+    pub portable_outcomes_equal: bool,
 }
 
 #[derive(Serialize)]
@@ -596,6 +622,10 @@ pub fn load_result(store: &Store, run_id: &str) -> Result<RunResult> {
         .context("decode run result")
 }
 
+pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
+    serde_json::from_slice(&store.read_run_file(run_id, "spec.json")?).context("decode run spec")
+}
+
 pub fn load_delta(store: &Store, run_id: &str, raw: bool) -> Result<DeltaManifest> {
     let name = if raw { "delta.raw.json" } else { "delta.json" };
     serde_json::from_slice(&store.read_run_file(run_id, name)?)
@@ -647,12 +677,185 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
     Ok(())
 }
 
+pub fn compare_runs(
+    store: &Store,
+    left_run_id: &str,
+    right_run_id: &str,
+    expected_factor_differences: &[String],
+) -> Result<RunComparison> {
+    if left_run_id == right_run_id {
+        bail!("compare requires two distinct runs");
+    }
+    let left_result = load_result(store, left_run_id)?;
+    let right_result = load_result(store, right_run_id)?;
+    verify_result(store, &left_result)?;
+    verify_result(store, &right_result)?;
+    let left = load_spec(store, left_run_id)?;
+    let right = load_spec(store, right_run_id)?;
+    if left.run_id != left_result.run_id || right.run_id != right_result.run_id {
+        bail!("run specification and result IDs do not agree");
+    }
+
+    let mut controlled = Vec::new();
+    compare_field(
+        &mut controlled,
+        "workspace_snapshot_digest",
+        &left.workspace_snapshot_digest,
+        &right.workspace_snapshot_digest,
+    );
+    compare_field(
+        &mut controlled,
+        "image_resolved_digest",
+        &left.image_resolved_digest,
+        &right.image_resolved_digest,
+    );
+    compare_field(
+        &mut controlled,
+        "target_platform",
+        &left.target_platform,
+        &right.target_platform,
+    );
+    compare_field(
+        &mut controlled,
+        "docker_image_id",
+        &left.docker_image_id,
+        &right.docker_image_id,
+    );
+    compare_field(
+        &mut controlled,
+        "workspace_guest_path",
+        &left.workspace_guest_path,
+        &right.workspace_guest_path,
+    );
+    compare_field(&mut controlled, "command", &left.command, &right.command);
+    compare_field(
+        &mut controlled,
+        "working_directory",
+        &left.working_directory,
+        &right.working_directory,
+    );
+    compare_field(
+        &mut controlled,
+        "resource_limits",
+        &left.resource_limits,
+        &right.resource_limits,
+    );
+    compare_field(
+        &mut controlled,
+        "network_policy",
+        &left.network_policy,
+        &right.network_policy,
+    );
+    compare_field(&mut controlled, "captures", &left.captures, &right.captures);
+    compare_field(
+        &mut controlled,
+        "secret_injections",
+        &left.secret_injections,
+        &right.secret_injections,
+    );
+    compare_field(
+        &mut controlled,
+        "workspace_ignore_digest",
+        &left.workspace_ignore_digest,
+        &right.workspace_ignore_digest,
+    );
+    compare_field(
+        &mut controlled,
+        "change_ignore",
+        &left.change_ignore,
+        &right.change_ignore,
+    );
+    compare_field(
+        &mut controlled,
+        "backend_name",
+        &left.backend_name,
+        &right.backend_name,
+    );
+    compare_field(
+        &mut controlled,
+        "backend_version",
+        &left.backend_version,
+        &right.backend_version,
+    );
+    compare_field(
+        &mut controlled,
+        "agentlab_version",
+        &left.agentlab_version,
+        &right.agentlab_version,
+    );
+
+    let factor_keys: BTreeSet<_> = left.factors.keys().chain(right.factors.keys()).collect();
+    let mut factor_differences = BTreeMap::new();
+    for key in factor_keys {
+        let left_value = left.factors.get(key);
+        let right_value = right.factors.get(key);
+        if left_value != right_value {
+            factor_differences.insert(
+                key.clone(),
+                FactorDifference {
+                    left: left_value.cloned(),
+                    right: right_value.cloned(),
+                },
+            );
+        }
+    }
+    let expected: BTreeSet<_> = expected_factor_differences.iter().cloned().collect();
+    if expected.len() != expected_factor_differences.len() {
+        bail!("duplicate --expect-factor key");
+    }
+    let actual: BTreeSet<_> = factor_differences.keys().cloned().collect();
+    let missing_expected_factor_differences: Vec<_> =
+        expected.difference(&actual).cloned().collect();
+    let unexpected_factor_differences: Vec<_> = actual.difference(&expected).cloned().collect();
+    let only_expected_factors_differ = controlled.is_empty()
+        && missing_expected_factor_differences.is_empty()
+        && unexpected_factor_differences.is_empty();
+    let same_workspace_snapshot = left.workspace_snapshot_digest == right.workspace_snapshot_digest;
+    let same_resolved_image = left.image_resolved_digest == right.image_resolved_digest;
+    let same_portable_base =
+        left_result.base_filesystem_digest == right_result.base_filesystem_digest;
+    let distinct_private_containers = left_result.docker.retained_container_id
+        != right_result.docker.retained_container_id
+        && left_result.docker.retained_container_name
+            != right_result.docker.retained_container_name;
+    Ok(RunComparison {
+        left_run_id: left_run_id.to_owned(),
+        right_run_id: right_run_id.to_owned(),
+        same_workspace_snapshot,
+        same_resolved_image,
+        same_portable_base,
+        distinct_private_containers,
+        controlled_input_differences: controlled,
+        factor_differences,
+        expected_factor_differences: expected.into_iter().collect(),
+        missing_expected_factor_differences,
+        unexpected_factor_differences,
+        only_expected_factors_differ,
+        comparable_repetition: only_expected_factors_differ
+            && same_workspace_snapshot
+            && same_resolved_image
+            && same_portable_base
+            && distinct_private_containers,
+        portable_outcomes_equal: left_result.result_filesystem_digest
+            == right_result.result_filesystem_digest,
+    })
+}
+
+fn compare_field<T: PartialEq>(differences: &mut Vec<String>, name: &str, left: &T, right: &T) {
+    if left != right {
+        differences.push(name.to_owned());
+    }
+}
+
 fn validate_options(options: &RunOptions) -> Result<()> {
     if options.image.trim().is_empty() {
         bail!("run requires --image IMAGE");
     }
     if options.command.is_empty() {
         bail!("run requires a command after --");
+    }
+    if options.factors.keys().any(String::is_empty) {
+        bail!("factor keys cannot be empty");
     }
     validate_guest_path(&options.workspace_guest_path)?;
     if !matches!(options.network.as_str(), "none" | "bridge") {

@@ -1,6 +1,6 @@
 # AgentLab Specification
 
-Status: Milestones 1–2 working contract
+Status: Milestones 1–3 working contract
 Snapshot schema: `agentlab.snapshot/v1`
 Run schema: `agentlab.run/v1`
 Delta schema: `agentlab.delta/v1`
@@ -16,7 +16,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Neither defines a workspace layout, repository registry, harness integration, evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
+Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. None defines a workspace layout, repository registry, harness integration, evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
 
 The selected workspace is opaque user content. Names such as `AGENTS.md`, `MEMORY.md`, `repos/`, `skills/`, and `worktrees/` have no meaning to the snapshot protocol.
 
@@ -160,6 +160,26 @@ Run-local artifacts include the specification, normalized rootfs manifests, raw 
 
 Run artifacts and complete rootfs exports may contain credentials or other sensitive information. A retained container and local state directory are private operational artifacts, not safe publication units.
 
-## 11. Current boundary
+## 11. Comparable repetition
 
-Milestone 2 is deliberately one direct-Docker run. AgentLab does not yet provide lifecycle management, continuation, fork/adopt operations, concurrent repetition, evaluation, or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.
+Independent `agentlab run` invocations may execute concurrently against the same source workspace and image. Each MUST reconstruct its own snapshot and receive a distinct private Docker writable layer and retained container. Concurrent snapshot/content-store writes MUST preserve immutable content-addressed semantics.
+
+Factors are an ordered string-to-string map recorded unchanged in `agentlab.run/v1`. AgentLab does not interpret names such as `variant`, `replicate`, `model`, or `thinking`. Empty keys and duplicate CLI keys are rejected rather than normalized or silently overwritten.
+
+`agentlab compare LEFT RIGHT` loads and integrity-verifies both results and specifications. It reports:
+
+- equality of workspace snapshot and resolved image identities;
+- equality of the exported prepared-base rootfs identity;
+- distinct retained container IDs and names;
+- controlled-input differences across command, workspace materialization, resource/network settings, captures, ignore identities, backend evidence, and AgentLab version;
+- exact left/right factor values, including a missing value on either side;
+- missing or unexpected differences relative to repeated `--expect-factor KEY` declarations; and
+- equality or difference of portable result-rootfs identities.
+
+A comparison is a `comparable_repetition` only when workspace, resolved image, and prepared base are identical; retained containers are distinct; controlled inputs are equal; and the actual factor-difference key set exactly matches the expected set. Image request aliases are not treated as controlled differences when they resolve to the same immutable image; resolved identity is authoritative.
+
+Comparison is derived metadata rather than a new persisted experimental-cell object. Concurrent launch uses ordinary independent CLI processes in this milestone; AgentLab does not introduce a scheduler, daemon, automatic statistical conclusion, or factor registry.
+
+## 12. Current boundary
+
+AgentLab does not yet provide lifecycle management, continuation, fork/adopt operations, evaluation, or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.
