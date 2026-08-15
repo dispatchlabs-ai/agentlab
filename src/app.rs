@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::VERSION;
+use crate::run::{self, CaptureSpec, RunOptions};
 use crate::snapshot::{self, Repository};
 use crate::store::Store;
 
@@ -30,9 +31,126 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         "snapshot" => snapshot_command(&arguments[1..], stdout),
+        "run" => run_command(&arguments[1..], stdout),
+        "diff" => diff_command(&arguments[1..], stdout),
         "inspect" => inspect_command(&arguments[1..], stdout),
         _ => bail!("unknown command {command:?}\n\nRun `agentlab --help` for usage."),
     }
+}
+
+fn required_value<'a>(arguments: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str> {
+    *index += 1;
+    arguments
+        .get(*index)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
+}
+
+fn run_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let separator = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .ok_or_else(|| anyhow::anyhow!("run requires `-- COMMAND [ARG ...]`"))?;
+    let (options, command_with_separator) = arguments.split_at(separator);
+    let command = &command_with_separator[1..];
+    if command.is_empty() {
+        bail!("run requires a command after `--`");
+    }
+
+    let mut parsed = RunOptions {
+        workspace: PathBuf::from("."),
+        image: String::new(),
+        command: command.to_vec(),
+        factors: std::collections::BTreeMap::new(),
+        workspace_guest_path: "/workspace".to_owned(),
+        network: "none".to_owned(),
+        memory: None,
+        cpus: None,
+        change_ignore: None,
+        captures: Vec::new(),
+    };
+    let mut json = false;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--workspace" => {
+                parsed.workspace =
+                    PathBuf::from(required_value(options, &mut index, "--workspace")?)
+            }
+            "--image" => parsed.image = required_value(options, &mut index, "--image")?.to_owned(),
+            "--workspace-path" => {
+                parsed.workspace_guest_path =
+                    required_value(options, &mut index, "--workspace-path")?.to_owned()
+            }
+            "--network" => {
+                parsed.network = required_value(options, &mut index, "--network")?.to_owned()
+            }
+            "--memory" => {
+                parsed.memory = Some(required_value(options, &mut index, "--memory")?.to_owned())
+            }
+            "--cpus" => {
+                parsed.cpus = Some(required_value(options, &mut index, "--cpus")?.to_owned())
+            }
+            "--factor" => {
+                let value = required_value(options, &mut index, "--factor")?;
+                let (key, value) = value
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--factor requires KEY=VALUE"))?;
+                parsed.factors.insert(key.to_owned(), value.to_owned());
+            }
+            "--change-ignore" => {
+                parsed.change_ignore = Some(PathBuf::from(required_value(
+                    options,
+                    &mut index,
+                    "--change-ignore",
+                )?))
+            }
+            "--capture" => {
+                let value = required_value(options, &mut index, "--capture")?;
+                let (guest_path, name) = value
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--capture requires GUEST_PATH=NAME"))?;
+                parsed.captures.push(CaptureSpec {
+                    guest_path: guest_path.to_owned(),
+                    name: name.to_owned(),
+                });
+            }
+            "--json" => json = true,
+            "--help" | "-h" => {
+                writeln!(
+                    stdout,
+                    "usage: agentlab run --image IMAGE [--workspace PATH] [--factor KEY=VALUE] [--workspace-path PATH] [--network MODE] [--memory LIMIT] [--cpus COUNT] [--change-ignore GLOB] [--capture GUEST_PATH=NAME] [--json] -- COMMAND [ARG ...]"
+                )?;
+                return Ok(());
+            }
+            value => bail!("unexpected run argument {value:?}"),
+        }
+        index += 1;
+    }
+    if parsed.image.is_empty() {
+        bail!("run requires --image IMAGE");
+    }
+
+    let store = Store::open(None)?;
+    let result = run::execute(&parsed, &store)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &result)?;
+        writeln!(stdout)?;
+    } else {
+        writeln!(stdout, "Run: {}", result.run_id)?;
+        writeln!(stdout, "Exit code: {}", result.exit_code)?;
+        writeln!(stdout, "Snapshot: {}", result.workspace_snapshot_digest)?;
+        writeln!(stdout, "Portable changes: {}", result.changes)?;
+        writeln!(stdout, "Ignored changes: {}", result.ignored_changes)?;
+        writeln!(
+            stdout,
+            "Retained container: {}",
+            result.retained_container_name
+        )?;
+        writeln!(stdout, "Inspect: agentlab inspect {}", result.run_id)?;
+        writeln!(stdout, "Diff: agentlab diff {}", result.run_id)?;
+    }
+    Ok(())
 }
 
 fn snapshot_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
@@ -130,7 +248,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab inspect [--json] [--verify] SNAPSHOT"
+                    "usage: agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN"
                 )?;
                 return Ok(());
             }
@@ -139,8 +257,44 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             value => bail!("unexpected inspect argument {value:?}"),
         }
     }
-    let digest = digest.ok_or_else(|| anyhow::anyhow!("inspect requires SNAPSHOT"))?;
+    let digest = digest.ok_or_else(|| anyhow::anyhow!("inspect requires SNAPSHOT_OR_RUN"))?;
     let store = Store::open(None)?;
+    if !digest.starts_with("sha256:") {
+        let result = run::load_result(&store, digest)?;
+        if verify {
+            run::verify_result(&store, &result)?;
+        }
+        if json {
+            serde_json::to_writer_pretty(&mut *stdout, &result)?;
+            writeln!(stdout)?;
+            return Ok(());
+        }
+        writeln!(stdout, "Run: {}", result.run_id)?;
+        writeln!(stdout, "Schema: {}", result.schema_version)?;
+        writeln!(stdout, "Result: {}", result.digest)?;
+        writeln!(stdout, "Exit code: {}", result.exit_code)?;
+        writeln!(stdout, "Started: {}", result.started_at)?;
+        writeln!(stdout, "Completed: {}", result.completed_at)?;
+        writeln!(stdout, "Base filesystem: {}", result.base_filesystem_digest)?;
+        writeln!(
+            stdout,
+            "Result filesystem: {}",
+            result.result_filesystem_digest
+        )?;
+        writeln!(stdout, "Portable delta: {}", result.portable_delta_digest)?;
+        writeln!(
+            stdout,
+            "Retained container: {} ({})",
+            result.docker.retained_container_name, result.docker.retained_container_state
+        )?;
+        for warning in &result.warnings {
+            writeln!(stdout, "Warning: {warning}")?;
+        }
+        if verify {
+            writeln!(stdout, "Integrity: verified")?;
+        }
+        return Ok(());
+    }
     let manifest = snapshot::load(&store, digest)?;
     if verify {
         snapshot::verify(&store, &manifest)?;
@@ -184,10 +338,51 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut json = false;
+    let mut raw = false;
+    let mut run_id = None;
+    for argument in arguments {
+        match argument.as_str() {
+            "--json" => json = true,
+            "--raw" => raw = true,
+            "--help" | "-h" => {
+                writeln!(stdout, "usage: agentlab diff [--raw] [--json] RUN")?;
+                return Ok(());
+            }
+            value if value.starts_with('-') => bail!("unexpected diff argument {value:?}"),
+            value if run_id.is_none() => run_id = Some(value),
+            value => bail!("unexpected diff argument {value:?}"),
+        }
+    }
+    let run_id = run_id.ok_or_else(|| anyhow::anyhow!("diff requires RUN"))?;
+    let store = Store::open(None)?;
+    let delta = run::load_delta(&store, run_id, raw)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &delta)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+    writeln!(stdout, "Delta: {}", delta.digest)?;
+    writeln!(stdout, "Base: {}", delta.base_filesystem_digest)?;
+    writeln!(stdout, "Result: {}", delta.result_filesystem_digest)?;
+    writeln!(stdout, "Changes: {}", delta.changes.len())?;
+    for change in &delta.changes {
+        writeln!(stdout, "  {:?} {}", change.change, change.path)?;
+    }
+    if !raw {
+        writeln!(stdout, "Ignored changes: {}", delta.ignored_changes.len())?;
+        for change in &delta.ignored_changes {
+            writeln!(stdout, "  {:?} {}", change.change, change.path)?;
+        }
+    }
+    Ok(())
+}
+
 fn print_help(output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
-        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT\n\nMilestone 1 commands:\n  snapshot    capture an immutable workspace snapshot\n  inspect     inspect snapshot metadata without printing file contents\n\nRun lifecycle commands are introduced in later milestones."
+        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  inspect     inspect and verify snapshot or run metadata\n  diff        show normalized persistent filesystem changes\n\nRuns retain their stopped container for direct inspection."
     )?;
     Ok(())
 }

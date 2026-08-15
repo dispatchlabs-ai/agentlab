@@ -12,7 +12,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 implements the first independently useful part of that model: deterministic, content-addressed workspace snapshots. Isolated OCI execution and whole-machine change capture begin in Milestone 2 and are intentionally not represented as working yet.
+Milestones 1 and 2 implement deterministic workspace snapshots plus one complete direct-Docker execution and observation cycle. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, and records a portable whole-root-filesystem delta without mounting the source workspace.
 
 ## Current capabilities
 
@@ -26,6 +26,10 @@ Milestone 1 implements the first independently useful part of that model: determ
 - Inspects paths, hashes, sizes, modes, symlink targets, repositories, and ignore-rule identity without printing file contents.
 - Verifies manifest and blob integrity.
 - Fails precisely on unsupported special files instead of silently dropping them.
+- Resolves an OCI image immutably and executes one command in a uniquely named retained Docker container.
+- Captures persistent changes across the complete guest root filesystem, including content, modes, types, symlink targets, and deletions.
+- Records raw and `.agentlabignore`-filtered deltas, stdout, stderr, nonzero exit status, lifecycle events, Docker evidence, requested captures, and integrity hashes.
+- Rejects image volumes and external writable mounts that would escape complete root-filesystem observation.
 
 AgentLab does not attempt to make a transactionally consistent snapshot of a workspace that is being modified concurrently. It detects changes to regular files while reading them and asks the user to retry from a stable source.
 
@@ -33,6 +37,7 @@ AgentLab does not attempt to make a transactionally consistent snapshot of a wor
 
 - Rust 1.85 or newer, including Cargo.
 - Git available in `PATH` when a workspace contains `.gitignore` files or Git repositories.
+- Docker Engine for `agentlab run` (Docker Desktop is sufficient on macOS).
 
 Git is used as the ignore-semantics authority. AgentLab evaluates workspace ignore files through temporary Git metadata outside the workspace, disables machine-global and system Git configuration for that evaluation, and uses read-only Git discovery commands with optional locks disabled.
 
@@ -75,6 +80,28 @@ Repeat the snapshot without changing the source. The snapshot digest will be ide
 
 Use `--json` with `snapshot` or `inspect` for machine-readable output.
 
+Run a harmless command against a private reconstruction of a workspace:
+
+```bash
+./target/release/agentlab run \
+  --workspace /path/to/workspace \
+  --image ubuntu:24.04 \
+  --network none \
+  -- /bin/sh -c 'printf "guest only\n" > /workspace/agentlab-proof.txt'
+```
+
+The summary includes a run ID, the command's exit code, the number of portable and ignored changes, and the retained stopped container name. Inspect and verify the result, then view its normalized delta:
+
+```bash
+./target/release/agentlab inspect --verify RUN_ID
+./target/release/agentlab diff RUN_ID
+./target/release/agentlab diff --raw RUN_ID
+```
+
+Use `--factor KEY=VALUE` to preserve arbitrary experimental factors, `--capture /guest/path=NAME` to export a selected path as a tar artifact, and `--change-ignore PATH` to override the workspace-root `.agentlabignore`. Network access defaults to `none`; Milestone 2 also accepts `--network bridge`.
+
+The container is deliberately retained in the exited state so it can be inspected directly with Docker. Milestone 2 does not yet provide AgentLab lifecycle commands or restore process memory.
+
 ## Local state
 
 AgentLab stores manifests and blobs in a user-private directory:
@@ -82,7 +109,14 @@ AgentLab stores manifests and blobs in a user-private directory:
 ```text
 ~/.agentlab/
 ├── blobs/sha256/
-└── snapshots/sha256/
+├── snapshots/sha256/
+└── runs/RUN_ID/
+    ├── spec.json
+    ├── delta.json
+    ├── delta.raw.json
+    ├── result.json
+    ├── artifacts/
+    └── evidence/
 ```
 
 Set `AGENTLAB_STATE_DIR` to use a different state location, which is especially useful for tests and disposable demonstrations. Generated snapshot content is never written into the selected source workspace by default.
@@ -97,9 +131,10 @@ Run all tests and static checks:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo test --test milestone2 -- --ignored --nocapture
 ```
 
-The conformance tests build disposable workspaces and prove default inclusion, Git-compatible exclusion, repository discovery, tracked-file inclusion, deterministic identity, source immutability, reconstruction, content reuse, and explicit failure for unsupported special files.
+The ordinary test suite covers deterministic snapshots without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity.
 
 See [SPEC.md](SPEC.md) for the contracts, [CONFORMANCE.md](CONFORMANCE.md) for the staged test plan, and [agentlab-plan.md](agentlab-plan.md) for the complete goal-oriented roadmap.
 

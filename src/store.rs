@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -55,6 +55,15 @@ impl Store {
     pub fn put_file(&self, path: &Path) -> Result<PutResult> {
         let mut source =
             File::open(path).with_context(|| format!("open source file {}", path.display()))?;
+        self.put_reader(&mut source)
+            .with_context(|| format!("capture source file {}", path.display()))
+    }
+
+    pub fn put_bytes(&self, bytes: &[u8]) -> Result<PutResult> {
+        self.put_reader(&mut Cursor::new(bytes))
+    }
+
+    pub fn put_reader(&self, source: &mut dyn Read) -> Result<PutResult> {
         let incoming_directory = self.root.join("blobs").join("sha256");
         let mut temporary =
             NamedTempFile::new_in(&incoming_directory).context("create temporary content blob")?;
@@ -64,9 +73,7 @@ impl Store {
         let mut size = 0_u64;
         let mut buffer = [0_u8; 128 * 1024];
         loop {
-            let read = source
-                .read(&mut buffer)
-                .with_context(|| format!("read source file {}", path.display()))?;
+            let read = source.read(&mut buffer).context("read content source")?;
             if read == 0 {
                 break;
             }
@@ -187,6 +194,54 @@ impl Store {
         fs::read(&path).with_context(|| format!("snapshot sha256:{hex} not found"))
     }
 
+    pub fn create_run_directory(&self, run_id: &str) -> Result<PathBuf> {
+        validate_run_id(run_id)?;
+        let runs = self.root.join("runs");
+        fs::create_dir_all(&runs).context("create AgentLab runs directory")?;
+        secure_directory(&runs)?;
+        let directory = runs.join(run_id);
+        fs::create_dir(&directory).with_context(|| format!("create run directory {run_id}"))?;
+        secure_directory(&directory)?;
+        for child in ["artifacts", "evidence"] {
+            let path = directory.join(child);
+            fs::create_dir(&path)?;
+            secure_directory(&path)?;
+        }
+        Ok(directory)
+    }
+
+    pub fn run_directory(&self, run_id: &str) -> Result<PathBuf> {
+        validate_run_id(run_id)?;
+        let directory = self.root.join("runs").join(run_id);
+        if !directory.is_dir() {
+            bail!("run {run_id:?} not found");
+        }
+        Ok(directory)
+    }
+
+    pub fn write_run_file(&self, run_id: &str, relative: &str, data: &[u8]) -> Result<PathBuf> {
+        let directory = self.run_directory(run_id)?;
+        let destination = safe_run_path(&directory, relative)?;
+        let parent = destination.parent().context("run file has no parent")?;
+        fs::create_dir_all(parent)?;
+        secure_directory(parent)?;
+        let mut temporary = NamedTempFile::new_in(parent).context("create temporary run file")?;
+        secure_file(temporary.as_file())?;
+        temporary.write_all(data)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)
+            .with_context(|| format!("persist run artifact {relative:?}"))?;
+        Ok(destination)
+    }
+
+    pub fn read_run_file(&self, run_id: &str, relative: &str) -> Result<Vec<u8>> {
+        let directory = self.run_directory(run_id)?;
+        let path = safe_run_path(&directory, relative)?;
+        fs::read(&path).with_context(|| format!("read run artifact {relative:?}"))
+    }
+
     fn blob_path(&self, hex: &str) -> PathBuf {
         self.root
             .join("blobs")
@@ -194,6 +249,33 @@ impl Store {
             .join(&hex[..2])
             .join(&hex[2..])
     }
+}
+
+fn validate_run_id(run_id: &str) -> Result<()> {
+    if run_id.is_empty()
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        bail!("invalid run ID {run_id:?}");
+    }
+    Ok(())
+}
+
+fn safe_run_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("unsafe run artifact path {relative:?}");
+    }
+    let mut path = root.to_path_buf();
+    for part in relative.split('/') {
+        path.push(part);
+    }
+    Ok(path)
 }
 
 pub fn normalize_digest(digest: &str) -> Result<String> {

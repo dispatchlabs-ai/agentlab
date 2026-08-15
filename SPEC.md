@@ -1,7 +1,10 @@
 # AgentLab Specification
 
-Status: Milestone 1 working contract
+Status: Milestones 1–2 working contract
 Snapshot schema: `agentlab.snapshot/v1`
+Run schema: `agentlab.run/v1`
+Delta schema: `agentlab.delta/v1`
+Result schema: `agentlab.result/v1`
 
 ## 1. Scope
 
@@ -13,7 +16,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 defines the immutable workspace-input portion. It deliberately does not define a workspace layout, repository registry, harness integration, environment-definition language, evaluator, adopter, daemon, scheduler, or cloud control plane.
+Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Neither defines a workspace layout, repository registry, harness integration, evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
 
 The selected workspace is opaque user content. Names such as `AGENTS.md`, `MEMORY.md`, `repos/`, `skills/`, and `worktrees/` have no meaning to the snapshot protocol.
 
@@ -109,6 +112,54 @@ Default inspection reports paths, types, hashes, sizes, modes, symlink targets, 
 
 Snapshot artifacts may contain credentials or other sensitive content. Local-only storage and metadata-only inspection reduce accidental exposure but do not make an artifact safe to publish.
 
-## 7. Future protocol boundary
+## 7. Run contract
 
-Milestone 2 will combine a workspace snapshot with a resolved OCI image digest and materialization settings, copy that state into private Docker storage, execute an opaque command, and capture the persistent guest-root delta. No Milestone 1 field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.
+`agentlab run` combines a workspace snapshot, immutable OCI image resolution, materialization settings, an opaque command, resource and network policy, arbitrary factors, change-ignore identity, and requested captures. The implementation MUST:
+
+1. Reconstruct the workspace from its snapshot in private storage at `/workspace` by default, never through a writable source mount.
+2. Establish and export a prepared base root filesystem after materialization and before command execution.
+3. execute the command exactly once in a uniquely named retained container;
+4. preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events;
+5. reject image-declared volumes and any container mount outside the exported root filesystem;
+6. retain the stopped result container for direct inspection; and
+7. state explicitly that pseudo-filesystems and live process memory are not portable persistent state.
+
+The run specification contains the snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, factors, resource limits, network policy, capture declarations, workspace- and change-ignore identities, backend evidence, and AgentLab version. Factors are recorded verbatim and have no core semantics.
+
+The Docker image and container identifiers are evidence, not AgentLab's portable run identity. A prepared Docker image ID may be nondeterministic without changing the meaning of the declared input.
+
+## 8. Persistent root-filesystem observation
+
+AgentLab exports both the prepared base and completed merged root filesystems. It normalizes each path to a sorted manifest containing its absolute UTF-8 path, type, relevant mode, regular-file digest and size, or symlink target. Supported normalized types are regular file, directory, and symlink; archive hard links resolve to the target regular-file identity. Unsupported persistent archive types fail explicitly.
+
+Comparison produces one of: `added`, `modified`, `deleted`, `type_changed`, `mode_changed`, or `symlink_changed`. A rename is portable as an authoritative delete plus add. Result regular-file bodies are inserted into the content-addressed store.
+
+Docker diff output is retained as path evidence and checked against the authoritative comparison. It does not replace the prepared/result exports: export provides merged content but not deletions, while Docker diff lacks complete portable content and metadata. Any normalized path not covered by Docker diff is recorded explicitly as evidence and a warning rather than silently discarded.
+
+Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds, named volumes, cache mounts, and image volumes are unsupported because their contents would fall outside the captured root filesystem.
+
+## 9. Delta contract
+
+`agentlab.delta/v1` contains:
+
+- its canonical SHA-256 identity;
+- prepared-base and result-rootfs identities;
+- change-ignore source and content identity;
+- normalized path changes; and
+- explicit ignored-change records.
+
+`delta.raw.json` records every normalized persistent change. `delta.json` applies `.agentlabignore` from the selected workspace root, or an explicit `--change-ignore` file, using Git-compatible patterns. Ignore rules affect only portable selection: ignored paths remain observed in the raw delta and present in the retained container. They are never represented as unobserved.
+
+The delta identity is SHA-256 over compact JSON containing every semantic field except the digest itself. Arrays are deterministically path ordered by rootfs comparison.
+
+## 10. Result contract and integrity
+
+`agentlab.result/v1` contains the run ID and run-spec digest, timing and lifecycle, exit code, stdout/stderr and requested capture artifacts, rootfs and delta identities, Docker evidence, observation status, warnings, and a path-to-digest integrity map. Its identity is SHA-256 over compact JSON containing those semantic fields except the result digest itself.
+
+Run-local artifacts include the specification, normalized rootfs manifests, raw and portable deltas, complete base/result exports, stdout, stderr, Docker inspection and diff evidence, and requested capture archives. `agentlab inspect --verify RUN` recalculates every listed artifact digest and the result identity before reporting success. Default inspection reports metadata and paths without printing captured file content.
+
+Run artifacts and complete rootfs exports may contain credentials or other sensitive information. A retained container and local state directory are private operational artifacts, not safe publication units.
+
+## 11. Current boundary
+
+Milestone 2 is deliberately one direct-Docker run. AgentLab does not yet provide lifecycle management, continuation, fork/adopt operations, concurrent repetition, evaluation, or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.

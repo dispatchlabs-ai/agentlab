@@ -1,4 +1,6 @@
 pub mod app;
+pub mod rootfs;
+pub mod run;
 pub mod snapshot;
 pub mod store;
 

@@ -19,8 +19,10 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - Milestone 0 is complete: AgentLab exists as an independent Rust project with a CLI, specification, conformance outline, and permissive license.
 - Milestone 1 is complete: deterministic, content-addressed workspace snapshots are implemented and covered by passing unit and conformance tests plus strict Clippy validation.
 - The `agentlab.snapshot/v1` verification gaps are closed: permission-only source mutations are detected during capture, and verification independently recomputes `ignore_rules_digest` from the recorded rule set.
-- The next implementation milestone is one complete direct-Docker run plus AgentLab-owned portable run, delta, and result formats. Preserve only a thin internal execution seam; do not build a generalized backend framework before a second implementation proves it is needed.
-- The repository should record the completed milestones in an initial baseline commit before Milestone 2 implementation begins.
+- Milestone 2 is complete: one direct-Docker command is materialized privately, executed once, retained, and normalized into documented `agentlab.run/v1`, `agentlab.delta/v1`, and `agentlab.result/v1` artifacts with integrity verification.
+- The Docker-gated whole-machine conformance fixture covers repository commits, package installation, workspace and system paths, content/mode/type/symlink/delete changes, ignore selection, nonzero exit, captures, evidence, and source immutability.
+- The Pi-workspace hands-on checkpoint passed against `ubuntu:24.04`: writes under `/workspace`, `/etc`, and `/root` appeared only in the retained container and portable delta, while the source snapshot digest remained unchanged.
+- The next implementation milestone is comparable repetition and isolation (Milestone 3). Preserve the current direct implementation; do not build a generalized backend framework before a second implementation proves it is needed.
 
 ## North-star goal
 
@@ -503,7 +505,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 ### Milestone 1: Produce deterministic workspace snapshots
 
-**Status:** Complete, with the two schema-freeze verification corrections listed below still required.
+**Status:** Complete, including the two schema-freeze verification corrections listed below.
 
 **Goal:** Turn any directory into a content-addressed immutable snapshot with correct default-inclusion and `.gitignore` behavior.
 
@@ -526,6 +528,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 **Hands-on checkpoint:** Run `agentlab snapshot --workspace /path/to/chosen/workspace`, inspect the returned digest, repeat the snapshot to demonstrate stable identity, and verify that the chosen source workspace is byte-identical afterward.
 
 ### Milestone 2: Run one isolated Docker command and capture the whole machine
+
+**Status:** Complete.
 
 **Goal:** Prove the portable run/result protocol by executing an arbitrary command in a private Docker container and exporting every persistent filesystem change across the guest.
 

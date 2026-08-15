@@ -47,12 +47,24 @@ The hands-on checkpoint additionally runs the public CLI against a workspace cho
 
 ## Milestone 2: isolated execution and whole-machine delta
 
-- Materialize the workspace privately at `/workspace` without a writable source mount.
-- Modify `/workspace`, a persistent home, `/etc`, `/usr`, `/opt`, and `/var` where guest permissions permit.
-- Capture additions, modifications, deletions, renames or their authoritative add/delete representation, modes, symlinks, and whiteouts.
-- Prove `.agentlabignore` affects only portable export, not retained guest state.
-- Record lifecycle, stdout, stderr, exit status, warnings, and integrity hashes.
-- Distinguish persistent root changes from pseudo-filesystems and runtime-only mounts.
+The Docker-gated fixture uses `ubuntu:24.04`, a disposable Git workspace, and a command that installs packages, creates a repository commit, exits with status 23, and modifies persistent paths throughout the guest. It proves:
+
+1. The workspace is materialized privately at `/workspace` without a writable source mount.
+2. Workspace, persistent home, `/etc`, package-managed `/usr`, and `/var` changes are captured.
+3. Additions, content modifications, deletions, rename-as-delete-plus-add, mode-only changes, type changes, and symlinks are normalized.
+4. A Git commit and its object/ref changes are captured without mutating the source repository.
+5. `.agentlabignore` removes exactly its selected path from the portable delta while the raw delta still reports it.
+6. The source snapshot identity is unchanged after execution.
+7. The nonzero exit status, lifecycle, stdout, stderr, captures, Docker evidence, observations, and integrity hashes are retained.
+8. `inspect --verify` recalculates every declared run artifact and result identity.
+9. A file outside `/workspace` can be copied from the retained stopped container for direct inspection.
+10. Persistent root changes are distinguished from pseudo-filesystems and unobserved live process memory.
+
+Run the Docker-gated case explicitly:
+
+```bash
+cargo test --test milestone2 -- --ignored --nocapture
+```
 
 ## Milestone 3: isolation and repetition
 
