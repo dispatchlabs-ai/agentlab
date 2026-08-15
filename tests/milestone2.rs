@@ -136,7 +136,7 @@ exit 23
 
     let result = run::load_result(&store, &summary.run_id)?;
     run::verify_result(&store, &result)?;
-    ensure!(result.docker.retained_container_state == "exited");
+    ensure!(result.docker.retained_container_state == "running");
     ensure!(
         result
             .captures

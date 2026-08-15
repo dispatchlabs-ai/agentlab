@@ -24,7 +24,9 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - The Pi-workspace hands-on checkpoint passed against `ubuntu:24.04`: writes under `/workspace`, `/etc`, and `/root` appeared only in the retained container and portable delta, while the source snapshot digest remained unchanged.
 - Milestone 3 is complete: concurrent runs receive distinct writable layers, comparisons verify identical portable inputs and bases, arbitrary/replicate factors are preserved, and expected factor differences are checked explicitly.
 - The Pi-workspace repetition checkpoint passed with two simultaneous `ubuntu:24.04` runs: identical snapshot, image, command, and portable base; distinct retained containers and private outcomes; exactly the declared `variant` and `replicate` differences; and an unchanged source snapshot.
-- The next implementation milestone is retained lifecycle management (Milestone 4). Preserve the current direct implementation; do not build a generalized backend framework before a second implementation proves it is needed.
+- Milestone 4 is complete: stable retained containers support ownership-checked list, inspect, stop, restart, harness continuation, filesystem fork, and exact removal while explicitly disclaiming live-memory restoration.
+- The Pi-workspace lifecycle checkpoint passed: one container ID survived stop/start, session value `1` continued to `2`, the requested capture refreshed, the fork inherited the exact continued base, deleting the fork preserved its parent, and the source snapshot remained unchanged.
+- The next implementation milestone is external evaluation (Milestone 5). Preserve the current direct implementation; do not build a scheduler, database, or factor/evaluator registry.
 
 ## North-star goal
 
@@ -577,6 +579,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 **Hands-on checkpoint:** Launch two runs from the same chosen workspace and image with different factor labels and conflicting writes to the same guest path. Inspect both results to show identical base identities, distinct private outcomes, and an unchanged source workspace.
 
 ### Milestone 4: Retain and manage session lifecycle
+
+**Status:** Complete.
 
 **Goal:** Preserve a Docker run long enough for inspection, harness continuation, filesystem-level fork, and later adoption.
 

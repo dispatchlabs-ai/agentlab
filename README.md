@@ -12,7 +12,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestones 1 and 2 implement deterministic workspace snapshots plus one complete direct-Docker execution and observation cycle. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, and records a portable whole-root-filesystem delta without mounting the source workspace.
+Milestones 1 through 4 implement deterministic workspace snapshots, isolated and comparable direct-Docker execution, and retained filesystem lifecycle. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, records a portable whole-root-filesystem delta without mounting the source workspace, and can later stop, continue, fork, inspect, or remove that retained state.
 
 ## Current capabilities
 
@@ -32,6 +32,9 @@ Milestones 1 and 2 implement deterministic workspace snapshots plus one complete
 - Rejects image volumes and external writable mounts that would escape complete root-filesystem observation.
 - Supports concurrent independent runs and verifies whether two results share the same workspace, resolved image, portable base, and controlled inputs.
 - Compares arbitrary factor values against explicitly expected differences, including ordinary `replicate` labels, without assigning semantics to them.
+- Retains a stable container supervisor so stop/start never reruns the original agent command.
+- Supports integrity-checked harness continuation from the exact filesystem, while explicitly reporting that process memory was not restored.
+- Creates independent filesystem-level forks and deletes only the selected run's owned container, image tag, and local artifacts.
 
 AgentLab does not attempt to make a transactionally consistent snapshot of a workspace that is being modified concurrently. It detects changes to regular files while reading them and asks the user to retry from a stable source.
 
@@ -92,7 +95,7 @@ Run a harmless command against a private reconstruction of a workspace:
   -- /bin/sh -c 'printf "guest only\n" > /workspace/agentlab-proof.txt'
 ```
 
-The summary includes a run ID, the command's exit code, the number of portable and ignored changes, and the retained stopped container name. Inspect and verify the result, then view its normalized delta:
+The summary includes a run ID, the command's exit code, the number of portable and ignored changes, and the retained container name. Inspect and verify the result, then view its normalized delta:
 
 ```bash
 ./target/release/agentlab inspect --verify RUN_ID
@@ -102,7 +105,7 @@ The summary includes a run ID, the command's exit code, the number of portable a
 
 Use `--factor KEY=VALUE` to preserve arbitrary experimental factors, `--capture /guest/path=NAME` to export a selected path as a tar artifact, and `--change-ignore PATH` to override the workspace-root `.agentlabignore`. Network access defaults to `none`; Milestone 2 also accepts `--network bridge`.
 
-The container is deliberately retained in the exited state so it can be inspected directly with Docker. Milestone 2 does not yet provide AgentLab lifecycle commands or restore process memory.
+The container remains running under an inert shell supervisor after the initial `docker exec` command completes. This makes later stop/start truthful: restarting the container starts only the supervisor and never reruns the original command.
 
 Launch independent runs concurrently using ordinary processes, recording every experimental label as a factor. Then verify that only the intended factors differed:
 
@@ -114,6 +117,23 @@ Launch independent runs concurrently using ordinary processes, recording every e
 ```
 
 `compare` integrity-checks both results before reporting whether their workspace snapshot, immutable image, exported prepared base, and controlled settings agree; whether their retained container identities are distinct; the exact factor differences; and whether their portable outcomes are equal. Factors absent from one side are reported with their missing value rather than normalized away.
+
+Manage retained filesystem state:
+
+```bash
+./target/release/agentlab list
+./target/release/agentlab stop RUN_ID
+./target/release/agentlab resume RUN_ID
+./target/release/agentlab resume RUN_ID -- /path/to/harness --continue
+./target/release/agentlab fork RUN_ID
+./target/release/agentlab rm RUN_OR_FORK_ID
+```
+
+`resume RUN` restarts the same stable container when stopped. Supplying a command executes a harness-level continuation in that container, re-exports and normalizes its complete persistent root filesystem, reapplies the preserved change-ignore rules, refreshes every requested capture, and writes `agentlab.continuation/v1`. It reports `filesystem_state_reused: true` and `process_memory_restored: false`—filesystem continuation is real, but the previous process tree and live memory are gone.
+
+`fork` commits the selected retained filesystem, exports it as the fork's portable base, and launches a separately owned stable container. Its `agentlab.fork/v1` record reports `filesystem_state_copied: true` and `process_memory_copied: false`. Forks can themselves be stopped, resumed, continued, inspected, and removed.
+
+Lifecycle operations require runs created by a lifecycle-capable AgentLab build. `list` marks older retained containers as `legacy`, and mutating commands reject them rather than risking rerunning their original command.
 
 ## Local state
 
@@ -128,6 +148,8 @@ AgentLab stores manifests and blobs in a user-private directory:
     ├── delta.json
     ├── delta.raw.json
     ├── result.json
+    ├── lifecycle/
+    ├── continuations/
     ├── artifacts/
     └── evidence/
 ```
@@ -146,9 +168,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --test milestone2 -- --ignored --nocapture
 cargo test --test milestone3 -- --ignored --nocapture
+cargo test --test milestone4 -- --ignored --nocapture
 ```
 
-The ordinary test suite covers deterministic snapshots without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity. The Milestone 3 Docker test launches overlapping runs from an identical Alpine base, forces conflicting writes, and proves distinct writable layers, exact factor preservation, comparable inputs, different private outcomes, and an unchanged source.
+The ordinary test suite covers deterministic snapshots without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity. The Milestone 3 Docker test launches overlapping runs from an identical Alpine base, forces conflicting writes, and proves distinct writable layers, exact factor preservation, comparable inputs, different private outcomes, and an unchanged source. The Milestone 4 test proves stable stop/start identity, session continuation and refreshed capture, full-rootfs continuation evidence, filesystem fork divergence, explicit memory disclaimers, and exact deletion while an unrelated control container survives.
+
+Lifecycle-capable images currently need `/bin/sh`, `sleep`, and `/bin/true`; typical Ubuntu, Alpine, and agent-development images satisfy this. Minimal `scratch`-style images fail explicitly because AgentLab cannot keep a stable supervisor inside them.
 
 See [SPEC.md](SPEC.md) for the contracts, [CONFORMANCE.md](CONFORMANCE.md) for the staged test plan, and [agentlab-plan.md](agentlab-plan.md) for the complete goal-oriented roadmap.
 

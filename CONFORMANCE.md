@@ -89,10 +89,25 @@ cargo test --test milestone3 -- --ignored --nocapture
 
 ## Milestone 4: retained lifecycle
 
-- List, inspect, stop, resume, and delete a retained run.
-- Prove filesystem continuation while explicitly disclaiming live-memory continuation.
-- Capture requested harness state outside `/workspace` without harness-specific core logic.
-- Delete only resources owned by the exact run.
+The Docker-gated fixture creates session-like state under `/root`, requests it as a capture, and retains a stable Alpine container. It proves:
+
+1. The initial opaque command executes through Docker exec, preserves a known nonzero status, and leaves the supervisor running.
+2. `list` discovers the run, live Docker state, lifecycle capability, and continuation count.
+3. `stop` and `resume` preserve the complete container ID and filesystem while reporting that process memory was not preserved or restored.
+4. A continuation after another stop reads prior session state, updates it, writes new workspace state, and preserves its own known nonzero exit.
+5. `agentlab.continuation/v1` captures the complete current rootfs and deltas, Docker evidence, stdout/stderr, and an updated requested session archive.
+6. Initial, lifecycle, and continuation integrity verification succeeds.
+7. A filesystem fork's portable base equals the parent's continued result-rootfs identity.
+8. The fork reads inherited session value `2`, changes its private copy to `3`, and leaves the parent value at `2`.
+9. Fork records and fork continuations explicitly report that filesystem state, but not process memory, was copied or restored.
+10. Deleting the fork leaves its parent and an unrelated control container untouched; deleting the parent still leaves the control container untouched.
+11. Selected run directories and unique image tags are removed while the shared content store and source workspace remain intact.
+
+Run the case explicitly:
+
+```bash
+cargo test --test milestone4 -- --ignored --nocapture
+```
 
 ## Milestones 5–9
 

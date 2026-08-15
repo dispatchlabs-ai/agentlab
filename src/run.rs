@@ -267,7 +267,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     lifecycle.push(event("workspace_snapshotted"));
     let resolved_image = resolve_image(&options.image)?;
     lifecycle.push(event("image_resolved"));
-    let change_ignore = resolve_change_ignore(options)?;
+    let (change_ignore, change_ignore_rules) = resolve_change_ignore(options)?;
 
     let spec = RunSpec {
         schema_version: RUN_SCHEMA_VERSION.to_string(),
@@ -302,6 +302,9 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         "evidence/image-inspect.json",
         &resolved_image.inspect,
     )?;
+    if let Some(rules) = &change_ignore_rules {
+        store.write_run_file(&run_id, "change-ignore.rules", rules)?;
+    }
 
     let materialized = tempfile::tempdir().context("create private materialization directory")?;
     snapshot::materialize(store, &workspace_snapshot.manifest, materialized.path())?;
@@ -373,6 +376,8 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     create
         .args(["create", "--name", &retained_name])
         .args(["--label", &format!("agentlab.run_id={run_id}")])
+        .args(["--label", "agentlab.lifecycle=v1"])
+        .args(["--label", &format!("agentlab.image_tag={prepared_tag}")])
         .args(["--workdir", &options.workspace_guest_path])
         .args(["--network", &options.network]);
     if let Some(memory) = &options.memory {
@@ -381,7 +386,11 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     if let Some(cpus) = &options.cpus {
         create.args(["--cpus", cpus]);
     }
-    create.arg(&prepared_image_id).args(&options.command);
+    create.arg(&prepared_image_id).args([
+        "/bin/sh",
+        "-c",
+        "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+    ]);
     let retained_id = docker_success(&mut create, "create retained run container")?;
     lifecycle.push(event("retained_container_created"));
     let pre_run_inspect = docker_output_bytes(
@@ -394,11 +403,18 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         "remove preparation container",
     )?;
 
+    docker_status(
+        Command::new("docker").args(["start", &retained_name]),
+        "start retained container supervisor",
+    )?;
+    lifecycle.push(event("retained_container_started"));
     lifecycle.push(event("command_started"));
     let command_output = Command::new("docker")
-        .args(["start", "--attach", &retained_name])
+        .args(["exec", &retained_name])
+        .args(&options.command)
         .output()
-        .context("start retained run container")?;
+        .context("execute command in retained run container")?;
+    let exit_code = command_output.status.code().map(i64::from).unwrap_or(-1);
     lifecycle.push(event("command_completed"));
     let stdout = write_artifact(
         store,
@@ -418,7 +434,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         "inspect completed retained container",
     )?;
     ensure_no_external_mounts(&result_inspect_bytes)?;
-    let (exit_code, retained_state) = container_status(&result_inspect_bytes)?;
+    let (_, retained_state) = container_status(&result_inspect_bytes)?;
     let result_inspect = write_artifact(
         store,
         &run_id,
@@ -544,6 +560,9 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         integrity.insert(artifact.path.clone(), artifact.digest.clone());
     }
     integrity.insert("spec.json".to_string(), spec_digest.clone());
+    if let Some(rules) = &change_ignore_rules {
+        integrity.insert("change-ignore.rules".to_string(), sha256_bytes(rules));
+    }
     integrity.insert(
         "base-rootfs.json".to_string(),
         sha256_bytes(&base_manifest_bytes),
@@ -957,7 +976,7 @@ fn docker_version() -> Result<String> {
     )
 }
 
-fn ensure_no_external_mounts(inspect: &[u8]) -> Result<()> {
+pub(crate) fn ensure_no_external_mounts(inspect: &[u8]) -> Result<()> {
     let value: Value = serde_json::from_slice(inspect).context("decode Docker inspect evidence")?;
     let mounts = value
         .as_array()
@@ -973,7 +992,7 @@ fn ensure_no_external_mounts(inspect: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn container_status(inspect: &[u8]) -> Result<(i64, String)> {
+pub(crate) fn container_status(inspect: &[u8]) -> Result<(i64, String)> {
     let value: Value = serde_json::from_slice(inspect).context("decode Docker inspect evidence")?;
     let container = value
         .as_array()
@@ -992,20 +1011,26 @@ fn container_status(inspect: &[u8]) -> Result<(i64, String)> {
     ))
 }
 
-fn resolve_change_ignore(options: &RunOptions) -> Result<IgnoreIdentity> {
+fn resolve_change_ignore(options: &RunOptions) -> Result<(IgnoreIdentity, Option<Vec<u8>>)> {
     let path = change_ignore_path(options);
     let Some(path) = path else {
-        return Ok(IgnoreIdentity {
-            source: None,
-            digest: format!("sha256:{}", hex_digest(&Sha256::digest([]))),
-        });
+        return Ok((
+            IgnoreIdentity {
+                source: None,
+                digest: format!("sha256:{}", hex_digest(&Sha256::digest([]))),
+            },
+            None,
+        ));
     };
     let bytes =
         fs::read(&path).with_context(|| format!("read change-ignore rules {}", path.display()))?;
-    Ok(IgnoreIdentity {
-        source: Some(path.display().to_string()),
-        digest: format!("sha256:{}", hex_digest(&Sha256::digest(bytes))),
-    })
+    Ok((
+        IgnoreIdentity {
+            source: Some(path.display().to_string()),
+            digest: format!("sha256:{}", hex_digest(&Sha256::digest(&bytes))),
+        },
+        Some(bytes),
+    ))
 }
 
 fn change_ignore_path(options: &RunOptions) -> Option<PathBuf> {
@@ -1022,8 +1047,15 @@ fn evaluate_change_ignore(
     let Some(path) = change_ignore_path(options) else {
         return Ok(HashSet::new());
     };
+    evaluate_change_ignore_bytes(&fs::read(path)?, changes)
+}
+
+pub(crate) fn evaluate_change_ignore_bytes(
+    rules: &[u8],
+    changes: &[RootFsChange],
+) -> Result<HashSet<String>> {
     let temporary = tempfile::tempdir()?;
-    fs::write(temporary.path().join(".gitignore"), fs::read(path)?)?;
+    fs::write(temporary.path().join(".gitignore"), rules)?;
     let git_directory = temporary.path().join("ignore.git");
     git_status(
         Command::new("git")
@@ -1085,7 +1117,7 @@ fn git_status(command: &mut Command, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn make_delta(
+pub(crate) fn make_delta(
     base: &RootFsManifest,
     result: &RootFsManifest,
     change_ignore: &IgnoreIdentity,
@@ -1193,7 +1225,7 @@ fn write_artifact(store: &Store, run_id: &str, relative: &str, bytes: &[u8]) -> 
     })
 }
 
-fn artifact_for_file(relative: &str, path: &Path) -> Result<Artifact> {
+pub(crate) fn artifact_for_file(relative: &str, path: &Path) -> Result<Artifact> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let size = std::io::copy(&mut file, &mut hasher)?;
@@ -1204,17 +1236,17 @@ fn artifact_for_file(relative: &str, path: &Path) -> Result<Artifact> {
     })
 }
 
-fn pretty_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+pub(crate) fn pretty_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex_digest(&Sha256::digest(bytes)))
 }
 
-fn docker_success(command: &mut Command, context: &str) -> Result<String> {
+pub(crate) fn docker_success(command: &mut Command, context: &str) -> Result<String> {
     let output = command.output().with_context(|| context.to_string())?;
     if !output.status.success() {
         bail!(
@@ -1225,11 +1257,11 @@ fn docker_success(command: &mut Command, context: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn docker_status(command: &mut Command, context: &str) -> Result<()> {
+pub(crate) fn docker_status(command: &mut Command, context: &str) -> Result<()> {
     docker_success(command, context).map(|_| ())
 }
 
-fn docker_output_bytes(command: &mut Command, context: &str) -> Result<Vec<u8>> {
+pub(crate) fn docker_output_bytes(command: &mut Command, context: &str) -> Result<Vec<u8>> {
     let output: Output = command.output().with_context(|| context.to_string())?;
     if !output.status.success() {
         bail!(

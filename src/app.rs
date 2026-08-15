@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::VERSION;
+use crate::lifecycle;
 use crate::run::{self, CaptureSpec, RunOptions};
 use crate::snapshot::{self, Repository};
 use crate::store::Store;
@@ -32,11 +33,202 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write) -> Result<()> {
         }
         "snapshot" => snapshot_command(&arguments[1..], stdout),
         "run" => run_command(&arguments[1..], stdout),
+        "list" => list_command(&arguments[1..], stdout),
+        "stop" => stop_command(&arguments[1..], stdout),
+        "resume" => resume_command(&arguments[1..], stdout),
+        "fork" => fork_command(&arguments[1..], stdout),
+        "rm" => remove_command(&arguments[1..], stdout),
         "compare" => compare_command(&arguments[1..], stdout),
         "diff" => diff_command(&arguments[1..], stdout),
         "inspect" => inspect_command(&arguments[1..], stdout),
         _ => bail!("unknown command {command:?}\n\nRun `agentlab --help` for usage."),
     }
+}
+
+fn list_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let json = match arguments {
+        [] => false,
+        [argument] if argument == "--json" => true,
+        [argument] if argument == "--help" || argument == "-h" => {
+            writeln!(stdout, "usage: agentlab list [--json]")?;
+            return Ok(());
+        }
+        _ => bail!("usage: agentlab list [--json]"),
+    };
+    let store = Store::open(None)?;
+    let runs = lifecycle::list(&store)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &runs)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+    if runs.is_empty() {
+        writeln!(stdout, "No retained runs.")?;
+        return Ok(());
+    }
+    writeln!(
+        stdout,
+        "RUN ID                                KIND  STATE    CONTINUATIONS  CONTAINER"
+    )?;
+    for run in runs {
+        writeln!(
+            stdout,
+            "{:<36}  {:<4}  {:<7}  {:<13}  {}{}",
+            run.run_id,
+            run.kind,
+            run.container_state,
+            run.continuation_count,
+            run.container_name,
+            if run.lifecycle_capable {
+                ""
+            } else {
+                " (legacy)"
+            }
+        )?;
+    }
+    Ok(())
+}
+
+fn stop_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        writeln!(stdout, "usage: agentlab stop [--json] RUN")?;
+        return Ok(());
+    }
+    let (run_id, json) = lifecycle_run_argument(arguments, "stop")?;
+    let store = Store::open(None)?;
+    let run = lifecycle::stop(&store, run_id)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &run)?;
+        writeln!(stdout)?;
+    } else {
+        writeln!(stdout, "Run: {}", run.run_id)?;
+        writeln!(stdout, "Container: {}", run.container_name)?;
+        writeln!(stdout, "State: {}", run.container_state)?;
+        writeln!(stdout, "Filesystem state preserved: true")?;
+        writeln!(stdout, "Process memory preserved: false")?;
+    }
+    Ok(())
+}
+
+fn resume_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        writeln!(
+            stdout,
+            "usage: agentlab resume [--json] RUN [-- COMMAND [ARG ...]]"
+        )?;
+        return Ok(());
+    }
+    let separator = arguments.iter().position(|argument| argument == "--");
+    let (options, command) = match separator {
+        Some(index) => (&arguments[..index], &arguments[index + 1..]),
+        None => (arguments, &[][..]),
+    };
+    let (run_id, json) = lifecycle_run_argument(options, "resume")?;
+    let store = Store::open(None)?;
+    let result = lifecycle::resume(&store, run_id, command)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &result)?;
+        writeln!(stdout)?;
+    } else {
+        writeln!(stdout, "Run: {}", result.run_id)?;
+        writeln!(stdout, "Container: {}", result.container_name)?;
+        writeln!(stdout, "State: {}", result.container_state)?;
+        writeln!(
+            stdout,
+            "Container restarted: {}",
+            result.container_restarted
+        )?;
+        writeln!(stdout, "Filesystem state reused: true")?;
+        writeln!(stdout, "Process memory restored: false")?;
+        if let Some(continuation) = result.continuation {
+            writeln!(stdout, "Continuation: {}", continuation.continuation_id)?;
+            writeln!(stdout, "Exit code: {}", continuation.exit_code)?;
+            writeln!(
+                stdout,
+                "Result filesystem: {}",
+                continuation.result_filesystem_digest
+            )?;
+            writeln!(
+                stdout,
+                "Portable delta: {}",
+                continuation.portable_delta_digest
+            )?;
+            writeln!(stdout, "Captures: {}", continuation.captures.len())?;
+        }
+    }
+    Ok(())
+}
+
+fn fork_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        writeln!(stdout, "usage: agentlab fork [--json] RUN")?;
+        return Ok(());
+    }
+    let (run_id, json) = lifecycle_run_argument(arguments, "fork")?;
+    let store = Store::open(None)?;
+    let fork = lifecycle::fork(&store, run_id)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &fork)?;
+        writeln!(stdout)?;
+    } else {
+        writeln!(stdout, "Fork: {}", fork.run_id)?;
+        writeln!(stdout, "Parent: {}", fork.parent_run_id)?;
+        writeln!(stdout, "Container: {}", fork.container_name)?;
+        writeln!(stdout, "State: running")?;
+        writeln!(stdout, "Base filesystem: {}", fork.base_filesystem_digest)?;
+        writeln!(stdout, "Filesystem state copied: true")?;
+        writeln!(stdout, "Process memory copied: false")?;
+    }
+    Ok(())
+}
+
+fn remove_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        writeln!(stdout, "usage: agentlab rm [--json] RUN")?;
+        return Ok(());
+    }
+    let (run_id, json) = lifecycle_run_argument(arguments, "rm")?;
+    let store = Store::open(None)?;
+    let removed = lifecycle::remove(&store, run_id)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &removed)?;
+        writeln!(stdout)?;
+    } else {
+        writeln!(stdout, "Removed run: {}", removed.run_id)?;
+        writeln!(stdout, "Removed container: {}", removed.container_name)?;
+        writeln!(stdout, "Removed image tag: {}", removed.image_tag)?;
+        writeln!(stdout, "Removed local run artifacts: true")?;
+    }
+    Ok(())
+}
+
+fn lifecycle_run_argument<'a>(arguments: &'a [String], command: &str) -> Result<(&'a str, bool)> {
+    let mut run_id = None;
+    let mut json = false;
+    for argument in arguments {
+        match argument.as_str() {
+            "--json" => json = true,
+            value if value.starts_with('-') => bail!("unexpected {command} argument {value:?}"),
+            value if run_id.is_none() => run_id = Some(value),
+            value => bail!("unexpected {command} argument {value:?}"),
+        }
+    }
+    Ok((
+        run_id.ok_or_else(|| anyhow::anyhow!("{command} requires RUN"))?,
+        json,
+    ))
 }
 
 fn required_value<'a>(arguments: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str> {
@@ -382,9 +574,46 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     let digest = digest.ok_or_else(|| anyhow::anyhow!("inspect requires SNAPSHOT_OR_RUN"))?;
     let store = Store::open(None)?;
     if !digest.starts_with("sha256:") {
+        if store.run_file_exists(digest, "fork.json")? {
+            let fork = lifecycle::load_fork(&store, digest)?;
+            if verify {
+                lifecycle::verify_all(&store, digest)?;
+            }
+            if json {
+                serde_json::to_writer_pretty(&mut *stdout, &fork)?;
+                writeln!(stdout)?;
+                return Ok(());
+            }
+            let managed = lifecycle::inspect(&store, digest, false)?;
+            writeln!(stdout, "Fork: {}", fork.run_id)?;
+            writeln!(stdout, "Schema: {}", fork.schema_version)?;
+            writeln!(stdout, "Record: {}", fork.digest)?;
+            writeln!(stdout, "Parent: {}", fork.parent_run_id)?;
+            writeln!(stdout, "Base filesystem: {}", fork.base_filesystem_digest)?;
+            writeln!(
+                stdout,
+                "Container: {} ({})",
+                managed.container_name, managed.container_state
+            )?;
+            writeln!(stdout, "Continuations: {}", managed.continuation_count)?;
+            writeln!(
+                stdout,
+                "Filesystem state copied: {}",
+                fork.filesystem_state_copied
+            )?;
+            writeln!(
+                stdout,
+                "Process memory copied: {}",
+                fork.process_memory_copied
+            )?;
+            if verify {
+                writeln!(stdout, "Integrity: verified")?;
+            }
+            return Ok(());
+        }
         let result = run::load_result(&store, digest)?;
         if verify {
-            run::verify_result(&store, &result)?;
+            lifecycle::verify_all(&store, digest)?;
         }
         if json {
             serde_json::to_writer_pretty(&mut *stdout, &result)?;
@@ -404,11 +633,14 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             result.result_filesystem_digest
         )?;
         writeln!(stdout, "Portable delta: {}", result.portable_delta_digest)?;
+        let managed = lifecycle::inspect(&store, digest, false)?;
         writeln!(
             stdout,
             "Retained container: {} ({})",
-            result.docker.retained_container_name, result.docker.retained_container_state
+            managed.container_name, managed.container_state
         )?;
+        writeln!(stdout, "Lifecycle capable: {}", managed.lifecycle_capable)?;
+        writeln!(stdout, "Continuations: {}", managed.continuation_count)?;
         for warning in &result.warnings {
             writeln!(stdout, "Warning: {warning}")?;
         }
@@ -504,7 +736,7 @@ fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 fn print_help(output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
-        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  compare     verify controlled inputs and expected factor differences\n  inspect     inspect and verify snapshot or run metadata\n  diff        show normalized persistent filesystem changes\n\nRuns retain their stopped container for direct inspection."
+        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, and lifecycle metadata\n  diff        show normalized persistent filesystem changes\n  compare     verify controlled inputs and expected factor differences\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not."
     )?;
     Ok(())
 }

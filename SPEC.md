@@ -1,10 +1,13 @@
 # AgentLab Specification
 
-Status: Milestones 1–3 working contract
+Status: Milestones 1–4 working contract
 Snapshot schema: `agentlab.snapshot/v1`
 Run schema: `agentlab.run/v1`
 Delta schema: `agentlab.delta/v1`
 Result schema: `agentlab.result/v1`
+Continuation schema: `agentlab.continuation/v1`
+Fork schema: `agentlab.fork/v1`
+Lifecycle event schema: `agentlab.lifecycle-event/v1`
 
 ## 1. Scope
 
@@ -16,7 +19,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. None defines a workspace layout, repository registry, harness integration, evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
+Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained filesystem state and harness-level continuation. None defines a workspace layout, repository registry, harness integration, evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
 
 The selected workspace is opaque user content. Names such as `AGENTS.md`, `MEMORY.md`, `repos/`, `skills/`, and `worktrees/` have no meaning to the snapshot protocol.
 
@@ -118,10 +121,10 @@ Snapshot artifacts may contain credentials or other sensitive content. Local-onl
 
 1. Reconstruct the workspace from its snapshot in private storage at `/workspace` by default, never through a writable source mount.
 2. Establish and export a prepared base root filesystem after materialization and before command execution.
-3. execute the command exactly once in a uniquely named retained container;
+3. start a minimal stable container supervisor and execute the command exactly once through Docker exec;
 4. preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events;
 5. reject image-declared volumes and any container mount outside the exported root filesystem;
-6. retain the stopped result container for direct inspection; and
+6. retain the running supervisor container for direct inspection and later filesystem continuation; and
 7. state explicitly that pseudo-filesystems and live process memory are not portable persistent state.
 
 The run specification contains the snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, factors, resource limits, network policy, capture declarations, workspace- and change-ignore identities, backend evidence, and AgentLab version. Factors are recorded verbatim and have no core semantics.
@@ -180,6 +183,33 @@ A comparison is a `comparable_repetition` only when workspace, resolved image, a
 
 Comparison is derived metadata rather than a new persisted experimental-cell object. Concurrent launch uses ordinary independent CLI processes in this milestone; AgentLab does not introduce a scheduler, daemon, automatic statistical conclusion, or factor registry.
 
-## 12. Current boundary
+## 12. Retained lifecycle
 
-AgentLab does not yet provide lifecycle management, continuation, fork/adopt operations, evaluation, or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.
+Lifecycle-capable containers carry exact AgentLab run ownership and lifecycle-version labels. Every mutating operation MUST load the local record, inspect Docker, match the complete expected container ID and run label, reject external mounts, and reject legacy containers without lifecycle semantics. A container name alone is never sufficient authorization.
+
+The stable main process is independent of the opaque agent command. `agentlab stop RUN` stops that supervisor. `agentlab resume RUN` restarts only the supervisor; it MUST NOT rerun the original agent command. The container ID and private writable filesystem remain identical across this stop/start cycle. A lifecycle event record states that filesystem state was preserved and process memory was not restored.
+
+`agentlab resume RUN -- COMMAND` executes a new opaque command in the retained container. `agentlab.continuation/v1` records:
+
+- the immutable initial-result or fork-record anchor;
+- exact command, timestamps, stdout, stderr, and exit code;
+- same retained container ID and current state;
+- whether a restart occurred;
+- `filesystem_state_reused: true` and `process_memory_restored: false`;
+- complete exported result-rootfs identity and raw/portable deltas from the run or fork base;
+- refreshed requested capture archives;
+- Docker inspect/diff evidence, warnings, and artifact integrity hashes.
+
+Initial runs preserve the exact change-ignore rule bytes as an integrity-checked private artifact. Continuations reapply those preserved rules rather than rereading a mutable source path. The initial `agentlab.result/v1` remains immutable; later continuations are separate immutable records.
+
+`agentlab fork RUN` exports the selected current filesystem, commits it privately, assigns a new AgentLab run ID, and starts a distinct stable container. `agentlab.fork/v1` anchors to the parent record, identifies its exported portable base and Docker evidence, inherits materialization/resource/capture/change-ignore settings, and states `filesystem_state_copied: true` and `process_memory_copied: false`. Fork continuation deltas use that copied filesystem as their base.
+
+`agentlab rm RUN` removes only the exact ownership-verified container, that run's unique image tag, and that run's local artifact directory. It does not delete parents, children, other AgentLab runs, unrelated Docker resources, shared content-addressed blobs, or workspace snapshots. Local run-artifact deletion is irreversible; the explicit `rm` command is the authorization boundary.
+
+`agentlab inspect --verify RUN` verifies the initial result or fork record plus every continuation and lifecycle event. `agentlab list` derives current Docker state and marks pre-lifecycle runs as legacy rather than attempting unsafe restart.
+
+Lifecycle-capable OCI images currently MUST provide `/bin/sh`, `sleep`, and `/bin/true` for the preparation and stable-supervisor processes. Unsupported minimal images fail rather than falling back to semantics that might rerun the agent command.
+
+## 13. Current boundary
+
+AgentLab does not yet provide adoption, external evaluation, or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.

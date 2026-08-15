@@ -202,7 +202,7 @@ impl Store {
         let directory = runs.join(run_id);
         fs::create_dir(&directory).with_context(|| format!("create run directory {run_id}"))?;
         secure_directory(&directory)?;
-        for child in ["artifacts", "evidence"] {
+        for child in ["artifacts", "evidence", "continuations", "lifecycle"] {
             let path = directory.join(child);
             fs::create_dir(&path)?;
             secure_directory(&path)?;
@@ -240,6 +240,45 @@ impl Store {
         let directory = self.run_directory(run_id)?;
         let path = safe_run_path(&directory, relative)?;
         fs::read(&path).with_context(|| format!("read run artifact {relative:?}"))
+    }
+
+    pub fn run_file_exists(&self, run_id: &str, relative: &str) -> Result<bool> {
+        let directory = self.run_directory(run_id)?;
+        Ok(safe_run_path(&directory, relative)?.is_file())
+    }
+
+    pub(crate) fn run_path(&self, run_id: &str, relative: &str) -> Result<PathBuf> {
+        let directory = self.run_directory(run_id)?;
+        safe_run_path(&directory, relative)
+    }
+
+    pub fn list_run_ids(&self) -> Result<Vec<String>> {
+        let runs = self.root.join("runs");
+        let mut run_ids = Vec::new();
+        let entries = match fs::read_dir(&runs) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(run_ids),
+            Err(error) => return Err(error).context("list AgentLab runs"),
+        };
+        for entry in entries {
+            let entry = entry.context("read AgentLab runs directory")?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let run_id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("run directory name is not valid UTF-8"))?;
+            validate_run_id(&run_id)?;
+            run_ids.push(run_id);
+        }
+        run_ids.sort();
+        Ok(run_ids)
+    }
+
+    pub fn remove_run_directory(&self, run_id: &str) -> Result<()> {
+        let directory = self.run_directory(run_id)?;
+        fs::remove_dir_all(&directory).with_context(|| format!("remove run directory {run_id}"))
     }
 
     fn blob_path(&self, hex: &str) -> PathBuf {
