@@ -1,0 +1,21 @@
+[package]
+name = "agentlab"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.85"
+description = "Content-addressed workspace snapshots and isolated agent execution"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+dirs = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+strip = true

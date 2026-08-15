@@ -1,0 +1,6 @@
+/agentlab
+/bin/
+/target/
+*.test
+*.out
+.DS_Store
