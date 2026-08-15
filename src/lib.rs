@@ -1,4 +1,5 @@
 pub mod app;
+pub mod evaluation;
 pub mod lifecycle;
 pub mod rootfs;
 pub mod run;

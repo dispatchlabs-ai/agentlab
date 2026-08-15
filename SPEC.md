@@ -1,6 +1,6 @@
 # AgentLab Specification
 
-Status: Milestones 1–4 working contract
+Status: Milestones 1–5 working contract
 Snapshot schema: `agentlab.snapshot/v1`
 Run schema: `agentlab.run/v1`
 Delta schema: `agentlab.delta/v1`
@@ -8,6 +8,7 @@ Result schema: `agentlab.result/v1`
 Continuation schema: `agentlab.continuation/v1`
 Fork schema: `agentlab.fork/v1`
 Lifecycle event schema: `agentlab.lifecycle-event/v1`
+Evaluation schema: `agentlab.evaluation/v1`
 
 ## 1. Scope
 
@@ -19,7 +20,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained filesystem state and harness-level continuation. None defines a workspace layout, repository registry, harness integration, evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
+Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained filesystem state and harness-level continuation. Milestone 5 records observations from arbitrary external evaluators. None defines a workspace layout, repository registry, harness integration, authoritative evaluator, adopter, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
 
 The selected workspace is opaque user content. Names such as `AGENTS.md`, `MEMORY.md`, `repos/`, `skills/`, and `worktrees/` have no meaning to the snapshot protocol.
 
@@ -210,6 +211,29 @@ Initial runs preserve the exact change-ignore rule bytes as an integrity-checked
 
 Lifecycle-capable OCI images currently MUST provide `/bin/sh`, `sleep`, and `/bin/true` for the preparation and stable-supervisor processes. Unsupported minimal images fail rather than falling back to semantics that might rerun the agent command.
 
-## 13. Current boundary
+## 13. External evaluation
 
-AgentLab does not yet provide adoption, external evaluation, or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, or workspace layout.
+`agentlab evaluate [--name NAME] RUN... -- COMMAND` executes the selected host command once per run. Before and after execution AgentLab verifies the immutable initial result, lifecycle/fork/continuation records, prior evaluation records, and their referenced artifacts. Mutation of those inputs is an explicit failure.
+
+The evaluator inherits the caller's working directory and host environment. AgentLab supplies absolute paths in `AGENTLAB_RUN_DIR`, `AGENTLAB_RESULT_PATH`, `AGENTLAB_SPEC_PATH`, `AGENTLAB_DELTA_PATH`, and `AGENTLAB_RAW_DELTA_PATH`, plus `AGENTLAB_RUN_ID`. AgentLab does not prescribe the evaluator language or interpret its domain.
+
+Successful stdout MUST be one JSON object with optional fields:
+
+- `scores`, an object whose nonempty keys map to JSON scalar values;
+- `observations`, an object with nonempty keys and arbitrary JSON values;
+- `summary`, a string; and
+- arbitrary extension fields, preserved unchanged.
+
+`agentlab.evaluation/v1` records the evaluation ID, anchored result digest, evaluator name, exact command argv, timestamps, actual exit code, status, parsed output when valid, stdout/stderr artifacts, warnings, and integrity hashes. Status is `succeeded`, `command_failed`, or `invalid_output`. A failed command or invalid envelope remains inspectable evidence but is not eligible as a successful score source.
+
+Evaluation records are immutable additions beneath the run and do not alter `agentlab.result/v1`. `agentlab inspect --verify RUN` verifies them along with the run lifecycle. Evaluator stdout, stderr, summaries, and observations may themselves be sensitive.
+
+`agentlab report` selects the latest successful evaluation, optionally by evaluator name, for each explicit run ID. It aligns requested or discovered factor keys and scalar score keys into rows. Missing factor or score values remain missing. JSON output is machine-readable; default output is a Markdown table.
+
+Reporting MUST state that scores are evaluator-specific observations, model/external-service execution can be nondeterministic, multiple replicates are advisable, and AgentLab performs no aggregation, statistical test, ranking, causal inference, or universal success judgment. Factor and score names remain opaque strings.
+
+External evaluators run directly on the host with the invoking user's authority. This milestone does not sandbox them. Integrity checks detect mutation of AgentLab records but do not constrain other filesystem, process, credential, network, or service access; users MUST run only evaluator commands they trust.
+
+## 14. Current boundary
+
+AgentLab does not yet provide adoption or another backend. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.

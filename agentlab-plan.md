@@ -26,7 +26,9 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - The Pi-workspace repetition checkpoint passed with two simultaneous `ubuntu:24.04` runs: identical snapshot, image, command, and portable base; distinct retained containers and private outcomes; exactly the declared `variant` and `replicate` differences; and an unchanged source snapshot.
 - Milestone 4 is complete: stable retained containers support ownership-checked list, inspect, stop, restart, harness continuation, filesystem fork, and exact removal while explicitly disclaiming live-memory restoration.
 - The Pi-workspace lifecycle checkpoint passed: one container ID survived stop/start, session value `1` continued to `2`, the requested capture refreshed, the fork inherited the exact continued base, deleting the fork preserved its parent, and the source snapshot remained unchanged.
-- The next implementation milestone is external evaluation (Milestone 5). Preserve the current direct implementation; do not build a scheduler, database, or factor/evaluator registry.
+- Milestone 5 is complete: arbitrary host evaluator commands produce integrity-checked structured observations, and reports align opaque factors and scalar scores without built-in ranking, statistics, or causal claims.
+- The Pi-workspace evaluator checkpoint passed with `variant={A,B} × replicate={1,2}`: four verified result-facts evaluations produced Markdown and JSON tables while the source snapshot remained unchanged.
+- The next implementation milestone is optional reviewed adoption (Milestone 6). Keep review-only as the default and require explicit authorization before changing a current workspace.
 
 ## North-star goal
 
@@ -599,6 +601,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 **Hands-on checkpoint:** Against a chosen workspace, retain a run that creates session-like state outside `/workspace`; list and inspect it, stop and restart it, demonstrate harness continuation from the same persistent state, create a filesystem-level fork, export the requested capture, and delete only the selected run's resources.
 
 ### Milestone 5: Support external evaluation
+
+**Status:** Complete.
 
 **Goal:** Make AgentLab runs useful for controlled agentic-environment experiments.
 

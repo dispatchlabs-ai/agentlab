@@ -109,6 +109,26 @@ Run the case explicitly:
 cargo test --test milestone4 -- --ignored --nocapture
 ```
 
-## Milestones 5–9
+## Milestone 5: external evaluation
 
-Later suites cover arbitrary external evaluators, reviewed three-way adoption, the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints are maintained in `agentlab-plan.md` until their protocols are implemented.
+The Docker-gated fixture launches four overlapping Alpine runs labeled `skill={off,on}` and `replicate={1,2}`, then uses only the public CLI and supplied evaluator. It proves:
+
+1. Every result is machine-readable and passes integrity verification before evaluation.
+2. One arbitrary external command receives absolute result/spec/delta paths through the documented environment contract.
+3. The supplied evaluator's JSON scores, observations, summary, stdout, stderr, command, timestamps, and exit status are preserved in `agentlab.evaluation/v1`.
+4. Every evaluation record and artifact passes independent integrity verification.
+5. The public report contains exactly four rows with the requested factor and score columns in deterministic order.
+6. JSON report output round-trips through the public data model.
+7. Malformed evaluator stdout and an intentional exit `42` are retained as `invalid_output` and `command_failed`, never promoted to scores, and do not hide earlier successful evaluations.
+8. Reports explicitly disclaim universal judgment, deterministic behavior, aggregation, statistics, ranking, and causal inference.
+9. The source workspace remains byte-identical and contains no run output.
+
+Run the case explicitly:
+
+```bash
+cargo test --test milestone5 -- --ignored --nocapture
+```
+
+## Milestones 6–9
+
+Later suites cover reviewed three-way adoption, the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints are maintained in `agentlab-plan.md` until their protocols are implemented.

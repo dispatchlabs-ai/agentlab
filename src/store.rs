@@ -202,7 +202,13 @@ impl Store {
         let directory = runs.join(run_id);
         fs::create_dir(&directory).with_context(|| format!("create run directory {run_id}"))?;
         secure_directory(&directory)?;
-        for child in ["artifacts", "evidence", "continuations", "lifecycle"] {
+        for child in [
+            "artifacts",
+            "evidence",
+            "continuations",
+            "evaluations",
+            "lifecycle",
+        ] {
             let path = directory.join(child);
             fs::create_dir(&path)?;
             secure_directory(&path)?;

@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::VERSION;
+use crate::evaluation;
 use crate::lifecycle;
 use crate::run::{self, CaptureSpec, RunOptions};
 use crate::snapshot::{self, Repository};
@@ -33,6 +34,8 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write) -> Result<()> {
         }
         "snapshot" => snapshot_command(&arguments[1..], stdout),
         "run" => run_command(&arguments[1..], stdout),
+        "evaluate" => evaluate_command(&arguments[1..], stdout),
+        "report" => report_command(&arguments[1..], stdout),
         "list" => list_command(&arguments[1..], stdout),
         "stop" => stop_command(&arguments[1..], stdout),
         "resume" => resume_command(&arguments[1..], stdout),
@@ -43,6 +46,138 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write) -> Result<()> {
         "inspect" => inspect_command(&arguments[1..], stdout),
         _ => bail!("unknown command {command:?}\n\nRun `agentlab --help` for usage."),
     }
+}
+
+fn evaluate_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let separator = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .ok_or_else(|| anyhow::anyhow!("evaluate requires `-- COMMAND [ARG ...]`"))?;
+    let (options, command_with_separator) = arguments.split_at(separator);
+    let command = &command_with_separator[1..];
+    if command.is_empty() {
+        bail!("evaluate requires a command after --");
+    }
+    let mut name = None;
+    let mut json = false;
+    let mut run_ids = Vec::new();
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--name" => name = Some(required_value(options, &mut index, "--name")?.to_owned()),
+            "--json" => json = true,
+            "--help" | "-h" => {
+                writeln!(
+                    stdout,
+                    "usage: agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]"
+                )?;
+                return Ok(());
+            }
+            value if value.starts_with('-') => bail!("unexpected evaluate argument {value:?}"),
+            value => run_ids.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    if run_ids.is_empty() {
+        bail!("evaluate requires at least one RUN");
+    }
+    let evaluator_name = name.unwrap_or_else(|| {
+        std::path::Path::new(&command[0])
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&command[0])
+            .to_owned()
+    });
+    let store = Store::open(None)?;
+    let mut records = Vec::new();
+    for run_id in &run_ids {
+        records.push(evaluation::evaluate(
+            &store,
+            run_id,
+            &evaluator_name,
+            command,
+        )?);
+    }
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &records)?;
+        writeln!(stdout)?;
+    } else {
+        for record in &records {
+            writeln!(stdout, "Run: {}", record.run_id)?;
+            writeln!(stdout, "Evaluation: {}", record.evaluation_id)?;
+            writeln!(stdout, "Evaluator: {}", record.evaluator_name)?;
+            writeln!(stdout, "Status: {}", record.status)?;
+            writeln!(stdout, "Exit code: {}", record.exit_code)?;
+            if let Some(output) = &record.output {
+                writeln!(
+                    stdout,
+                    "Scores: {}",
+                    if output.scores.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        output.scores.keys().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                )?;
+                if let Some(summary) = &output.summary {
+                    writeln!(stdout, "Summary: {summary}")?;
+                }
+            }
+        }
+    }
+    if records.iter().any(|record| record.status != "succeeded") {
+        bail!("one or more evaluator commands failed or emitted invalid output");
+    }
+    Ok(())
+}
+
+fn report_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut evaluator_name = None;
+    let mut factors = Vec::new();
+    let mut scores = Vec::new();
+    let mut run_ids = Vec::new();
+    let mut json = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--evaluator" => {
+                evaluator_name =
+                    Some(required_value(arguments, &mut index, "--evaluator")?.to_owned())
+            }
+            "--factor" => {
+                factors.push(required_value(arguments, &mut index, "--factor")?.to_owned())
+            }
+            "--score" => scores.push(required_value(arguments, &mut index, "--score")?.to_owned()),
+            "--json" => json = true,
+            "--help" | "-h" => {
+                writeln!(
+                    stdout,
+                    "usage: agentlab report [--evaluator NAME] [--factor KEY]... [--score KEY]... [--json] RUN..."
+                )?;
+                return Ok(());
+            }
+            value if value.starts_with('-') => bail!("unexpected report argument {value:?}"),
+            value => run_ids.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    let store = Store::open(None)?;
+    let table = evaluation::table(
+        &store,
+        &run_ids,
+        evaluator_name.as_deref(),
+        &factors,
+        &scores,
+    )?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &table)?;
+        writeln!(stdout)?;
+    } else {
+        write!(stdout, "{}", evaluation::markdown_table(&table))?;
+        for warning in &table.warnings {
+            writeln!(stdout, "Warning: {warning}")?;
+        }
+    }
+    Ok(())
 }
 
 fn list_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
@@ -578,6 +713,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             let fork = lifecycle::load_fork(&store, digest)?;
             if verify {
                 lifecycle::verify_all(&store, digest)?;
+                evaluation::verify_all(&store, digest)?;
             }
             if json {
                 serde_json::to_writer_pretty(&mut *stdout, &fork)?;
@@ -614,6 +750,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         let result = run::load_result(&store, digest)?;
         if verify {
             lifecycle::verify_all(&store, digest)?;
+            evaluation::verify_all(&store, digest)?;
         }
         if json {
             serde_json::to_writer_pretty(&mut *stdout, &result)?;
@@ -641,6 +778,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         )?;
         writeln!(stdout, "Lifecycle capable: {}", managed.lifecycle_capable)?;
         writeln!(stdout, "Continuations: {}", managed.continuation_count)?;
+        writeln!(
+            stdout,
+            "Evaluations: {}",
+            evaluation::list(&store, digest)?.len()
+        )?;
         for warning in &result.warnings {
             writeln!(stdout, "Warning: {warning}")?;
         }
@@ -736,7 +878,7 @@ fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 fn print_help(output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
-        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, and lifecycle metadata\n  diff        show normalized persistent filesystem changes\n  compare     verify controlled inputs and expected factor differences\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not."
+        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--expect-factor KEY]... [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--factor KEY]... [--score KEY]... [--json] RUN...\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once in a private Docker root filesystem\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, and evaluation metadata\n  diff        show normalized persistent filesystem changes\n  compare     verify controlled inputs and expected factor differences\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align factors and evaluator scores without interpreting them\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not. Evaluator scores are observations, not universal judgments."
     )?;
     Ok(())
 }
