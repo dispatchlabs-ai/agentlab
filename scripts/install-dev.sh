@@ -63,7 +63,7 @@ docker run --rm --pull=missing \
   --volume "$temporary_dir:/out" \
   --workdir /src \
   "$builder_image" \
-  sh -lc 'cargo build --release --locked && install -m 0755 /target/release/agentlab /out/agentlab'
+  sh -c 'cargo build --release --locked && install -m 0755 /target/release/agentlab /out/agentlab'
 
 "$temporary_dir/agentlab" --version
 
