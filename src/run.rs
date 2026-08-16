@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::VERSION;
+use crate::build_version;
 use crate::rootfs::{self, ChangeKind, RootFsChange, RootFsManifest};
 use crate::snapshot;
 use crate::store::{Store, hex_digest};
@@ -332,7 +332,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         change_ignore: change_ignore.clone(),
         backend_name: "docker-cli".to_string(),
         backend_version: docker_version()?,
-        agentlab_version: VERSION.to_string(),
+        agentlab_version: build_version(),
     };
     spec.run_input_digest = compute_run_input_digest(&spec)?;
     let spec_bytes = pretty_json(&spec)?;

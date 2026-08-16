@@ -59,6 +59,8 @@ cargo build --release
 ./target/release/agentlab --help
 ```
 
+For a repeatable Linux development install that builds through rootless Docker, installs under `~/.local/bin`, and embeds the exact Git commit, see [Dogfooding development builds](docs/DOGFOODING.md).
+
 Snapshot a workspace of your choosing:
 
 ```bash

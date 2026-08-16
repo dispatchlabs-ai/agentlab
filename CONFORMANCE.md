@@ -6,6 +6,7 @@ This document defines observable tests for the durable AgentLab protocol. Tests 
 
 - A fresh checkout builds with the documented Rust version.
 - `agentlab --version` succeeds.
+- A development build may append its exact source build ID, and that complete version identity is recorded as a controlled run input.
 - `agentlab --help` describes only implemented commands as available.
 - The README states the north-star goal and a minimal working example.
 - The specification contains no dependency on a particular workspace layout, harness, model, credential, or unrelated repository.

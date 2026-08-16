@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::VERSION;
+use crate::build_version;
 use crate::evaluation;
 use crate::lifecycle;
 use crate::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
@@ -29,7 +29,7 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write) -> Result<()> {
     match command {
         "--help" | "-h" | "help" => print_help(stdout),
         "--version" | "version" => {
-            writeln!(stdout, "agentlab {VERSION}")?;
+            writeln!(stdout, "agentlab {}", build_version())?;
             Ok(())
         }
         "snapshot" => snapshot_command(&arguments[1..], stdout),
@@ -847,9 +847,10 @@ fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 }
 
 fn print_help(output: &mut dyn Write) -> Result<()> {
+    let version = build_version();
     writeln!(
         output,
-        "AgentLab {VERSION}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, and evaluation metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not. Evaluator scores are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab stop [--json] RUN\n  agentlab resume [--json] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture an immutable workspace snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, and evaluation metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nFilesystem state survives stop/resume. Process trees and live memory do not. Evaluator scores are observations, not universal judgments."
     )?;
     Ok(())
 }

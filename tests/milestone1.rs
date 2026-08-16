@@ -246,9 +246,10 @@ fn cli_and_machine_global_excludes() {
     let binary = env!("CARGO_BIN_EXE_agentlab");
     let version = Command::new(binary).arg("--version").output().unwrap();
     assert!(version.status.success());
-    assert_eq!(
-        String::from_utf8(version.stdout).unwrap(),
-        "agentlab 0.1.0-dev\n"
+    let version = String::from_utf8(version.stdout).unwrap();
+    assert!(
+        version.starts_with("agentlab 0.1.0-dev"),
+        "unexpected version output: {version:?}"
     );
     let help = Command::new(binary).arg("--help").output().unwrap();
     assert!(
