@@ -299,6 +299,20 @@ struct FailedRunCleanup {
     armed: bool,
 }
 
+struct FailedRunDirectoryCleanup {
+    store: Store,
+    run_id: String,
+    armed: bool,
+}
+
+impl Drop for FailedRunDirectoryCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.store.remove_run_directory(&self.run_id);
+        }
+    }
+}
+
 impl Drop for FailedRunCleanup {
     fn drop(&mut self) {
         if !self.armed {
@@ -328,6 +342,11 @@ pub fn execute_with_observer(
     let started_at = Utc::now();
     let run_id = Uuid::new_v4().to_string();
     let run_directory = store.create_run_directory(&run_id)?;
+    let mut failed_run_directory_cleanup = FailedRunDirectoryCleanup {
+        store: store.clone(),
+        run_id: run_id.clone(),
+        armed: true,
+    };
     let mut lifecycle = vec![event("run_created")];
     report_stage(observer, &format!("Run created: {run_id}"))?;
 
@@ -787,6 +806,7 @@ pub fn execute_with_observer(
     };
     store.write_run_file(&run_id, "result.json", &pretty_json(&result)?)?;
     failed_run_cleanup.armed = false;
+    failed_run_directory_cleanup.armed = false;
     let source_workspace_status = match &options.workspace {
         WorkspaceSource::Directory(workspace) => {
             report_stage(observer, "Verifying source workspace remained unchanged")?;
@@ -1101,6 +1121,7 @@ fn validate_options(options: &RunOptions) -> Result<()> {
     if let Some(path) = &options.pi_auth {
         validate_pi_auth(path)?;
     }
+    let mut capture_names = HashSet::new();
     for capture in &options.captures {
         validate_guest_path(&capture.guest_path)?;
         if capture.name.is_empty()
@@ -1109,6 +1130,9 @@ fn validate_options(options: &RunOptions) -> Result<()> {
             || capture.name == ".."
         {
             bail!("invalid capture name {:?}", capture.name);
+        }
+        if !capture_names.insert(capture.name.as_str()) {
+            bail!("duplicate capture name {:?}", capture.name);
         }
     }
     Ok(())
@@ -1791,4 +1815,59 @@ pub(crate) fn docker_output_bytes(command: &mut Command, context: &str) -> Resul
         );
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(workspace: PathBuf, captures: Vec<CaptureSpec>) -> RunOptions {
+        RunOptions {
+            workspace: WorkspaceSource::Directory(workspace),
+            workspace_capture_mode: snapshot::CaptureMode::All,
+            image: "unused:latest".to_owned(),
+            command: vec!["/bin/true".to_owned()],
+            workspace_guest_path: "/workspace".to_owned(),
+            network: "none".to_owned(),
+            memory: None,
+            cpus: None,
+            pi_auth: None,
+            change_ignore: None,
+            captures,
+        }
+    }
+
+    #[test]
+    fn duplicate_capture_names_are_rejected() {
+        let error = validate_options(&options(
+            PathBuf::from("."),
+            vec![
+                CaptureSpec {
+                    guest_path: "/one".to_owned(),
+                    name: "duplicate".to_owned(),
+                },
+                CaptureSpec {
+                    guest_path: "/two".to_owned(),
+                    name: "duplicate".to_owned(),
+                },
+            ],
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "duplicate capture name \"duplicate\"");
+    }
+
+    #[test]
+    fn failed_run_removes_incomplete_run_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(&temporary.path().join("state"))).unwrap();
+        let error = execute(
+            &options(temporary.path().join("missing-workspace"), Vec::new()),
+            &store,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("resolve workspace"));
+        assert!(store.list_run_ids().unwrap().is_empty());
+    }
 }

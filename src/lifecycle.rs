@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -220,6 +220,19 @@ struct ForkCleanup {
     run_id: String,
     store: Store,
     armed: bool,
+}
+
+struct FailedContinuationCleanup {
+    directory: PathBuf,
+    armed: bool,
+}
+
+impl Drop for FailedContinuationCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 }
 
 impl Drop for ForkCleanup {
@@ -634,6 +647,10 @@ fn execute_continuation(
     let continuation_id = Uuid::new_v4().to_string();
     let prefix = format!("continuations/{continuation_id}");
     let directory = store.run_path(&subject.run_id, &prefix)?;
+    let mut failed_continuation_cleanup = FailedContinuationCleanup {
+        directory: directory.clone(),
+        armed: true,
+    };
     fs::create_dir_all(directory.join("artifacts"))?;
     fs::create_dir_all(directory.join("evidence"))?;
 
@@ -848,6 +865,7 @@ fn execute_continuation(
         &format!("{prefix}/continuation.json"),
         &run::pretty_json(&result)?,
     )?;
+    failed_continuation_cleanup.armed = false;
     Ok(result)
 }
 
