@@ -1250,15 +1250,17 @@ fn write_cli_stage(stderr: &mut dyn Write, started: Instant, message: &str) -> R
 fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut json = false;
     let mut verify = false;
+    let mut verbose = false;
     let mut digest = None;
     for argument in arguments {
         match argument.as_str() {
             "--json" => json = true,
             "--verify" => verify = true,
+            "--verbose" | "-v" => verbose = true,
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] SNAPSHOT_RUN_OR_ACCEPTANCE\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --json                    Write the underlying snapshot, run, or acceptance record as JSON"
+                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --verbose, -v             List repositories and every captured snapshot path\n  --json                    Write the complete underlying record as JSON"
                 )?;
                 return Ok(());
             }
@@ -1440,25 +1442,27 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         manifest.ignore_rules_digest
     )?;
     writeln!(stdout, "Repositories: {}", manifest.repositories.len())?;
-    for repository in &manifest.repositories {
-        writeln!(
-            stdout,
-            "  repo  {} ({} metadata at {})",
-            repository.path, repository.metadata_kind, repository.metadata_path
-        )?;
-    }
     writeln!(stdout, "Entries: {}", manifest.entries.len())?;
-    for entry in &manifest.entries {
-        let detail = match entry.kind.as_str() {
-            "file" => format!(" size={} digest={}", entry.size, entry.digest),
-            "symlink" => format!(" target={:?}", entry.link_target),
-            _ => String::new(),
-        };
-        writeln!(
-            stdout,
-            "  {:<9} {:04o} {}{}",
-            entry.kind, entry.mode, entry.path, detail
-        )?;
+    if verbose {
+        for repository in &manifest.repositories {
+            writeln!(
+                stdout,
+                "  repo  {} ({} metadata at {})",
+                repository.path, repository.metadata_kind, repository.metadata_path
+            )?;
+        }
+        for entry in &manifest.entries {
+            let detail = match entry.kind.as_str() {
+                "file" => format!(" size={} digest={}", entry.size, entry.digest),
+                "symlink" => format!(" target={:?}", entry.link_target),
+                _ => String::new(),
+            };
+            writeln!(
+                stdout,
+                "  {:<9} {:04o} {}{}",
+                entry.kind, entry.mode, entry.path, detail
+            )?;
+        }
     }
     if verify {
         writeln!(stdout, "Integrity: verified")?;
@@ -1514,7 +1518,7 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
     )?;
     Ok(())
 }

@@ -33,6 +33,14 @@ pub struct RootFsManifest {
     pub entries: Vec<RootFsEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobStorageSummary {
+    pub required_paths: usize,
+    pub unique_blobs: usize,
+    pub reused_blobs: usize,
+    pub created_blobs: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
@@ -66,7 +74,7 @@ struct HardLink {
     mode: u32,
 }
 
-pub fn scan_export(export: &Path, store_files: Option<&Store>) -> Result<RootFsManifest> {
+pub fn scan_export(export: &Path) -> Result<RootFsManifest> {
     let file = File::open(export)
         .with_context(|| format!("open root filesystem export {}", export.display()))?;
     let mut archive = tar::Archive::new(file);
@@ -82,15 +90,8 @@ pub fn scan_export(export: &Path, store_files: Option<&Store>) -> Result<RootFsM
         let entry_type = header.entry_type();
         let mode = header.mode().context("read archive entry mode")? & 0o7777;
         let entry = if entry_type.is_file() {
-            let (digest, size) = if let Some(store) = store_files {
-                let stored = store
-                    .put_reader(&mut item)
-                    .with_context(|| format!("store exported rootfs file {path:?}"))?;
-                (stored.digest, stored.size)
-            } else {
-                hash_reader(&mut item)
-                    .with_context(|| format!("hash exported rootfs file {path:?}"))?
-            };
+            let (digest, size) = hash_reader(&mut item)
+                .with_context(|| format!("hash exported rootfs file {path:?}"))?;
             Some(RootFsEntry {
                 path: path.clone(),
                 kind: "file".to_string(),
@@ -198,6 +199,98 @@ pub fn scan_export(export: &Path, store_files: Option<&Store>) -> Result<RootFsM
     })
 }
 
+pub fn store_required_file_blobs(
+    export: &Path,
+    manifest: &RootFsManifest,
+    required_paths: &BTreeSet<String>,
+    store: &Store,
+) -> Result<BlobStorageSummary> {
+    let entries: BTreeMap<_, _> = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut required_blobs = BTreeMap::new();
+    for path in required_paths {
+        let entry = entries
+            .get(path.as_str())
+            .with_context(|| format!("required root filesystem path /{path} is absent"))?;
+        if entry.kind != "file" {
+            bail!(
+                "required root filesystem path /{path} is {}, not a file",
+                entry.kind
+            );
+        }
+        match required_blobs.insert(entry.digest.clone(), entry.size) {
+            Some(size) if size != entry.size => {
+                bail!(
+                    "root filesystem digest {} has inconsistent sizes",
+                    entry.digest
+                )
+            }
+            _ => {}
+        }
+    }
+
+    let unique_blobs = required_blobs.len();
+    let mut missing_blobs = BTreeMap::new();
+    for (digest, size) in &required_blobs {
+        if !store.contains_blob(digest, *size)? {
+            missing_blobs.insert(digest.clone(), *size);
+        }
+    }
+    if missing_blobs.is_empty() {
+        return Ok(BlobStorageSummary {
+            required_paths: required_paths.len(),
+            unique_blobs,
+            reused_blobs: unique_blobs,
+            created_blobs: 0,
+        });
+    }
+
+    let file = File::open(export)
+        .with_context(|| format!("open root filesystem export {}", export.display()))?;
+    let mut archive = tar::Archive::new(file);
+    let mut created_blobs = 0;
+    for item in archive.entries().context("read root filesystem export")? {
+        let mut item = item.context("read root filesystem archive entry")?;
+        if !item.header().entry_type().is_file() {
+            continue;
+        }
+        let path = normalize_archive_path(&item.path_bytes())?;
+        let entry = entries
+            .get(path.as_str())
+            .with_context(|| format!("root filesystem manifest is missing file /{path}"))?;
+        let Some(expected_size) = missing_blobs.get(&entry.digest).copied() else {
+            continue;
+        };
+        let stored = store
+            .put_reader(&mut item)
+            .with_context(|| format!("store required rootfs file {path:?}"))?;
+        if stored.digest != entry.digest || stored.size != expected_size {
+            bail!("required root filesystem file /{path} changed while storing its content");
+        }
+        if stored.created {
+            created_blobs += 1;
+        }
+        missing_blobs.remove(&entry.digest);
+        if missing_blobs.is_empty() {
+            break;
+        }
+    }
+    if !missing_blobs.is_empty() {
+        let digests: Vec<_> = missing_blobs.keys().map(String::as_str).collect();
+        bail!("required root filesystem blobs were absent from the export: {digests:?}");
+    }
+
+    Ok(BlobStorageSummary {
+        required_paths: required_paths.len(),
+        unique_blobs,
+        reused_blobs: unique_blobs - created_blobs,
+        created_blobs,
+    })
+}
+
 pub fn compare(base: &RootFsManifest, result: &RootFsManifest) -> Vec<RootFsChange> {
     let base: BTreeMap<_, _> = base
         .entries
@@ -276,4 +369,105 @@ fn hash_reader(reader: &mut dyn Read) -> Result<(String, u64)> {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use tar::{Builder, EntryType, Header};
+
+    use super::*;
+
+    #[test]
+    fn complete_scan_stores_only_required_file_blobs_and_resolves_hard_links() {
+        let temporary = tempfile::tempdir().unwrap();
+        let export = temporary.path().join("rootfs.tar");
+        let file = File::create(&export).unwrap();
+        let mut builder = Builder::new(file);
+        append_file(&mut builder, "workspace/kept.txt", b"already stored\n");
+        append_file(
+            &mut builder,
+            "workspace/new.txt",
+            b"new workspace content\n",
+        );
+        append_file(&mut builder, "usr/bin/tool", b"linked tool content\n");
+        append_hard_link(&mut builder, "workspace/tool-link", "usr/bin/tool");
+        append_file(&mut builder, "etc/unneeded", b"must not be stored\n");
+        builder.finish().unwrap();
+
+        let state = temporary.path().join("state");
+        let store = Store::open(Some(&state)).unwrap();
+        let existing = store.put_bytes(b"already stored\n").unwrap();
+        assert!(existing.created);
+
+        let manifest = scan_export(&export).unwrap();
+        let required_paths = [
+            "workspace/kept.txt",
+            "workspace/new.txt",
+            "workspace/tool-link",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let summary =
+            store_required_file_blobs(&export, &manifest, &required_paths, &store).unwrap();
+        assert_eq!(summary.required_paths, 3);
+        assert_eq!(summary.unique_blobs, 3);
+        assert_eq!(summary.reused_blobs, 1);
+        assert_eq!(summary.created_blobs, 2);
+
+        for path in &required_paths {
+            let entry = manifest
+                .entries
+                .iter()
+                .find(|entry| &entry.path == path)
+                .unwrap();
+            assert!(store.contains_blob(&entry.digest, entry.size).unwrap());
+        }
+        let hard_link = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "workspace/tool-link")
+            .unwrap();
+        let mut linked_content = String::new();
+        store
+            .open_blob(&hard_link.digest)
+            .unwrap()
+            .read_to_string(&mut linked_content)
+            .unwrap();
+        assert_eq!(linked_content, "linked tool content\n");
+
+        let unneeded = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "etc/unneeded")
+            .unwrap();
+        assert!(
+            !store
+                .contains_blob(&unneeded.digest, unneeded.size)
+                .unwrap()
+        );
+    }
+
+    fn append_file(builder: &mut Builder<File>, path: &str, contents: &[u8]) {
+        let mut header = Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        builder.append(&header, contents).unwrap();
+    }
+
+    fn append_hard_link(builder: &mut Builder<File>, path: &str, target: &str) {
+        let mut header = Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(EntryType::Link);
+        header.set_mode(0o644);
+        header.set_size(0);
+        header.set_link_name(target).unwrap();
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+    }
 }

@@ -84,32 +84,22 @@ impl Store {
             hasher.update(&buffer[..read]);
             size += read as u64;
         }
-        temporary
-            .as_file()
-            .sync_all()
-            .context("sync content blob")?;
         let digest = format!("sha256:{}", hex_digest(hasher.finalize().as_slice()));
         let hex = normalize_digest(&digest)?;
         let destination = self.blob_path(&hex);
 
-        match fs::metadata(&destination) {
-            Ok(metadata) => {
-                if metadata.len() != size {
-                    bail!(
-                        "content store collision for {digest}: stored size {}, incoming size {size}",
-                        metadata.len()
-                    );
-                }
-                return Ok(PutResult {
-                    digest,
-                    size,
-                    created: false,
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("inspect existing content blob"),
+        if self.contains_blob(&digest, size)? {
+            return Ok(PutResult {
+                digest,
+                size,
+                created: false,
+            });
         }
 
+        temporary
+            .as_file()
+            .sync_all()
+            .context("sync new content blob")?;
         let parent = destination
             .parent()
             .context("content blob destination has no parent")?;
@@ -133,6 +123,19 @@ impl Store {
                 })
             }
             Err(error) => Err(error.error).context("persist content blob"),
+        }
+    }
+
+    pub fn contains_blob(&self, digest: &str, expected_size: u64) -> Result<bool> {
+        let hex = normalize_digest(digest)?;
+        match fs::metadata(self.blob_path(&hex)) {
+            Ok(metadata) if metadata.len() == expected_size => Ok(true),
+            Ok(metadata) => bail!(
+                "content store collision for {digest}: stored size {}, expected {expected_size}",
+                metadata.len()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).context("inspect existing content blob"),
         }
     }
 

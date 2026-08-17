@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -658,9 +658,24 @@ pub fn execute_with_observer(
     )?;
     lifecycle.push(event("result_rootfs_exported"));
 
-    report_stage(observer, "Computing portable filesystem delta")?;
-    let base_manifest = rootfs::scan_export(&base_export_path, None)?;
-    let result_manifest = rootfs::scan_export(&result_export_path, Some(store))?;
+    report_stage(observer, "Scanning complete base filesystem")?;
+    let base_manifest = rootfs::scan_export(&base_export_path)?;
+    report_stage(
+        observer,
+        &format!(
+            "Base filesystem scanned: {} paths",
+            base_manifest.entries.len()
+        ),
+    )?;
+    report_stage(observer, "Scanning complete result filesystem")?;
+    let result_manifest = rootfs::scan_export(&result_export_path)?;
+    report_stage(
+        observer,
+        &format!(
+            "Result filesystem scanned: {} paths",
+            result_manifest.entries.len()
+        ),
+    )?;
     let base_manifest_bytes = pretty_json(&base_manifest)?;
     let result_manifest_bytes = pretty_json(&result_manifest)?;
     store.write_run_file(&run_id, "base-rootfs.json", &base_manifest_bytes)?;
@@ -668,6 +683,38 @@ pub fn execute_with_observer(
     lifecycle.push(event("portable_rootfs_manifests_created"));
 
     let all_changes = rootfs::compare(&base_manifest, &result_manifest);
+    report_stage(
+        observer,
+        &format!(
+            "Complete filesystem comparison: {} changes",
+            all_changes.len()
+        ),
+    )?;
+    let required_blob_paths = required_result_file_paths(
+        &result_manifest,
+        &all_changes,
+        &options.workspace_guest_path,
+    );
+    report_stage(
+        observer,
+        &format!(
+            "Preserving content for {} required files",
+            required_blob_paths.len()
+        ),
+    )?;
+    let blob_storage = rootfs::store_required_file_blobs(
+        &result_export_path,
+        &result_manifest,
+        &required_blob_paths,
+        store,
+    )?;
+    report_stage(
+        observer,
+        &format!(
+            "Required content ready: {} unique blobs, {} reused, {} new",
+            blob_storage.unique_blobs, blob_storage.reused_blobs, blob_storage.created_blobs
+        ),
+    )?;
     let ignored_paths = match &change_ignore_rules {
         Some(rules) => evaluate_change_ignore_bytes(rules, &all_changes)?,
         None => HashSet::new(),
@@ -1597,6 +1644,32 @@ pub(crate) fn evaluate_change_ignore_bytes(
         }
     }
     Ok(ignored)
+}
+
+pub(crate) fn required_result_file_paths(
+    result: &RootFsManifest,
+    changes: &[RootFsChange],
+    workspace_guest_path: &str,
+) -> BTreeSet<String> {
+    let workspace = workspace_guest_path.trim_start_matches('/');
+    let workspace_prefix = format!("{workspace}/");
+    let mut paths: BTreeSet<_> = result
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == "file"
+                && (entry.path == workspace || entry.path.starts_with(&workspace_prefix))
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+    for entry in changes
+        .iter()
+        .filter_map(|change| change.after.as_ref())
+        .filter(|entry| entry.kind == "file")
+    {
+        paths.insert(entry.path.clone());
+    }
+    paths
 }
 
 fn git_status(command: &mut Command, context: &str) -> Result<()> {

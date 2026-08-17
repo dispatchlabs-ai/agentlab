@@ -97,7 +97,7 @@ Inspect and integrity-check the snapshot without printing captured contents:
 
 Repeat the snapshot without changing the source. The snapshot digest will be identical and previously stored file blobs will be reused.
 
-Use `--json` with `snapshot` or `inspect` for machine-readable output.
+Snapshot inspection is concise by default. Add `--verbose` to list every discovered repository and captured path, or use `--json` with `snapshot` or `inspect` for the complete machine-readable record.
 
 Run a harmless command against a private reconstruction of the snapshot you just inspected:
 

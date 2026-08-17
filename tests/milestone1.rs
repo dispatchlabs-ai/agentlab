@@ -571,6 +571,36 @@ fn cli_and_machine_global_excludes() {
             .any(|entry| entry.path == "machine-global.txt")
     );
     assert!(!String::from_utf8_lossy(&inspect.stdout).contains("must be included"));
+
+    let concise = Command::new(binary)
+        .args(["inspect", "--verify", digest])
+        .env("AGENTLAB_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(
+        concise.status.success(),
+        "{}",
+        String::from_utf8_lossy(&concise.stderr)
+    );
+    let concise = String::from_utf8(concise.stdout).unwrap();
+    assert!(concise.contains("Repositories: 0"));
+    assert!(concise.contains("Entries: 2"));
+    assert!(concise.contains("Integrity: verified"));
+    assert!(!concise.contains("machine-global.txt"));
+
+    let verbose = Command::new(binary)
+        .args(["inspect", "--verify", "--verbose", digest])
+        .env("AGENTLAB_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(
+        verbose.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verbose.stderr)
+    );
+    let verbose = String::from_utf8(verbose.stdout).unwrap();
+    assert!(verbose.contains("machine-global.txt"));
+    assert!(verbose.contains("Integrity: verified"));
 }
 
 #[test]

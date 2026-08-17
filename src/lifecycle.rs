@@ -341,7 +341,10 @@ pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
         ]),
         "export retained filesystem for fork base",
     )?;
-    let base_manifest = rootfs::scan_export(&export_path, Some(store))?;
+    let base_manifest = rootfs::scan_export(&export_path)?;
+    let required_blob_paths =
+        run::required_result_file_paths(&base_manifest, &[], &parent.workspace_guest_path);
+    rootfs::store_required_file_blobs(&export_path, &base_manifest, &required_blob_paths, store)?;
     let base_manifest_bytes = run::pretty_json(&base_manifest)?;
     store.write_run_file(&run_id, "base-rootfs.json", &base_manifest_bytes)?;
     let base_export = run::artifact_for_file("artifacts/base-rootfs.tar", &export_path)?;
@@ -688,7 +691,7 @@ fn execute_continuation(
         ]),
         "export continued root filesystem",
     )?;
-    let result_manifest = rootfs::scan_export(&result_export_path, Some(store))?;
+    let result_manifest = rootfs::scan_export(&result_export_path)?;
     let result_manifest_bytes = run::pretty_json(&result_manifest)?;
     store.write_run_file(
         &subject.run_id,
@@ -696,6 +699,17 @@ fn execute_continuation(
         &result_manifest_bytes,
     )?;
     let all_changes = rootfs::compare(&subject.base_manifest, &result_manifest);
+    let required_blob_paths = run::required_result_file_paths(
+        &result_manifest,
+        &all_changes,
+        &subject.workspace_guest_path,
+    );
+    rootfs::store_required_file_blobs(
+        &result_export_path,
+        &result_manifest,
+        &required_blob_paths,
+        store,
+    )?;
     let ignored = match store.read_run_file(&subject.run_id, "change-ignore.rules") {
         Ok(rules) => run::evaluate_change_ignore_bytes(&rules, &all_changes)?,
         Err(_) if subject.change_ignore.source.is_none() => Default::default(),
