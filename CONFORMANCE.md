@@ -69,6 +69,23 @@ Run the Docker-gated case explicitly:
 cargo test --test milestone2 -- --ignored --nocapture
 ```
 
+## Per-file and agent-curated diff presentation
+
+Unit coverage plus the hands-on Wvains checkpoint prove:
+
+1. Every selected normalized change receives one path-ordered per-file record with exact before/after metadata.
+2. Text additions, modifications, and deletions render as unified patches; binary and metadata-only paths are never rendered as invented text.
+3. Missing historical content is explicit, while new runs preserve changed before-content for later review.
+4. Per-file bundles are content-addressed, tied to the selected raw or portable delta, retained beneath the run, and independently verified.
+5. `--complete`, `--file`, `--inventory`, `--raw`, and deterministic JSON remain available without a model.
+6. Only trusted global configuration beneath the private AgentLab state directory selects a named command-argv harness; workspace content cannot choose a host command.
+7. The generic harness receives the complete request on stdin from a private temporary working directory.
+8. The presenter prompt marks all diff content as untrusted data and asks only for relevance-oriented display.
+9. Missing commands, nonzero exits, timeouts, interrupted input, empty output, and non-UTF-8 output are recorded and fall back to the complete deterministic view.
+10. Every presentation records and verifies its run, delta and per-file identities; exact request, stdout and stderr; harness argv; prompt version; timestamps; status; and receipt digest.
+11. `agentlab inspect --verify PRESENTATION_ID` verifies a presentation without rehashing multi-gigabyte rootfs exports; `agentlab inspect --verify RUN_ID` remains the explicit full-artifact audit.
+12. The Wvains dogfood run reduced 19 complete filesystem changes through a no-tools, no-session Pi harness in 24.7 seconds while emitting immediate progress and 10-second heartbeats.
+
 ## Milestone 3: isolation and repetition
 
 The Docker-gated fixture takes one immutable snapshot, then launches two commands concurrently from that exact digest and the same `alpine:3.21` image. The commands overlap for five seconds, use byte-identical argv, and derive conflicting content from their distinct container hostnames. It proves:

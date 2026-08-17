@@ -101,6 +101,7 @@ pub fn evaluate(
     }
     let result = run::load_result(store, run_id)?;
     crate::lifecycle::verify_all(store, run_id)?;
+    crate::diff::verify_all(store, run_id)?;
     verify_all(store, run_id)?;
     let run_directory = store.run_directory(run_id)?;
     let evaluation_id = Uuid::new_v4().to_string();
@@ -164,6 +165,8 @@ pub fn evaluate(
     // Re-verification makes mutation of the immutable input an explicit failure.
     crate::lifecycle::verify_all(store, run_id)
         .context("evaluator mutated immutable run or lifecycle artifacts")?;
+    crate::diff::verify_all(store, run_id)
+        .context("evaluator mutated per-file diff or presentation artifacts")?;
     verify_all(store, run_id).context("evaluator mutated prior evaluation artifacts")?;
 
     let mut integrity = BTreeMap::new();

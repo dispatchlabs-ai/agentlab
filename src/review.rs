@@ -250,6 +250,7 @@ pub fn review_with_observer(
     )?;
     let reviewer_command = resolve_reviewer_command(&options.reviewer_command)?;
     lifecycle::verify_all(store, &options.run_id)?;
+    crate::diff::verify_all(store, &options.run_id)?;
     evaluation::verify_all(store, &options.run_id)?;
     verify_all(store, &options.run_id)?;
 
@@ -766,6 +767,8 @@ fn verify_reviewer_postconditions(
     verify_bundle_inputs(bundle, request, request_bytes)?;
     lifecycle::verify_all(store, run_id)
         .context("reviewer mutated immutable run or lifecycle artifacts")?;
+    crate::diff::verify_all(store, run_id)
+        .context("reviewer mutated per-file diff or presentation artifacts")?;
     evaluation::verify_all(store, run_id).context("reviewer mutated evaluation artifacts")?;
     verify_all(store, run_id).context("reviewer mutated prior review records")?;
     snapshot::verify(store, base_workspace)

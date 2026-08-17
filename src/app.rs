@@ -8,6 +8,8 @@ use serde::Serialize;
 use crate::acceptance::{self, AcceptOptions};
 use crate::apply::{self, ApplyOptions};
 use crate::build_version;
+use crate::config::{AgentLabConfig, DiffPresentation};
+use crate::diff;
 use crate::evaluation;
 use crate::lifecycle;
 use crate::review::{self, ReviewOptions};
@@ -58,7 +60,7 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Writ
         "fork" => fork_command(&arguments[1..], stdout),
         "rm" => remove_command(&arguments[1..], stdout),
         "compare" => compare_command(&arguments[1..], stdout),
-        "diff" => diff_command(&arguments[1..], stdout),
+        "diff" => diff_command(&arguments[1..], stdout, stderr),
         "inspect" => inspect_command(&arguments[1..], stdout),
         _ => bail!("unknown command {command:?}\n\nRun `agentlab --help` for usage."),
     }
@@ -821,7 +823,23 @@ struct CliReviewObserver<'a> {
     started: Instant,
 }
 
+struct CliDiffObserver<'a> {
+    stderr: &'a mut dyn Write,
+    started: Instant,
+}
+
 impl review::ReviewObserver for CliReviewObserver<'_> {
+    fn stage(&mut self, message: &str) -> std::io::Result<()> {
+        writeln!(
+            self.stderr,
+            "[{:.1}s] {message}",
+            self.started.elapsed().as_secs_f64()
+        )?;
+        self.stderr.flush()
+    }
+}
+
+impl diff::DiffObserver for CliDiffObserver<'_> {
     fn stage(&mut self, message: &str) -> std::io::Result<()> {
         writeln!(
             self.stderr,
@@ -1323,7 +1341,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, review attempt, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] [--verbose] ID_OR_DIGEST\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --verbose, -v             List repositories, snapshot paths, or reviewer artifact paths\n  --json                    Write the complete underlying record as JSON"
+                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, diff presentation, review attempt, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] [--verbose] ID_OR_DIGEST\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --verbose, -v             List repositories, snapshot paths, or reviewer/presenter artifact paths\n  --json                    Write the complete underlying record as JSON"
                 )?;
                 return Ok(());
             }
@@ -1337,6 +1355,63 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     if !digest.starts_with("sha256:") {
         let is_run = store.list_run_ids()?.iter().any(|run_id| run_id == digest);
         if !is_run {
+            if let Some(presentation) = diff::find_optional(&store, digest)? {
+                if verify {
+                    diff::verify(&store, &presentation)?;
+                }
+                if json {
+                    serde_json::to_writer_pretty(&mut *stdout, &presentation)?;
+                    writeln!(stdout)?;
+                    return Ok(());
+                }
+                writeln!(
+                    stdout,
+                    "Diff presentation: {}",
+                    presentation.presentation_id
+                )?;
+                writeln!(stdout, "Schema: {}", presentation.schema_version)?;
+                writeln!(stdout, "Record: {}", presentation.digest)?;
+                writeln!(stdout, "Status: {}", presentation.status)?;
+                writeln!(stdout, "Run: {}", presentation.run_id)?;
+                writeln!(stdout, "Delta: {}", presentation.delta_digest)?;
+                writeln!(stdout, "Per-file diff: {}", presentation.file_diff_digest)?;
+                writeln!(stdout, "Raw selection: {}", presentation.raw)?;
+                writeln!(stdout, "Harness: {}", presentation.harness_name)?;
+                writeln!(stdout, "Command: {}", display_names(&presentation.command))?;
+                writeln!(stdout, "Prompt: {}", presentation.prompt_version)?;
+                writeln!(stdout, "Started: {}", presentation.started_at)?;
+                writeln!(stdout, "Completed: {}", presentation.completed_at)?;
+                writeln!(stdout, "Exit code: {}", presentation.exit_code)?;
+                writeln!(stdout, "AgentLab applied changes: false")?;
+                for warning in &presentation.warnings {
+                    writeln!(stdout, "Warning: {warning}")?;
+                }
+                if verbose {
+                    for (label, artifact) in [
+                        ("Request", &presentation.request),
+                        ("Stdout", &presentation.stdout),
+                        ("Stderr", &presentation.stderr),
+                    ] {
+                        writeln!(
+                            stdout,
+                            "{label}: {}",
+                            store
+                                .run_path(&presentation.run_id, &artifact.path)?
+                                .display()
+                        )?;
+                    }
+                } else {
+                    writeln!(
+                        stdout,
+                        "Artifacts: agentlab inspect --verbose {}",
+                        presentation.presentation_id
+                    )?;
+                }
+                if verify {
+                    writeln!(stdout, "Integrity: verified")?;
+                }
+                return Ok(());
+            }
             if let Some(attempt) = review::find_attempt_optional(&store, digest)? {
                 if verify {
                     review::verify_attempt(&store, &attempt)?;
@@ -1463,6 +1538,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 evaluation::verify_all(&store, digest)?;
                 review::verify_all(&store, digest)?;
                 apply::verify_all(&store, digest)?;
+                diff::verify_all(&store, digest)?;
                 for record in acceptance::list_for_run(&store, digest)? {
                     acceptance::verify(&store, &record)?;
                 }
@@ -1505,6 +1581,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             evaluation::verify_all(&store, digest)?;
             review::verify_all(&store, digest)?;
             apply::verify_all(&store, digest)?;
+            diff::verify_all(&store, digest)?;
             for record in acceptance::list_for_run(&store, digest)? {
                 acceptance::verify(&store, &record)?;
             }
@@ -1541,6 +1618,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             evaluation::list(&store, digest)?.len()
         )?;
         writeln!(stdout, "Reviews: {}", review::list(&store, digest)?.len())?;
+        writeln!(
+            stdout,
+            "Diff presentations: {}",
+            diff::list(&store, digest)?.len()
+        )?;
         writeln!(
             stdout,
             "Review attempts: {}",
@@ -1609,34 +1691,205 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
-fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffView {
+    Inventory,
+    Complete,
+    Important,
+}
+
+fn diff_command(
+    arguments: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     let mut json = false;
     let mut raw = false;
+    let mut requested_view = None;
+    let mut harness_name = None;
+    let mut selected_path = None;
     let mut run_id = None;
-    for argument in arguments {
-        match argument.as_str() {
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
             "--json" => json = true,
             "--raw" => raw = true,
+            "--inventory" => set_diff_view(&mut requested_view, DiffView::Inventory)?,
+            "--complete" => set_diff_view(&mut requested_view, DiffView::Complete)?,
+            "--important" => set_diff_view(&mut requested_view, DiffView::Important)?,
+            "--harness" => {
+                harness_name = Some(required_value(arguments, &mut index, "--harness")?.to_owned())
+            }
+            "--file" => {
+                selected_path = Some(required_value(arguments, &mut index, "--file")?.to_owned())
+            }
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "AgentLab diff\n\nShow persistent filesystem changes from a run. The default respects its portable change-ignore rules.\n\nUsage:\n  agentlab diff [--raw] [--json] RUN\n\nOptions:\n  --raw                     Include every captured machine change\n  --json                    Write the selected delta manifest as JSON"
+                    "AgentLab diff\n\nShow persistent filesystem changes as deterministic per-file diffs or a configured agent-curated important-changes presentation. The default respects portable change-ignore rules and ~/.agentlab/config.toml.\n\nUsage:\n  agentlab diff [--complete | --important | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n\nOptions:\n  --complete                Show every selected per-file content diff without AI\n  --important               Ask the configured trusted host harness to present important changes\n  --inventory               Show only the path-level change inventory\n  --harness NAME            Override the configured harness; implies --important\n  --file PATH               Show one authoritative per-file diff; implies --complete\n  --raw                     Include every captured machine change; alone preserves the raw inventory view\n  --json                    Without a presentation flag, preserve the deterministic delta-manifest JSON\n\nConfiguration:\n  ~/.agentlab/config.toml may define default_harness, named [harnesses.NAME] commands, and [diff] presentation = \"complete\" or \"important\". Harnesses receive the complete diff-review request on stdin and run from a private temporary directory. A failed presentation falls back to the complete deterministic view. Workspace-local harness configuration is never loaded."
                 )?;
                 return Ok(());
             }
             value if value.starts_with('-') => bail!("unexpected diff argument {value:?}"),
-            value if run_id.is_none() => run_id = Some(value),
+            value if run_id.is_none() => run_id = Some(value.to_owned()),
             value => bail!("unexpected diff argument {value:?}"),
         }
+        index += 1;
     }
     let run_id = run_id.ok_or_else(|| anyhow::anyhow!("diff requires RUN"))?;
+    if selected_path.is_some() {
+        match requested_view {
+            Some(DiffView::Important | DiffView::Inventory) => {
+                bail!("--file cannot be combined with --important or --inventory")
+            }
+            _ => requested_view = Some(DiffView::Complete),
+        }
+    }
+    if harness_name.is_some() {
+        match requested_view {
+            Some(DiffView::Complete | DiffView::Inventory) => {
+                bail!("--harness cannot be combined with --complete or --inventory")
+            }
+            _ => requested_view = Some(DiffView::Important),
+        }
+    }
+
     let store = Store::open(None)?;
-    let delta = run::load_delta(&store, run_id, raw)?;
-    if json {
+    let delta = run::load_delta(&store, &run_id, raw)?;
+    if json && requested_view.is_none() {
         serde_json::to_writer_pretty(&mut *stdout, &delta)?;
         writeln!(stdout)?;
         return Ok(());
     }
+
+    let config =
+        if requested_view == Some(DiffView::Important) || (requested_view.is_none() && !raw) {
+            AgentLabConfig::load(&store)?
+        } else {
+            AgentLabConfig::default()
+        };
+    let view = requested_view.unwrap_or({
+        if raw {
+            DiffView::Inventory
+        } else {
+            match config.diff.presentation {
+                DiffPresentation::Complete => DiffView::Complete,
+                DiffPresentation::Important => DiffView::Important,
+            }
+        }
+    });
+    if view == DiffView::Inventory {
+        if json {
+            serde_json::to_writer_pretty(&mut *stdout, &delta)?;
+            writeln!(stdout)?;
+        } else {
+            render_diff_inventory(stdout, &delta, raw)?;
+        }
+        return Ok(());
+    }
+
+    let bundle = diff::ensure_file_diff_bundle(&store, &run_id, raw)?;
+    if view == DiffView::Complete {
+        if json {
+            if let Some(path) = selected_path.as_deref() {
+                let normalized = format!("/{}", path.trim_start_matches('/'));
+                let file = bundle
+                    .files
+                    .iter()
+                    .find(|file| file.path == normalized)
+                    .with_context(|| format!("run has no selected change at {normalized:?}"))?;
+                serde_json::to_writer_pretty(&mut *stdout, file)?;
+            } else {
+                serde_json::to_writer_pretty(&mut *stdout, &bundle)?;
+            }
+            writeln!(stdout)?;
+            return Ok(());
+        }
+        write!(
+            stdout,
+            "{}",
+            diff::render_complete(&bundle, selected_path.as_deref())?
+        )?;
+        return Ok(());
+    }
+
+    let selected_harness = config.selected_harness(harness_name.as_deref())?;
+    let Some((selected_harness_name, harness)) = selected_harness else {
+        if json {
+            bail!(
+                "important diff presentation requires a configured harness in {}",
+                crate::config::config_path(&store).display()
+            );
+        }
+        writeln!(
+            stderr,
+            "AgentLab: important diff presentation requested, but no harness is configured; showing the complete deterministic diff."
+        )?;
+        write!(stdout, "{}", diff::render_complete(&bundle, None)?)?;
+        return Ok(());
+    };
+    let record = {
+        let mut observer = CliDiffObserver {
+            stderr,
+            started: Instant::now(),
+        };
+        diff::present_with_observer(
+            &store,
+            &bundle,
+            selected_harness_name,
+            harness,
+            config.diff.show_omitted_count,
+            &mut observer,
+        )?
+    };
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &record)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+    if record.status == "succeeded" {
+        let presentation = diff::presentation_output(&store, &record)?;
+        writeln!(
+            stdout,
+            "Important changes from {} captured filesystem changes",
+            bundle.files.len()
+        )?;
+        writeln!(stdout, "Reviewed by harness: {}", record.harness_name)?;
+        writeln!(stdout, "Presentation: {}\n", record.presentation_id)?;
+        write!(stdout, "{presentation}")?;
+        if !presentation.ends_with('\n') {
+            writeln!(stdout)?;
+        }
+        writeln!(stdout, "\nPresentation receipt: {}", record.digest)?;
+        return Ok(());
+    }
+    writeln!(
+        stderr,
+        "AgentLab: diff harness {} returned {}; showing the complete deterministic diff.",
+        record.harness_name, record.status
+    )?;
+    for warning in &record.warnings {
+        writeln!(stderr, "AgentLab: {warning}")?;
+    }
+    write!(stdout, "{}", diff::render_complete(&bundle, None)?)?;
+    Ok(())
+}
+
+fn set_diff_view(selected: &mut Option<DiffView>, requested: DiffView) -> Result<()> {
+    if let Some(existing) = selected {
+        if *existing != requested {
+            bail!("choose only one of --complete, --important, or --inventory");
+        }
+    }
+    *selected = Some(requested);
+    Ok(())
+}
+
+fn render_diff_inventory(
+    stdout: &mut dyn Write,
+    delta: &run::DeltaManifest,
+    raw: bool,
+) -> Result<()> {
     writeln!(stdout, "Delta: {}", delta.digest)?;
     writeln!(stdout, "Base: {}", delta.base_filesystem_digest)?;
     writeln!(stdout, "Result: {}", delta.result_filesystem_digest)?;
@@ -1657,7 +1910,7 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--complete | --important | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes or a configured important-changes presentation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation may use only a trusted host harness configured in ~/.agentlab/config.toml; deterministic evidence remains available without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
     )?;
     Ok(())
 }

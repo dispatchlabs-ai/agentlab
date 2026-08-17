@@ -723,6 +723,22 @@ pub fn execute_with_observer(
             all_changes.len()
         ),
     )?;
+    let required_base_blob_paths = required_base_file_paths(&all_changes);
+    if !required_base_blob_paths.is_empty() {
+        report_stage(
+            observer,
+            &format!(
+                "Preserving before-content for {} changed files",
+                required_base_blob_paths.len()
+            ),
+        )?;
+        rootfs::store_required_file_blobs(
+            &base_export_path,
+            &base_manifest,
+            &required_base_blob_paths,
+            store,
+        )?;
+    }
     let required_blob_paths = required_result_file_paths(
         &result_manifest,
         &all_changes,
@@ -987,13 +1003,8 @@ pub fn load_delta(store: &Store, run_id: &str, raw: bool) -> Result<DeltaManifes
 }
 
 pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
-    if result.schema_version != RESULT_SCHEMA_VERSION {
-        bail!("unsupported run result schema {:?}", result.schema_version);
-    }
+    verify_result_identity(store, result)?;
     let spec = load_spec(store, &result.run_id)?;
-    if spec.run_id != result.run_id {
-        bail!("run specification and result IDs do not agree");
-    }
     if let Some(reference) = &spec.accepted_input {
         acceptance::verify_run_input(
             store,
@@ -1005,13 +1016,6 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
             &spec.workspace_ignore_digest,
         )?;
     }
-    let actual_spec_digest = sha256_bytes(&store.read_run_file(&result.run_id, "spec.json")?);
-    if actual_spec_digest != result.run_spec_digest {
-        bail!(
-            "run specification digest mismatch: result records {}, got {actual_spec_digest}",
-            result.run_spec_digest
-        );
-    }
     for (relative, expected) in &result.integrity {
         let bytes = store
             .read_run_file(&result.run_id, relative)
@@ -1022,6 +1026,24 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
                 "run artifact integrity mismatch for {relative:?}: expected {expected}, got {actual}"
             );
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_result_identity(store: &Store, result: &RunResult) -> Result<()> {
+    if result.schema_version != RESULT_SCHEMA_VERSION {
+        bail!("unsupported run result schema {:?}", result.schema_version);
+    }
+    let spec = load_spec(store, &result.run_id)?;
+    if spec.run_id != result.run_id {
+        bail!("run specification and result IDs do not agree");
+    }
+    let actual_spec_digest = sha256_bytes(&store.read_run_file(&result.run_id, "spec.json")?);
+    if actual_spec_digest != result.run_spec_digest {
+        bail!(
+            "run specification digest mismatch: result records {}, got {actual_spec_digest}",
+            result.run_spec_digest
+        );
     }
     let identity = ResultIdentity {
         schema_version: RESULT_SCHEMA_VERSION,
@@ -1048,6 +1070,28 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
         bail!(
             "run result integrity mismatch: expected {}, got {actual}",
             result.digest
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_delta(delta: &DeltaManifest) -> Result<()> {
+    if delta.schema_version != DELTA_SCHEMA_VERSION {
+        bail!("unsupported delta schema {:?}", delta.schema_version);
+    }
+    let identity = DeltaIdentity {
+        schema_version: DELTA_SCHEMA_VERSION,
+        base_filesystem_digest: &delta.base_filesystem_digest,
+        result_filesystem_digest: &delta.result_filesystem_digest,
+        change_ignore: &delta.change_ignore,
+        changes: &delta.changes,
+        ignored_changes: &delta.ignored_changes,
+    };
+    let actual = sha256_bytes(&serde_json::to_vec(&identity)?);
+    if actual != delta.digest {
+        bail!(
+            "delta integrity mismatch: expected {}, got {actual}",
+            delta.digest
         );
     }
     Ok(())
@@ -1849,6 +1893,15 @@ pub(crate) fn required_result_file_paths(
         paths.insert(entry.path.clone());
     }
     paths
+}
+
+pub(crate) fn required_base_file_paths(changes: &[RootFsChange]) -> BTreeSet<String> {
+    changes
+        .iter()
+        .filter_map(|change| change.before.as_ref())
+        .filter(|entry| entry.kind == "file")
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 fn git_status(command: &mut Command, context: &str) -> Result<()> {

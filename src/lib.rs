@@ -1,6 +1,8 @@
 pub mod acceptance;
 pub mod app;
 pub mod apply;
+pub mod config;
+pub mod diff;
 pub mod evaluation;
 pub mod lifecycle;
 pub mod review;

@@ -5,6 +5,8 @@ Snapshot schema: `agentlab.snapshot/v1`
 Run schema: `agentlab.run/v3` (`agentlab.run/v1` and `agentlab.run/v2` read compatibility)
 Run-input schema: `agentlab.run-input/v1`
 Delta schema: `agentlab.delta/v1`
+Per-file diff schema: `agentlab.file-diffs/v1`
+Diff-presentation schema: `agentlab.diff-presentation/v1`
 Result schema: `agentlab.result/v1`
 Continuation schema: `agentlab.continuation/v1`
 Fork schema: `agentlab.fork/v1`
@@ -170,6 +172,56 @@ Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds
 `delta.raw.json` records every normalized persistent change. `delta.json` applies `.agentlabignore` from the selected workspace root, or an explicit `--change-ignore` file, using Git-compatible patterns. Ignore rules affect only portable selection: ignored paths remain observed in the raw delta and present in the retained container. They are never represented as unobserved.
 
 The delta identity is SHA-256 over compact JSON containing every semantic field except the digest itself. Arrays are deterministically path ordered by rootfs comparison.
+
+### 9.1 Per-file diff and presentation contract
+
+`agentlab.file-diffs/v1` is a deterministic derivative of one selected raw or
+portable delta. It records the run and delta identities, selection mode,
+ignored changes, and one path-ordered record for every selected change. Every
+record preserves before/after rootfs metadata and classifies content as text,
+binary, metadata-only, or unavailable. Text additions, modifications, and
+deletions contain ordinary unified patches. Binary and metadata changes MUST
+not be rendered as invented text. Missing content from a legacy run is explicit
+and does not weaken the authoritative path and rootfs metadata.
+
+New runs preserve content-addressed before-content for every changed regular
+file in addition to required result and workspace content. A per-file bundle
+re-hashes every content blob it reads, has its own canonical identity, and is
+retained beneath the run. `--complete` renders this evidence without AI;
+`--file PATH` selects exactly one record; `--inventory` preserves the concise
+path view; `--raw` alone preserves the existing unfiltered machine inventory;
+and `--json` without a presentation flag preserves the delta-manifest JSON
+contract.
+
+`~/.agentlab/config.toml` is trusted host configuration and MUST NOT be loaded
+from the tested workspace. It may define named command-argv harnesses, one
+default harness, and whether the human diff presentation is `complete` or
+`important`. A harness receives the complete versioned request on standard
+input, starts in a private temporary directory, and returns human-facing UTF-8
+text on stdout. AgentLab supplies no captured workspace path or runtime secret
+file to the harness. The process still runs with the invoking host user's
+authority and normal environment; command configuration is therefore a trust
+decision, not a sandbox boundary.
+
+The presentation prompt identifies every diff body as untrusted evidence and
+limits the requested task to relevance-oriented display. AgentLab verifies the
+run-result identity, selected delta identity, complete per-file bundle, and
+prior presentation records before and after invocation. The explicit
+`agentlab inspect --verify` command remains the full byte-level audit of every
+large run artifact.
+`agentlab.diff-presentation/v1` records the exact harness name and argv, prompt
+version, raw/portable selection, run/delta/per-file identities, timestamps,
+exit status, exact request/stdout/stderr artifacts, warnings, and integrity
+hashes. Command failure, timeout, empty output, or non-UTF-8 output is recorded
+and the human command falls back to the complete deterministic view. The
+presentation is an observation and never changes, deletes, or supersedes its
+underlying evidence.
+
+Because a tested command can deliberately copy an injected secret into
+persistent storage, per-file evidence may be sensitive. Enabling an external
+model presenter can transmit that evidence to its provider. Runtime-secret
+cleanup prevents AgentLab from retaining the injected source file; it cannot
+declare arbitrary command-created copies safe.
 
 ## 10. Result contract and integrity
 

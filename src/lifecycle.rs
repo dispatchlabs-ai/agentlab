@@ -753,6 +753,16 @@ fn execute_continuation(
         &result_manifest_bytes,
     )?;
     let all_changes = rootfs::compare(&subject.base_manifest, &result_manifest);
+    let required_base_blob_paths = run::required_base_file_paths(&all_changes);
+    if !required_base_blob_paths.is_empty() {
+        let base_export_path = store.run_path(&subject.run_id, "artifacts/base-rootfs.tar")?;
+        rootfs::store_required_file_blobs(
+            &base_export_path,
+            &subject.base_manifest,
+            &required_base_blob_paths,
+            store,
+        )?;
+    }
     let required_blob_paths = run::required_result_file_paths(
         &result_manifest,
         &all_changes,
