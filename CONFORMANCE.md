@@ -133,6 +133,23 @@ Run the case explicitly:
 cargo test --test milestone5 -- --ignored --nocapture
 ```
 
-## Milestones 6–9
+## Milestone 6: review-only adoption
 
-Later suites cover reviewed three-way adoption, the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints are maintained in `agentlab-plan.md` until their protocols are implemented.
+The Docker-gated fixture runs from an immutable Git workspace, creates three candidate workspace changes plus one `/etc` change, and then independently advances the current host workspace. Through the public CLI it invokes a deterministic reviewer command using the same adapter contract available to Pi or any other command-line harness. It proves:
+
+1. Base, candidate, and current workspace snapshots have distinct, exact anchors and automatically discovered repository records.
+2. The reviewer runs from the private current copy with applicable `AGENTS.md` instructions and receives every documented manifest, delta, workspace tree, and changed-machine path.
+3. Actual after-content for the `/etc` candidate is materialized for inspection without copying it into the host workspace.
+4. Every raw candidate is accounted exactly once as one proposed workspace addition, one rejected workspace change, one three-way conflict, or one unresolved environment change.
+5. Review ID, result/input, workspace, filesystem, and delta anchors plus all nine input-artifact byte digests are immutable.
+6. Duplicate, omitted, traversing, incorrectly anchored, and inconsistently counted proposals fail semantic validation.
+7. The canonical request, proposal, exact reviewer stdout/stderr, receipt identity, and all artifacts pass independent verification and `agentlab inspect --verify`.
+8. The current source snapshot is identical before and after review; current-only work remains, the proposed file is absent, the rejected file is unchanged, and AgentLab explicitly records that it applied nothing.
+
+Run the case explicitly:
+
+```bash
+cargo test --test milestone6 -- --ignored --nocapture
+```
+
+The explicit receipt-bound apply phase remains unimplemented. Later suites cover stale-current apply protection, the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints remain in `agentlab-plan.md` until implemented.

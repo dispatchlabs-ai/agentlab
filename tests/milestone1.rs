@@ -260,6 +260,7 @@ fn command_help_does_not_require_command_separator() {
         ("run", "Capture every supported path"),
         ("evaluate", "trusted host command"),
         ("resume", "--pi-auth"),
+        ("adopt", "It does not apply changes"),
     ] {
         let output = Command::new(binary)
             .args([command, "--help"])

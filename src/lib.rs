@@ -1,3 +1,4 @@
+pub mod adoption;
 pub mod app;
 pub mod evaluation;
 pub mod lifecycle;

@@ -28,7 +28,7 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - The Pi-workspace lifecycle checkpoint passed: one container ID survived stop/start, session value `1` continued to `2`, the requested capture refreshed, the fork inherited the exact continued base, deleting the fork preserved its parent, and the source snapshot remained unchanged.
 - Milestone 5 is complete: arbitrary host evaluator commands produce integrity-checked structured observations, and reports align actual run-input, workspace, image, portable-base, and scalar-score identities without built-in ranking, statistics, or causal claims.
 - The current four-run conformance case snapshots a real workspace without and with a skill directory, repeats each exact input twice, verifies within-input repetition and the cross-input workspace difference, and produces Markdown and JSON reports while preserving the host workspace after the deliberate edit.
-- The next implementation milestone is optional reviewed adoption (Milestone 6). Keep review-only as the default and require explicit authorization before changing a current workspace.
+- Milestone 6 review-only adoption is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, and AgentLab validates and records its proposal without applying it. The next phase is explicit receipt-bound apply with stale-current rejection and recoverable backups.
 
 ## North-star goal
 
@@ -647,7 +647,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 ### Milestone 6: Add optional AI-assisted adoption
 
-**Status:** Next implementation milestone.
+**Status:** Review-only phase complete; explicit apply phase remains.
 
 **Goal:** Allow selected successful changes to improve a current workspace or future environment without weakening the core isolation model.
 
@@ -666,6 +666,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Adoption does not silently change the accepted baseline. Acceptance/promotion is a later explicit lineage decision.
 
 **Acceptance:** From a run based on an older snapshot, advance a disposable current workspace independently, invoke a fixture reviewer through the public command adapter, validate a complete three-way proposal, prove review itself causes no AgentLab apply, reject a stale or unresolved apply, then explicitly apply an authorized nonconflicting workspace subset while leaving rejected and non-workspace changes untouched.
+
+**Review-only acceptance completed:** The public adapter now anchors distinct base/candidate/current states, discovers repositories, exposes actual changed-machine content, validates all four dispositions and unsafe-output rejection, records an integrity-checked receipt, and proves the selected host workspace is unchanged. Stale/unresolved rejection and explicit apply remain the next authorization-bound phase.
 
 **Hands-on checkpoint:** Use a disposable copy of a chosen workspace to generate candidate workspace and machine changes, advance the copy independently, and run `agentlab adopt review` with a chosen CLI reviewer (for example a Pi adapter). Inspect the anchored proposed, rejected, conflicted, and unresolved dispositions. Apply the exact review ID only after explicit authorization, then verify the current workspace's before/after snapshots and the untouched non-workspace recommendations.
 
