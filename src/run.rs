@@ -29,7 +29,7 @@ const PI_AUTH_SECRET_DIRECTORY: &str = "/run/agentlab-secrets";
 const PI_AUTH_SECRET_PATH: &str = "/run/agentlab-secrets/pi-auth.json";
 pub(crate) const PI_AUTH_TMPFS_MOUNT: &str =
     "type=tmpfs,destination=/run/agentlab-secrets,tmpfs-mode=0711,tmpfs-size=1048576";
-const MAX_PI_AUTH_BYTES: u64 = 1024 * 1024;
+const MAX_RUNTIME_SECRET_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -42,9 +42,16 @@ pub struct RunOptions {
     pub memory: Option<String>,
     pub cpus: Option<String>,
     pub pi_auth: Option<PathBuf>,
+    pub secret_files: Vec<SecretFileSpec>,
     pub change_ignore: Option<PathBuf>,
     pub captures: Vec<CaptureSpec>,
     pub accepted_input: Option<AcceptedInputReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretFileSpec {
+    pub name: String,
+    pub source: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,11 +445,7 @@ pub fn execute_with_observer(
         },
         network_policy: options.network.clone(),
         captures: options.captures.clone(),
-        secret_injections: options
-            .pi_auth
-            .as_ref()
-            .map(|_| vec![PI_AUTH_SECRET_NAME.to_owned()])
-            .unwrap_or_default(),
+        secret_injections: secret_injection_names(options),
         workspace_ignore_digest: workspace_manifest.ignore_rules_digest.clone(),
         change_ignore: change_ignore.clone(),
         backend_name: "docker-cli".to_string(),
@@ -598,6 +601,12 @@ pub fn execute_with_observer(
         "start retained container supervisor",
     )?;
     lifecycle.push(event("retained_container_started"));
+    let mut secret_file_guard = if options.secret_files.is_empty() {
+        None
+    } else {
+        report_stage(observer, "Injecting runtime secret files for this command")?;
+        Some(inject_secret_files(&retained_name, &options.secret_files)?)
+    };
     let mut pi_auth_guard = if let Some(auth_path) = &options.pi_auth {
         report_stage(
             observer,
@@ -617,8 +626,13 @@ pub fn execute_with_observer(
         Some(guard) => guard.cleanup(),
         None => Ok(()),
     };
+    let secret_file_cleanup = match &mut secret_file_guard {
+        Some(guard) => guard.cleanup(),
+        None => Ok(()),
+    };
     let command_output = command_output?;
     auth_cleanup?;
+    secret_file_cleanup?;
     let exit_code = command_output.status.code().map(i64::from).unwrap_or(-1);
     lifecycle.push(event("command_completed"));
     report_stage(
@@ -1224,6 +1238,7 @@ fn validate_options(options: &RunOptions) -> Result<()> {
     if let Some(path) = &options.pi_auth {
         validate_pi_auth(path)?;
     }
+    validate_secret_files(&options.secret_files, options.pi_auth.as_deref())?;
     let mut capture_names = HashSet::new();
     for capture in &options.captures {
         validate_guest_path(&capture.guest_path)?;
@@ -1411,7 +1426,7 @@ pub(crate) fn ensure_pi_auth_tmpfs(inspect: &[u8]) -> Result<()> {
                     && mount
                         .pointer("/TmpfsOptions/SizeBytes")
                         .and_then(Value::as_u64)
-                        == Some(MAX_PI_AUTH_BYTES)
+                        == Some(MAX_RUNTIME_SECRET_BYTES)
                     && mount.pointer("/TmpfsOptions/Mode").and_then(Value::as_u64) == Some(0o711)
             })
         });
@@ -1429,7 +1444,7 @@ fn validate_pi_auth(path: &Path) -> Result<()> {
     if !metadata.is_file() {
         bail!("host Pi authentication path is not a regular file");
     }
-    if metadata.len() > MAX_PI_AUTH_BYTES {
+    if metadata.len() > MAX_RUNTIME_SECRET_BYTES {
         bail!("host Pi authentication file exceeds the 1 MiB safety limit");
     }
     let bytes = fs::read(path).context("read host Pi authentication file")?;
@@ -1439,6 +1454,168 @@ fn validate_pi_auth(path: &Path) -> Result<()> {
         bail!("host Pi authentication JSON must be an object");
     }
     Ok(())
+}
+
+fn secret_injection_names(options: &RunOptions) -> Vec<String> {
+    let mut names: Vec<_> = options
+        .secret_files
+        .iter()
+        .map(|secret| secret.name.clone())
+        .collect();
+    if options.pi_auth.is_some() {
+        names.push(PI_AUTH_SECRET_NAME.to_owned());
+    }
+    names.sort();
+    names
+}
+
+pub(crate) fn validate_secret_files(
+    secret_files: &[SecretFileSpec],
+    pi_auth: Option<&Path>,
+) -> Result<()> {
+    let mut names = HashSet::new();
+    let mut total_bytes = match pi_auth {
+        Some(path) => fs::metadata(path)
+            .with_context(|| format!("read host Pi authentication metadata {}", path.display()))?
+            .len(),
+        None => 0,
+    };
+    for secret in secret_files {
+        validate_secret_name(&secret.name)?;
+        if !names.insert(secret.name.as_str()) {
+            bail!("duplicate runtime secret name {:?}", secret.name);
+        }
+        let metadata = fs::metadata(&secret.source).with_context(|| {
+            format!(
+                "read runtime secret file metadata {}",
+                secret.source.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            bail!(
+                "runtime secret source {} is not a regular file",
+                secret.source.display()
+            );
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .context("runtime secret size overflow")?;
+    }
+    if total_bytes > MAX_RUNTIME_SECRET_BYTES {
+        bail!("runtime secret files exceed the combined 1 MiB safety limit");
+    }
+    Ok(())
+}
+
+fn validate_secret_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name == PI_AUTH_SECRET_NAME
+        || name == "pi-auth.json"
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("invalid runtime secret name {name:?}; use letters, digits, '.', '_', or '-'");
+    }
+    Ok(())
+}
+
+fn container_user_identity(container: &str, purpose: &str) -> Result<(String, String, String)> {
+    let identity = docker_success(
+        Command::new("docker").args([
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            "set -eu; uid=$(id -u); gid=$(id -g); home=${HOME:-}; if [ -z \"$home\" ]; then home=$(awk -F: -v uid=\"$uid\" '$3 == uid { print $6; exit }' /etc/passwd); fi; case \"$home\" in /*) ;; *) exit 14 ;; esac; printf '%s\\n%s\\n%s\\n' \"$uid\" \"$gid\" \"$home\"",
+        ]),
+        purpose,
+    )?;
+    let mut lines = identity.lines();
+    let uid = lines.next().context("container user lookup omitted uid")?;
+    let gid = lines.next().context("container user lookup omitted gid")?;
+    let home = lines
+        .next()
+        .context("container user lookup omitted home directory")?;
+    if lines.next().is_some()
+        || uid.parse::<u32>().is_err()
+        || gid.parse::<u32>().is_err()
+        || !home.starts_with('/')
+    {
+        bail!("container returned an invalid user identity for {purpose}");
+    }
+    Ok((uid.to_owned(), gid.to_owned(), home.to_owned()))
+}
+
+pub(crate) struct SecretFileGuard {
+    container: String,
+    paths: Vec<String>,
+    active: bool,
+}
+
+impl SecretFileGuard {
+    pub(crate) fn cleanup(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        if !self.paths.is_empty() {
+            docker_status(
+                Command::new("docker")
+                    .args(["exec", "--user", "0", &self.container, "rm", "-f", "--"])
+                    .args(&self.paths),
+                "remove runtime secret files",
+            )?;
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SecretFileGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+pub(crate) fn inject_secret_files(
+    container: &str,
+    secret_files: &[SecretFileSpec],
+) -> Result<SecretFileGuard> {
+    validate_secret_files(secret_files, None)?;
+    let (uid, gid, _) = container_user_identity(container, "runtime secret injection")?;
+    let owner = format!("{uid}:{gid}");
+    let mut guard = SecretFileGuard {
+        container: container.to_owned(),
+        paths: Vec::new(),
+        active: true,
+    };
+    for secret in secret_files {
+        let target = format!("{PI_AUTH_SECRET_DIRECTORY}/{}", secret.name);
+        guard.paths.push(target.clone());
+        let source = File::open(&secret.source)
+            .with_context(|| format!("open runtime secret file {}", secret.source.display()))?;
+        docker_status(
+            Command::new("docker")
+                .args([
+                    "exec",
+                    "-i",
+                    "--user",
+                    "0",
+                    container,
+                    "/bin/sh",
+                    "-c",
+                    "set -eu; umask 077; target=$1; owner=$2; test -d /run/agentlab-secrets; test ! -e \"$target\"; test ! -L \"$target\"; cat > \"$target\"; chown \"$owner\" \"$target\"; chmod 600 \"$target\"",
+                    "agentlab-secret-file-copy",
+                    &target,
+                    &owner,
+                ])
+                .stdin(Stdio::from(source)),
+            &format!("copy runtime secret {:?} into runtime memory", secret.name),
+        )?;
+    }
+    Ok(guard)
 }
 
 pub(crate) struct PiAuthGuard {
@@ -1479,30 +1656,8 @@ impl Drop for PiAuthGuard {
 
 pub(crate) fn inject_pi_auth(container: &str, source: &Path) -> Result<PiAuthGuard> {
     validate_pi_auth(source)?;
-    let identity = docker_success(
-        Command::new("docker").args([
-            "exec",
-            container,
-            "/bin/sh",
-            "-c",
-            "set -eu; uid=$(id -u); gid=$(id -g); home=${HOME:-}; if [ -z \"$home\" ]; then home=$(awk -F: -v uid=\"$uid\" '$3 == uid { print $6; exit }' /etc/passwd); fi; case \"$home\" in /*) ;; *) exit 14 ;; esac; printf '%s\\n%s\\n%s\\n' \"$uid\" \"$gid\" \"$home\"",
-        ]),
-        "resolve container user for Pi authentication",
-    )?;
-    let mut lines = identity.lines();
-    let uid = lines.next().context("container user lookup omitted uid")?;
-    let gid = lines.next().context("container user lookup omitted gid")?;
-    let home = lines
-        .next()
-        .context("container user lookup omitted home directory")?
-        .to_owned();
-    if lines.next().is_some()
-        || uid.parse::<u32>().is_err()
-        || gid.parse::<u32>().is_err()
-        || !home.starts_with('/')
-    {
-        bail!("container returned an invalid user identity for Pi authentication");
-    }
+    let (uid, gid, home) =
+        container_user_identity(container, "resolve container user for Pi authentication")?;
 
     let auth_file = File::open(source).context("open host Pi authentication file")?;
     let owner = format!("{uid}:{gid}");
@@ -1997,6 +2152,7 @@ mod tests {
             memory: None,
             cpus: None,
             pi_auth: None,
+            secret_files: Vec::new(),
             change_ignore: None,
             captures,
             accepted_input: None,
@@ -2021,6 +2177,55 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "duplicate capture name \"duplicate\"");
+    }
+
+    #[test]
+    fn runtime_secret_names_are_safe_unique_and_do_not_record_host_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+
+        let valid = vec![SecretFileSpec {
+            name: "aws-credentials".to_owned(),
+            source: first.clone(),
+        }];
+        validate_secret_files(&valid, None).unwrap();
+        let mut configured = options(PathBuf::from("."), Vec::new());
+        configured.secret_files = valid;
+        assert_eq!(secret_injection_names(&configured), ["aws-credentials"]);
+        assert!(
+            !secret_injection_names(&configured)[0].contains(temporary.path().to_str().unwrap())
+        );
+
+        let duplicate = vec![
+            SecretFileSpec {
+                name: "credential".to_owned(),
+                source: first,
+            },
+            SecretFileSpec {
+                name: "credential".to_owned(),
+                source: second.clone(),
+            },
+        ];
+        assert_eq!(
+            validate_secret_files(&duplicate, None)
+                .unwrap_err()
+                .to_string(),
+            "duplicate runtime secret name \"credential\""
+        );
+
+        let unsafe_name = vec![SecretFileSpec {
+            name: "../credential".to_owned(),
+            source: second,
+        }];
+        assert!(
+            validate_secret_files(&unsafe_name, None)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid runtime secret name")
+        );
     }
 
     #[test]

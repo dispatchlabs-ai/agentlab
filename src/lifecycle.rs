@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use crate::acceptance;
 use crate::rootfs::{self, RootFsManifest};
-use crate::run::{self, Artifact, CaptureSpec, IgnoreIdentity, ResourceLimits, RunResult, RunSpec};
+use crate::run::{
+    self, Artifact, CaptureSpec, IgnoreIdentity, ResourceLimits, RunResult, RunSpec, SecretFileSpec,
+};
 use crate::store::Store;
 
 pub const FORK_SCHEMA_VERSION: &str = "agentlab.fork/v1";
@@ -286,7 +288,7 @@ pub fn stop(store: &Store, run_id: &str) -> Result<ManagedRun> {
 }
 
 pub fn resume(store: &Store, run_id: &str, command: &[String]) -> Result<ResumeSummary> {
-    resume_with_pi_auth(store, run_id, command, None)
+    resume_with_secrets(store, run_id, command, None, &[])
 }
 
 pub fn resume_with_pi_auth(
@@ -294,6 +296,16 @@ pub fn resume_with_pi_auth(
     run_id: &str,
     command: &[String],
     pi_auth: Option<&Path>,
+) -> Result<ResumeSummary> {
+    resume_with_secrets(store, run_id, command, pi_auth, &[])
+}
+
+pub fn resume_with_secrets(
+    store: &Store,
+    run_id: &str,
+    command: &[String],
+    pi_auth: Option<&Path>,
+    secret_files: &[SecretFileSpec],
 ) -> Result<ResumeSummary> {
     let subject = load_subject(store, run_id)?;
     let inspect = assert_owned_container(&subject)?;
@@ -310,7 +322,12 @@ pub fn resume_with_pi_auth(
         None
     } else {
         Some(execute_continuation(
-            store, &subject, command, restarted, pi_auth,
+            store,
+            &subject,
+            command,
+            restarted,
+            pi_auth,
+            secret_files,
         )?)
     };
     let inspect = assert_owned_container(&subject)?;
@@ -653,6 +670,7 @@ fn execute_continuation(
     command: &[String],
     restarted: bool,
     pi_auth: Option<&Path>,
+    secret_files: &[SecretFileSpec],
 ) -> Result<ContinuationResult> {
     let started_at = Utc::now();
     let continuation_id = Uuid::new_v4().to_string();
@@ -665,8 +683,19 @@ fn execute_continuation(
     fs::create_dir_all(directory.join("artifacts"))?;
     fs::create_dir_all(directory.join("evidence"))?;
 
-    let mut pi_auth_guard = if let Some(source) = pi_auth {
+    run::validate_secret_files(secret_files, pi_auth)?;
+    if pi_auth.is_some() || !secret_files.is_empty() {
         run::ensure_pi_auth_tmpfs(&assert_owned_container(subject)?)?;
+    }
+    let mut secret_file_guard = if secret_files.is_empty() {
+        None
+    } else {
+        Some(run::inject_secret_files(
+            &subject.container_name,
+            secret_files,
+        )?)
+    };
+    let mut pi_auth_guard = if let Some(source) = pi_auth {
         Some(run::inject_pi_auth(&subject.container_name, source)?)
     } else {
         None
@@ -679,10 +708,18 @@ fn execute_continuation(
     if let Some(guard) = &mut pi_auth_guard {
         guard.cleanup()?;
     }
+    if let Some(guard) = &mut secret_file_guard {
+        guard.cleanup()?;
+    }
     let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
-    let secret_injections = pi_auth
-        .map(|_| vec![run::PI_AUTH_SECRET_NAME.to_owned()])
-        .unwrap_or_default();
+    let mut secret_injections: Vec<_> = secret_files
+        .iter()
+        .map(|secret| secret.name.clone())
+        .collect();
+    if pi_auth.is_some() {
+        secret_injections.push(run::PI_AUTH_SECRET_NAME.to_owned());
+    }
+    secret_injections.sort();
     let stdout = write_bytes_artifact(
         store,
         &subject.run_id,

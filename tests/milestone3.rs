@@ -75,6 +75,7 @@ test "$count" = 1
         memory: None,
         cpus: None,
         pi_auth: None,
+        secret_files: Vec::new(),
         change_ignore: None,
         captures: Vec::new(),
         accepted_input: None,

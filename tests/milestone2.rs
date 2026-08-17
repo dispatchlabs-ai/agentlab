@@ -6,7 +6,7 @@ use std::os::unix::fs::symlink;
 use std::process::Command;
 
 use agentlab::rootfs::ChangeKind;
-use agentlab::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
+use agentlab::run::{self, CaptureSpec, RunOptions, SecretFileSpec, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -100,10 +100,17 @@ fn direct_docker_whole_machine_conformance() -> Result<()> {
     let source_before = snapshot::create(&workspace, &store)?.manifest.digest;
     let pi_auth = temporary.path().join("pi-auth.json");
     fs::write(&pi_auth, b"{\"fixture\":\"not-a-real-secret\"}\n")?;
+    let aws_credentials = temporary.path().join("aws-credentials");
+    fs::write(
+        &aws_credentials,
+        b"[fixture]\naws_access_key_id = runtime-only\n",
+    )?;
     let command = r#"
 set -eu
 test -r /root/.pi/agent/auth.json
 test "$(cat /root/.pi/agent/auth.json)" = '{"fixture":"not-a-real-secret"}'
+test -r /run/agentlab-secrets/aws-credentials
+grep -Fx 'aws_access_key_id = runtime-only' /run/agentlab-secrets/aws-credentials >/dev/null
 printf 'after\n' > /workspace/modify.txt
 rm /workspace/delete.txt
 chmod 755 /workspace/mode.txt
@@ -141,6 +148,10 @@ exit 23
             memory: Some("1g".to_owned()),
             cpus: Some("2".to_owned()),
             pi_auth: Some(pi_auth),
+            secret_files: vec![SecretFileSpec {
+                name: "aws-credentials".to_owned(),
+                source: aws_credentials,
+            }],
             change_ignore: None,
             captures: vec![CaptureSpec {
                 guest_path: "/root/session.txt".to_owned(),
@@ -179,7 +190,7 @@ exit 23
     let result = run::load_result(&store, &summary.run_id)?;
     run::verify_result(&store, &result)?;
     let spec = run::load_spec(&store, &summary.run_id)?;
-    ensure!(spec.secret_injections == ["pi-auth"]);
+    ensure!(spec.secret_injections == ["aws-credentials", "pi-auth"]);
     ensure!(result.docker.retained_container_state == "running");
     ensure!(
         result
@@ -212,7 +223,7 @@ exit 23
             .iter()
             .any(|candidate| candidate.path == "/root/.pi/agent/auth.json"
                 || candidate.path.starts_with("/run/agentlab-secrets")),
-        "runtime Pi authentication leaked into persistent filesystem changes"
+        "runtime credentials leaked into persistent filesystem changes"
     );
     ensure!(
         portable
@@ -240,6 +251,21 @@ exit 23
             .iter()
             .any(|candidate| candidate.path == "/var/log/agentlab-noise.log"),
         "ignored path was not classified explicitly"
+    );
+
+    let secret_cleanup = Command::new("docker")
+        .args([
+            "exec",
+            &summary.retained_container_name,
+            "/bin/sh",
+            "-c",
+            "test ! -e /root/.pi/agent/auth.json; test ! -e /run/agentlab-secrets/pi-auth.json; test ! -e /run/agentlab-secrets/aws-credentials",
+        ])
+        .output()?;
+    ensure!(
+        secret_cleanup.status.success(),
+        "runtime credentials were not removed: {}",
+        String::from_utf8_lossy(&secret_cleanup.stderr)
     );
 
     let copied = temporary.path().join("retained-system-file");

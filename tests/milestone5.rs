@@ -96,6 +96,7 @@ fn external_evaluator_reports_real_input_identities_and_scores() -> Result<()> {
                 memory: None,
                 cpus: None,
                 pi_auth: None,
+                secret_files: Vec::new(),
                 change_ignore: None,
                 captures: Vec::new(),
                 accepted_input: None,

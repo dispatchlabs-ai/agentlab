@@ -29,6 +29,7 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - Milestone 5 is complete: arbitrary host evaluator commands produce integrity-checked structured observations, and reports align actual run-input, workspace, image, portable-base, and scalar-score identities without built-in ranking, statistics, or causal claims.
 - The current four-run conformance case snapshots a real workspace without and with a skill directory, repeats each exact input twice, verifies within-input repetition and the cross-input workspace difference, and produces Markdown and JSON reports while preserving the host workspace after the deliberate edit.
 - Milestone 6 is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, AgentLab validates and records its proposal without applying it, and a separate receipt-bound command applies only authorized workspace paths after stale-current checks, explicit conflict/unresolved acknowledgements, private staging, recoverable backup capture, and exact after-snapshot verification.
+- Runtime credentials now have one provider-neutral file primitive: repeatable `--secret-file NAME=HOST_PATH` inputs exist only in private runtime memory for the selected run or continuation command, are removed before capture/export, and record only stable names. `--pi-auth` remains the ergonomic Pi-specific adapter over the same boundary.
 
 ## North-star goal
 

@@ -362,7 +362,7 @@ fn review_errors_explain_the_missing_part_of_the_command() {
 }
 
 #[test]
-fn resume_pi_auth_requires_a_continuation_command() {
+fn resume_credentials_require_a_continuation_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentlab"))
         .args(["resume", "--pi-auth", "fixture-run"])
         .output()
@@ -370,8 +370,31 @@ fn resume_pi_auth_requires_a_continuation_command() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("resume --pi-auth requires `-- COMMAND [ARG ...]`")
+            .contains("resume credential injection requires `-- COMMAND [ARG ...]`")
     );
+}
+
+#[test]
+fn secret_file_cli_requires_a_name_and_host_path() {
+    let binary = env!("CARGO_BIN_EXE_agentlab");
+    for (arguments, expected) in [
+        (
+            vec!["run", "--secret-file", "credentials", "--", "/bin/true"],
+            "--secret-file requires NAME=HOST_PATH",
+        ),
+        (
+            vec!["resume", "--secret-file", "=", "fixture-run"],
+            "--secret-file requires non-empty NAME and HOST_PATH",
+        ),
+    ] {
+        let output = Command::new(binary).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "unexpected secret-file error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

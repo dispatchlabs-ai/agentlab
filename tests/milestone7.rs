@@ -93,6 +93,7 @@ fn accepted_input_to_reviewed_improvement_preserves_complete_lineage() -> Result
             memory: None,
             cpus: None,
             pi_auth: None,
+            secret_files: Vec::new(),
             change_ignore: None,
             captures: Vec::new(),
             accepted_input: None,

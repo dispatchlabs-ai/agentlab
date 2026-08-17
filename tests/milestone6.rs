@@ -77,6 +77,7 @@ fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<
             memory: None,
             cpus: None,
             pi_auth: None,
+            secret_files: Vec::new(),
             change_ignore: None,
             captures: Vec::new(),
             accepted_input: None,

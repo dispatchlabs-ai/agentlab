@@ -5,7 +5,7 @@ use std::io::Read;
 use std::process::Command;
 
 use agentlab::lifecycle;
-use agentlab::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
+use agentlab::run::{self, CaptureSpec, RunOptions, SecretFileSpec, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -53,6 +53,8 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     let source_before = snapshot::create(&workspace, &store)?.manifest.digest;
     let pi_auth = temporary.path().join("pi-auth.json");
     fs::write(&pi_auth, b"{\"fixture\":\"continuation-only\"}\n")?;
+    let runtime_secret = temporary.path().join("aws-credentials");
+    fs::write(&runtime_secret, b"runtime-only\n")?;
 
     let unrelated_name = format!(
         "agentlab-unrelated-{}",
@@ -91,6 +93,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
             memory: None,
             cpus: None,
             pi_auth: None,
+            secret_files: Vec::new(),
             change_ignore: None,
             captures: vec![CaptureSpec {
                 guest_path: "/root/session.txt".to_owned(),
@@ -129,16 +132,20 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     ensure!(!restarted.process_memory_restored);
 
     lifecycle::stop(&store, &summary.run_id)?;
-    let continuation = lifecycle::resume_with_pi_auth(
+    let continuation = lifecycle::resume_with_secrets(
         &store,
         &summary.run_id,
         &[
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "test \"$(cat /root/session.txt)\" = 1; test \"$(cat /root/.pi/agent/auth.json)\" = '{\"fixture\":\"continuation-only\"}'; printf '2\\n' > /root/session.txt; printf 'continued\\n' > /workspace/continued.txt; exit 29"
+            "test \"$(cat /root/session.txt)\" = 1; test \"$(cat /root/.pi/agent/auth.json)\" = '{\"fixture\":\"continuation-only\"}'; test \"$(cat /run/agentlab-secrets/aws-credentials)\" = runtime-only; printf '2\\n' > /root/session.txt; printf 'continued\\n' > /workspace/continued.txt; exit 29"
                 .to_owned(),
         ],
         Some(&pi_auth),
+        &[SecretFileSpec {
+            name: "aws-credentials".to_owned(),
+            source: runtime_secret,
+        }],
     )?;
     ensure!(continuation.container_restarted);
     ensure!(!continuation.process_memory_restored);
@@ -146,7 +153,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
         .continuation
         .context("missing continuation result")?;
     ensure!(continuation.exit_code == 29);
-    ensure!(continuation.secret_injections == ["pi-auth"]);
+    ensure!(continuation.secret_injections == ["aws-credentials", "pi-auth"]);
     ensure!(continuation.filesystem_state_reused);
     ensure!(!continuation.process_memory_restored);
     ensure!(continuation.container_id == summary.retained_container_id);
@@ -157,12 +164,12 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
             &summary.retained_container_name,
             "/bin/sh",
             "-c",
-            "test ! -e /root/.pi/agent/auth.json; test ! -e /run/agentlab-secrets/pi-auth.json",
+            "test ! -e /root/.pi/agent/auth.json; test ! -e /run/agentlab-secrets/pi-auth.json; test ! -e /run/agentlab-secrets/aws-credentials",
         ])
         .output()?;
     ensure!(
         auth_cleanup.status.success(),
-        "continuation Pi auth was not removed: {}",
+        "continuation credentials were not removed: {}",
         String::from_utf8_lossy(&auth_cleanup.stderr)
     );
     ensure!(
