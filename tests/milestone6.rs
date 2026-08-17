@@ -79,6 +79,7 @@ fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<
             pi_auth: None,
             change_ignore: None,
             captures: Vec::new(),
+            accepted_input: None,
         },
         &store,
     )?;

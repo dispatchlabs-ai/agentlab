@@ -96,6 +96,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
                 guest_path: "/root/session.txt".to_owned(),
                 name: "session".to_owned(),
             }],
+            accepted_input: None,
         },
         &store,
     )?;

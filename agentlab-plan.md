@@ -676,6 +676,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 ### Milestone 7: Prove the self-improvement loop
 
+**Status:** Complete.
+
 **Goal:** Launch a new isolated run from an improved workspace/environment produced through reviewed application.
 
 **Outcomes:**
@@ -686,8 +688,14 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Run C begins from that improved base.
 - C contains accepted improvements and excludes rejected or ignored session debris.
 - All prior run evidence remains auditable.
+- `agentlab accept RUN` explicitly accepts the exact workspace/image input tested by a completed run, while `--from-apply APPLY_ID` requires an independent retest of the exact reviewed apply result.
+- `agentlab run --accepted ACCEPTANCE_ID -- COMMAND` reconstructs the accepted snapshot and immutable OCI image, carries verified lineage in the run specification, and never promotes the retest result filesystem.
+- Accepted input identity is content-based; acceptance remains an explicit decision rather than an interpretation of exit status or evaluator scores.
+- Ordinary removal protects candidate and test runs referenced by accepted lineage.
 
 **Acceptance:** A documented short sequence executes the complete accepted-input → isolated run → result → review → explicit apply → retest → explicit acceptance → improved run loop against a disposable fixture workspace, preserving its lineage.
+
+**Acceptance completed:** A Docker-backed public-CLI fixture bootstraps an initial tested acceptance, launches independent comparable candidate runs A and B from it, reviews A against independently advanced current workspace state, applies only one authorized improvement, and leaves rejected, conflicted, ignored-session, and environment candidates out of the applied workspace. It rejects B as a false retest because B began from the old base, retests the exact apply after snapshot with the candidate's immutable image, records a new reviewed-application acceptance linked to the parent acceptance, A result, review, apply, and retest result, and launches C directly from that reference. C proves the accepted improvement is present while rejected content remains at the current/base version and session/environment debris is absent. Acceptance and run verification recursively validate the lineage, and ordinary removal refuses to erase referenced A or retest evidence.
 
 **Hands-on checkpoint:** Run the documented accepted-input → candidate run → review → explicit apply → new snapshot → retest → explicit acceptance → improved run sequence against a disposable copy of a chosen workspace, and verify that the new run contains accepted improvements but not rejected or ignored debris. The developer's mutable host workspace remains the working tree throughout; “accepted” is a recorded immutable reference, not a hidden golden checkout.
 

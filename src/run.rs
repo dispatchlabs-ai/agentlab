@@ -12,13 +12,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::acceptance;
 use crate::build_version;
 use crate::rootfs::{self, ChangeKind, RootFsChange, RootFsManifest};
 use crate::snapshot;
 use crate::store::{Store, hex_digest};
 
-pub const RUN_SCHEMA_VERSION: &str = "agentlab.run/v2";
+pub const RUN_SCHEMA_VERSION: &str = "agentlab.run/v3";
 pub const LEGACY_RUN_SCHEMA_VERSION: &str = "agentlab.run/v1";
+pub const LEGACY_RUN_SCHEMA_VERSION_V2: &str = "agentlab.run/v2";
 pub const RUN_INPUT_SCHEMA_VERSION: &str = "agentlab.run-input/v1";
 pub const DELTA_SCHEMA_VERSION: &str = "agentlab.delta/v1";
 pub const RESULT_SCHEMA_VERSION: &str = "agentlab.result/v1";
@@ -42,12 +44,20 @@ pub struct RunOptions {
     pub pi_auth: Option<PathBuf>,
     pub change_ignore: Option<PathBuf>,
     pub captures: Vec<CaptureSpec>,
+    pub accepted_input: Option<AcceptedInputReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceSource {
     Directory(PathBuf),
     Snapshot(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptedInputReference {
+    pub acceptance_id: String,
+    pub acceptance_digest: String,
+    pub accepted_input_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +85,8 @@ pub struct IgnoreIdentity {
 pub struct RunSpec {
     pub schema_version: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_input: Option<AcceptedInputReference>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_input_digest: String,
     pub workspace_snapshot_digest: String,
@@ -191,6 +203,8 @@ pub struct RunSummary {
     pub retained_container_name: String,
     pub retained_container_id: String,
     pub source_workspace_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_input: Option<AcceptedInputReference>,
 }
 
 pub trait RunObserver {
@@ -388,6 +402,7 @@ pub fn execute_with_observer(
     let mut spec = RunSpec {
         schema_version: RUN_SCHEMA_VERSION.to_string(),
         run_id: run_id.clone(),
+        accepted_input: options.accepted_input.clone(),
         run_input_digest: String::new(),
         workspace_snapshot_digest: workspace_manifest.digest.clone(),
         image_requested: options.image.clone(),
@@ -415,6 +430,22 @@ pub fn execute_with_observer(
         backend_version: docker_version()?,
         agentlab_version: build_version(),
     };
+    if let Some(reference) = &spec.accepted_input {
+        acceptance::verify_run_input(
+            store,
+            reference,
+            &spec.workspace_snapshot_digest,
+            &spec.image_resolved_digest,
+            &spec.target_platform,
+            &spec.workspace_guest_path,
+            &spec.workspace_ignore_digest,
+        )?;
+        lifecycle.push(event("accepted_input_verified"));
+        report_stage(
+            observer,
+            &format!("Accepted input verified: {}", reference.acceptance_id),
+        )?;
+    }
     spec.run_input_digest = compute_run_input_digest(&spec)?;
     let spec_bytes = pretty_json(&spec)?;
     let spec_digest = sha256_bytes(&spec_bytes);
@@ -724,6 +755,10 @@ pub fn execute_with_observer(
         integrity.insert(artifact.path.clone(), artifact.digest.clone());
     }
     integrity.insert("spec.json".to_string(), spec_digest.clone());
+    integrity.insert(
+        "evidence/image-inspect.json".to_string(),
+        sha256_bytes(&resolved_image.inspect),
+    );
     if let Some(rules) = &change_ignore_rules {
         integrity.insert("change-ignore.rules".to_string(), sha256_bytes(rules));
     }
@@ -829,6 +864,7 @@ pub fn execute_with_observer(
         retained_container_name: retained_name,
         retained_container_id: result.docker.retained_container_id,
         source_workspace_status,
+        accepted_input: spec.accepted_input,
     })
 }
 
@@ -842,7 +878,7 @@ pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
         .context("decode run spec")?;
     if !matches!(
         spec.schema_version.as_str(),
-        RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION
+        RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION_V2 | LEGACY_RUN_SCHEMA_VERSION
     ) {
         bail!(
             "unsupported run specification schema {:?}",
@@ -850,7 +886,11 @@ pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
         );
     }
     let computed = compute_run_input_digest(&spec)?;
-    if spec.schema_version == RUN_SCHEMA_VERSION && spec.run_input_digest != computed {
+    if matches!(
+        spec.schema_version.as_str(),
+        RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION_V2
+    ) && spec.run_input_digest != computed
+    {
         bail!(
             "run input identity mismatch: recorded {}, computed {computed}",
             spec.run_input_digest
@@ -872,6 +912,17 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
     let spec = load_spec(store, &result.run_id)?;
     if spec.run_id != result.run_id {
         bail!("run specification and result IDs do not agree");
+    }
+    if let Some(reference) = &spec.accepted_input {
+        acceptance::verify_run_input(
+            store,
+            reference,
+            &spec.workspace_snapshot_digest,
+            &spec.image_resolved_digest,
+            &spec.target_platform,
+            &spec.workspace_guest_path,
+            &spec.workspace_ignore_digest,
+        )?;
     }
     let actual_spec_digest = sha256_bytes(&store.read_run_file(&result.run_id, "spec.json")?);
     if actual_spec_digest != result.run_spec_digest {
@@ -1094,6 +1145,11 @@ fn validate_options(options: &RunOptions) -> Result<()> {
     if options.command.is_empty() {
         bail!("run requires a command after --");
     }
+    if options.accepted_input.is_some()
+        && !matches!(options.workspace, WorkspaceSource::Snapshot(_))
+    {
+        bail!("an accepted input must run from its immutable stored snapshot");
+    }
     validate_guest_path(&options.workspace_guest_path)?;
     if !matches!(options.network.as_str(), "none" | "bridge") {
         bail!("network policy must be either none or bridge in Milestone 2");
@@ -1112,6 +1168,42 @@ fn validate_options(options: &RunOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn immutable_image_reference(store: &Store, run_id: &str) -> Result<String> {
+    let spec = load_spec(store, run_id)?;
+    let inspect = store.read_run_file(run_id, "evidence/image-inspect.json")?;
+    let value: Value = serde_json::from_slice(&inspect).context("decode Docker image evidence")?;
+    let image = value
+        .as_array()
+        .and_then(|values| values.first())
+        .context("Docker image evidence contains no image")?;
+    let evidence_id = image["Id"]
+        .as_str()
+        .context("Docker image evidence omitted Id")?;
+    if evidence_id != spec.docker_image_id {
+        bail!("Docker image evidence does not agree with the run specification");
+    }
+    let mut repo_digests: Vec<_> = image["RepoDigests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    repo_digests.sort();
+    let reference = repo_digests
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| spec.docker_image_id.clone());
+    let resolved = reference
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .unwrap_or(reference.as_str());
+    if resolved != spec.image_resolved_digest {
+        bail!("immutable image reference does not agree with the run specification");
+    }
+    Ok(reference)
 }
 
 fn validate_guest_path(path: &str) -> Result<()> {

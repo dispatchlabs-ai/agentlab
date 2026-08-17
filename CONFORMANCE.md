@@ -161,4 +161,27 @@ Run the case explicitly:
 cargo test --test milestone6 -- --ignored --nocapture
 ```
 
-Later suites cover the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints remain in `agentlab-plan.md` until implemented.
+## Milestone 7: accepted input to improved input
+
+The Docker-gated fixture executes the public accepted-input → independent candidates → review → apply → retest → acceptance → improved-run journey. It proves:
+
+1. One completed seed run can explicitly accept its exact starting workspace/image input without promoting the seed result filesystem.
+2. The accepted-input digest is derived from workspace snapshot, ignore identity, guest path, resolved OCI image, and platform, while the decision receives a separate acceptance ID and record digest.
+3. Two public `run --accepted` invocations reconstruct the same actual input in distinct retained containers and qualify as a comparable repetition.
+4. Both candidate specifications preserve the exact initial acceptance reference without adding labels to canonical run-input identity.
+5. Candidate A creates one proposed improvement, rejected and conflicting workspace changes, ignored session debris, and an environment recommendation; review accounts for the complete raw delta.
+6. Apply changes only the proposed file in the independently advanced host workspace. The rejected file remains at base content, the conflict remains current content, current-only work survives, and session/environment candidates remain absent.
+7. Candidate B is rejected as a retest for the application because it began from the old accepted workspace rather than the apply after snapshot.
+8. A distinct run tests the exact apply after snapshot with the candidate's immutable OCI image, platform, and guest path.
+9. `accept RETEST --from-apply APPLY` creates `agentlab.acceptance/v1` with parent acceptance, candidate run/result/input, review, apply, retest run/result/input, exit status, and new accepted-input identity.
+10. The improved accepted workspace materializes with the authorized improvement, base/current versions of unapplied files, and no ignored session debris.
+11. Run C starts through `run --accepted` from the improved snapshot/image, verifies the expected content, and stores the new acceptance reference in `agentlab.run/v3`.
+12. `inspect --verify ACCEPTANCE` recursively checks complete lineage, while ordinary `rm` refuses to delete the referenced candidate evidence.
+
+Run the case explicitly:
+
+```bash
+cargo test --test milestone7 -- --ignored --nocapture
+```
+
+Later suites cover backend capability equivalence and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints remain in `agentlab-plan.md` until implemented.

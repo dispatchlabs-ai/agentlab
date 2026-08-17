@@ -98,6 +98,7 @@ fn external_evaluator_reports_real_input_identities_and_scores() -> Result<()> {
                 pi_auth: None,
                 change_ignore: None,
                 captures: Vec::new(),
+                accepted_input: None,
             };
             barrier.wait();
             run::execute(&options, &store)

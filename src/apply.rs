@@ -350,6 +350,23 @@ pub fn list(store: &Store, run_id: &str) -> Result<Vec<ApplyRecord>> {
     Ok(records)
 }
 
+pub fn find(store: &Store, apply_id: &str) -> Result<ApplyRecord> {
+    Uuid::parse_str(apply_id).context("apply ID is not a UUID")?;
+    let mut found = None;
+    for run_id in store.list_run_ids()? {
+        for record in list(store, &run_id)? {
+            if record.apply_id != apply_id {
+                continue;
+            }
+            if found.is_some() {
+                bail!("apply ID {apply_id:?} is not unique");
+            }
+            found = Some(record);
+        }
+    }
+    found.with_context(|| format!("apply {apply_id:?} not found"))
+}
+
 pub fn verify_all(store: &Store, run_id: &str) -> Result<()> {
     for record in list(store, run_id)? {
         verify(store, &record)?;

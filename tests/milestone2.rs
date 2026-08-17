@@ -146,6 +146,7 @@ exit 23
                 guest_path: "/root/session.txt".to_owned(),
                 name: "session".to_owned(),
             }],
+            accepted_input: None,
         },
         &store,
         &mut observer,

@@ -36,6 +36,7 @@ impl Store {
             root.clone(),
             root.join("blobs").join("sha256"),
             root.join("snapshots").join("sha256"),
+            root.join("acceptances"),
         ] {
             fs::create_dir_all(&directory).with_context(|| {
                 format!(
@@ -283,6 +284,65 @@ impl Store {
         Ok(run_ids)
     }
 
+    pub fn write_acceptance(&self, acceptance_id: &str, data: &[u8]) -> Result<PathBuf> {
+        validate_record_id(acceptance_id, "acceptance")?;
+        let directory = self.root.join("acceptances");
+        fs::create_dir_all(&directory).context("create AgentLab acceptances directory")?;
+        secure_directory(&directory)?;
+        let destination = directory.join(format!("{acceptance_id}.json"));
+        let mut temporary =
+            NamedTempFile::new_in(&directory).context("create temporary acceptance record")?;
+        secure_file(temporary.as_file())?;
+        temporary
+            .write_all(data)
+            .context("write acceptance record")?;
+        temporary
+            .as_file()
+            .sync_all()
+            .context("sync acceptance record")?;
+        temporary
+            .persist_noclobber(&destination)
+            .map_err(|error| error.error)
+            .with_context(|| format!("persist acceptance {acceptance_id:?}"))?;
+        Ok(destination)
+    }
+
+    pub fn read_acceptance(&self, acceptance_id: &str) -> Result<Vec<u8>> {
+        validate_record_id(acceptance_id, "acceptance")?;
+        let path = self
+            .root
+            .join("acceptances")
+            .join(format!("{acceptance_id}.json"));
+        fs::read(&path).with_context(|| format!("acceptance {acceptance_id:?} not found"))
+    }
+
+    pub fn list_acceptance_ids(&self) -> Result<Vec<String>> {
+        let directory = self.root.join("acceptances");
+        let mut ids = Vec::new();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(error) => return Err(error).context("list AgentLab acceptances"),
+        };
+        for entry in entries {
+            let entry = entry.context("read AgentLab acceptances directory")?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("acceptance filename is not valid UTF-8"))?;
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            validate_record_id(id, "acceptance")?;
+            ids.push(id.to_owned());
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     pub fn remove_run_directory(&self, run_id: &str) -> Result<()> {
         let directory = self.run_directory(run_id)?;
         fs::remove_dir_all(&directory).with_context(|| format!("remove run directory {run_id}"))
@@ -304,6 +364,17 @@ fn validate_run_id(run_id: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
         bail!("invalid run ID {run_id:?}");
+    }
+    Ok(())
+}
+
+fn validate_record_id(id: &str, kind: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        bail!("invalid {kind} ID {id:?}");
     }
     Ok(())
 }

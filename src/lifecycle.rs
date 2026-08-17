@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::acceptance;
 use crate::rootfs::{self, RootFsManifest};
 use crate::run::{self, Artifact, CaptureSpec, IgnoreIdentity, ResourceLimits, RunResult, RunSpec};
 use crate::store::Store;
@@ -454,6 +455,13 @@ pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
 }
 
 pub fn remove(store: &Store, run_id: &str) -> Result<RemovalSummary> {
+    let acceptances = acceptance::referencing_run(store, run_id)?;
+    if !acceptances.is_empty() {
+        bail!(
+            "run {run_id:?} is preserved by accepted lineage {}; accepted evidence cannot be removed",
+            acceptances.join(", ")
+        );
+    }
     let subject = load_subject(store, run_id)?;
     assert_owned_container(&subject)?;
     run::docker_status(

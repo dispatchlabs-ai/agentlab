@@ -267,6 +267,7 @@ fn every_public_command_has_useful_help_without_side_effects() {
         ("report", "agentlab report"),
         ("review", "applies nothing"),
         ("apply", "mutates the selected host workspace"),
+        ("accept", "does not promote the run's output filesystem"),
         ("stop", "agentlab stop"),
         ("resume", "--pi-auth"),
         ("fork", "agentlab fork"),
@@ -346,6 +347,18 @@ fn review_errors_explain_the_missing_part_of_the_command() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    let missing_accept_run = Command::new(binary)
+        .arg("accept")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!missing_accept_run.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_accept_run.stderr).contains("accept requires RUN"),
+        "unexpected accept error: {}",
+        String::from_utf8_lossy(&missing_accept_run.stderr)
+    );
 }
 
 #[test]
@@ -359,6 +372,74 @@ fn resume_pi_auth_requires_a_continuation_command() {
         String::from_utf8_lossy(&output.stderr)
             .contains("resume --pi-auth requires `-- COMMAND [ARG ...]`")
     );
+}
+
+#[test]
+fn accepted_run_errors_explain_which_input_it_already_supplies() {
+    let binary = env!("CARGO_BIN_EXE_agentlab");
+    let state = tempfile::tempdir().unwrap();
+    let acceptance = "00000000-0000-4000-8000-000000000009";
+    for (arguments, expected) in [
+        (
+            vec![
+                "run",
+                "--accepted",
+                acceptance,
+                "--image",
+                "alpine:3.21",
+                "--",
+                "/bin/true",
+            ],
+            "supplies the OCI image",
+        ),
+        (
+            vec![
+                "run",
+                "--accepted",
+                acceptance,
+                "--workspace-path",
+                "/other",
+                "--",
+                "/bin/true",
+            ],
+            "supplies the guest workspace path",
+        ),
+        (
+            vec![
+                "run",
+                "--accepted",
+                acceptance,
+                "--respect-gitignore",
+                "--",
+                "/bin/true",
+            ],
+            "supplies an exact snapshot",
+        ),
+        (
+            vec![
+                "run",
+                "--accepted",
+                acceptance,
+                "--workspace",
+                ".",
+                "--",
+                "/bin/true",
+            ],
+            "mutually exclusive",
+        ),
+    ] {
+        let output = Command::new(binary)
+            .args(arguments)
+            .env("AGENTLAB_STATE_DIR", state.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "unexpected accepted-run error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -526,7 +607,7 @@ fn removed_factor_flags_fail_with_real_input_guidance() {
 }
 
 #[test]
-fn legacy_v1_specs_remain_readable_but_factors_do_not_define_input_identity() {
+fn legacy_v1_and_v2_specs_remain_readable_but_factors_do_not_define_input_identity() {
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(Some(state.path())).unwrap();
     let run_id = "00000000-0000-4000-8000-000000000001";
@@ -576,6 +657,23 @@ fn legacy_v1_specs_remain_readable_but_factors_do_not_define_input_identity() {
         identity_with_legacy_labels,
         run::compute_run_input_digest(&without_legacy_labels).unwrap()
     );
+
+    let v2_run_id = "00000000-0000-4000-8000-000000000002";
+    store.create_run_directory(v2_run_id).unwrap();
+    without_legacy_labels.schema_version = run::LEGACY_RUN_SCHEMA_VERSION_V2.to_owned();
+    without_legacy_labels.run_id = v2_run_id.to_owned();
+    without_legacy_labels.run_input_digest =
+        run::compute_run_input_digest(&without_legacy_labels).unwrap();
+    store
+        .write_run_file(
+            v2_run_id,
+            "spec.json",
+            &serde_json::to_vec_pretty(&without_legacy_labels).unwrap(),
+        )
+        .unwrap();
+    let loaded_v2 = run::load_spec(&store, v2_run_id).unwrap();
+    assert_eq!(loaded_v2.schema_version, "agentlab.run/v2");
+    assert!(loaded_v2.accepted_input.is_none());
 }
 
 fn assert_materialized(root: &Path, manifest: &Manifest) {

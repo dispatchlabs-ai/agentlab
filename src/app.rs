@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::acceptance::{self, AcceptOptions};
 use crate::apply::{self, ApplyOptions};
 use crate::build_version;
 use crate::evaluation;
@@ -50,6 +51,7 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Writ
         "report" => report_command(&arguments[1..], stdout),
         "review" => review_command(&arguments[1..], stdout, stderr),
         "apply" => apply_command(&arguments[1..], stdout, stderr),
+        "accept" => accept_command(&arguments[1..], stdout, stderr),
         "list" => list_command(&arguments[1..], stdout),
         "stop" => stop_command(&arguments[1..], stdout),
         "resume" => resume_command(&arguments[1..], stdout),
@@ -293,10 +295,111 @@ fn apply_command(
         record.before_workspace_snapshot_digest
     )?;
     writeln!(stdout, "Result workspace verified: true")?;
+    let image_reference = run::immutable_image_reference(&store, &record.run_id)?;
+    writeln!(
+        stdout,
+        "Retest exact applied input: agentlab run --snapshot {} --image {} -- COMMAND",
+        record.after_workspace_snapshot_digest,
+        shell_word(&image_reference)
+    )?;
+    writeln!(
+        stdout,
+        "Accept after retest: agentlab accept RETEST_RUN --from-apply {}",
+        record.apply_id
+    )?;
     writeln!(
         stdout,
         "Inspect: agentlab inspect --verify {}",
         record.run_id
+    )?;
+    Ok(())
+}
+
+fn accept_command(
+    arguments: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    if arguments.is_empty()
+        || arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        print_accept_help(stdout)?;
+        return Ok(());
+    }
+    let mut tested_by_run_id = None;
+    let mut from_apply_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--from-apply" => {
+                from_apply_id =
+                    Some(required_value(arguments, &mut index, "--from-apply")?.to_owned())
+            }
+            "--json" => json = true,
+            value if value.starts_with('-') => bail!("unexpected accept argument {value:?}"),
+            value if tested_by_run_id.is_none() => tested_by_run_id = Some(value.to_owned()),
+            value => bail!("unexpected accept argument {value:?}"),
+        }
+        index += 1;
+    }
+    let tested_by_run_id =
+        tested_by_run_id.ok_or_else(|| anyhow::anyhow!("accept requires RUN"))?;
+    writeln!(
+        stderr,
+        "AgentLab: recording an explicit acceptance of the exact workspace and OCI image input tested by run {tested_by_run_id}; test output and session changes are not promoted."
+    )?;
+    stderr.flush()?;
+    let store = Store::open(None)?;
+    let record = acceptance::accept(
+        &store,
+        &AcceptOptions {
+            tested_by_run_id,
+            from_apply_id,
+        },
+    )?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &record)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+    writeln!(stdout, "Acceptance: {}", record.acceptance_id)?;
+    writeln!(stdout, "Record: {}", record.digest)?;
+    writeln!(stdout, "Accepted input: {}", record.accepted_input_digest)?;
+    writeln!(stdout, "Kind: {}", record.kind)?;
+    writeln!(stdout, "Workspace: {}", record.workspace_snapshot_digest)?;
+    writeln!(
+        stdout,
+        "OCI image: {} ({})",
+        record.image.execution_reference, record.image.resolved_digest
+    )?;
+    writeln!(stdout, "Test run: {}", record.tested_by_run_id)?;
+    writeln!(stdout, "Test exit code: {}", record.test_exit_code)?;
+    if let Some(lineage) = &record.applied_lineage {
+        writeln!(stdout, "Candidate run: {}", lineage.candidate_run_id)?;
+        writeln!(stdout, "Review: {}", lineage.review_id)?;
+        writeln!(stdout, "Apply: {}", lineage.apply_id)?;
+    }
+    writeln!(stdout, "Decision: explicit")?;
+    writeln!(
+        stdout,
+        "Run accepted input: agentlab run --accepted {} -- COMMAND",
+        record.acceptance_id
+    )?;
+    writeln!(
+        stdout,
+        "Inspect: agentlab inspect --verify {}",
+        record.acceptance_id
+    )?;
+    Ok(())
+}
+
+fn print_accept_help(stdout: &mut dyn Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "AgentLab accept\n\nExplicitly accept the exact workspace and OCI image input tested by a completed run. This records lineage; it does not promote the run's output filesystem.\n\nUsage:\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n\nArguments:\n  RUN                       Completed run that tested the input being accepted\n  --from-apply APPLY_ID     Require the test input to equal this reviewed apply result\n  --json                    Write the immutable acceptance record as JSON\n\nExamples:\n  agentlab accept INITIAL_TEST_RUN\n  agentlab accept RETEST_RUN --from-apply APPLY_ID\n\nWithout --from-apply, this creates or extends a tested-input lineage. With --from-apply, AgentLab requires an independent retest whose workspace is the exact after snapshot and whose OCI image and workspace path match the candidate run. Exit status is recorded but never interpreted as universal correctness. Each test run receives at most one acceptance decision."
     )?;
     Ok(())
 }
@@ -621,7 +724,7 @@ fn remove_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     {
         writeln!(
             stdout,
-            "AgentLab rm\n\nDelete exactly one run's owned container, prepared image tag, and local run artifacts.\n\nUsage:\n  agentlab rm [--json] RUN"
+            "AgentLab rm\n\nDelete exactly one unreferenced run's owned container, prepared image tag, and local run artifacts. Runs preserved by accepted lineage are refused.\n\nUsage:\n  agentlab rm [--json] RUN"
         )?;
         return Ok(());
     }
@@ -701,7 +804,7 @@ impl run::RunObserver for CliRunObserver<'_> {
 fn print_run_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
-        "AgentLab run\n\nRun one opaque command in a private Docker filesystem reconstructed from a complete workspace or an exact stored snapshot.\n\nUsage:\n  agentlab run --workspace PATH --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --snapshot DIGEST --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n\nWorkspace input:\n  --workspace PATH          Capture every supported path, then run that exact snapshot\n  --snapshot DIGEST         Reuse and verify an existing immutable snapshot\n  --respect-gitignore       Deliberately omit paths selected by workspace .gitignore files\n  --workspace-path PATH     Guest path for the private workspace (default: /workspace)\n\nRuntime:\n  --image IMAGE             OCI image tag or digest (required)\n  --network none|bridge     Network policy (default: bridge)\n  --memory LIMIT            Docker memory limit\n  --cpus COUNT              Docker CPU limit\n  --pi-auth                 Inject ~/.pi/agent/auth.json only while the command runs\n\nObservation:\n  --change-ignore PATH      Git-compatible rules for portable result changes\n  --capture PATH=NAME       Export an additional guest path as a retained tar artifact\n  --json                    Write only the final JSON summary to stdout; progress stays on stderr\n\nExample:\n  agentlab run --workspace ./project --image alpine:3.21 -- /bin/sh -c 'printf \"private\\n\" > /workspace/proof.txt'\n\nThe source workspace is never mounted into the container. Network access uses Docker bridge mode by default; pass --network none for an offline run. Pi authentication uses private runtime memory and is removed before filesystem capture. The guest command can still reveal or copy any credential it receives. AgentLab streams command output, captures the complete persistent guest filesystem, retains the container, and verifies a direct source workspace again after the run."
+        "AgentLab run\n\nRun one opaque command in a private Docker filesystem reconstructed from a complete workspace, exact stored snapshot, or explicitly accepted input.\n\nUsage:\n  agentlab run --workspace PATH --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --snapshot DIGEST --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n\nWorkspace input:\n  --workspace PATH          Capture every supported path, then run that exact snapshot\n  --snapshot DIGEST         Reuse and verify an existing immutable snapshot\n  --accepted ACCEPTANCE_ID  Reuse an accepted workspace, OCI image, and guest path\n  --respect-gitignore       Deliberately omit paths selected by workspace .gitignore files\n  --workspace-path PATH     Guest path for the private workspace (default: /workspace)\n\nRuntime:\n  --image IMAGE             OCI image tag or digest (required except with --accepted)\n  --network none|bridge     Network policy (default: bridge)\n  --memory LIMIT            Docker memory limit\n  --cpus COUNT              Docker CPU limit\n  --pi-auth                 Inject ~/.pi/agent/auth.json only while the command runs\n\nObservation:\n  --change-ignore PATH      Git-compatible rules for portable result changes\n  --capture PATH=NAME       Export an additional guest path as a retained tar artifact\n  --json                    Write only the final JSON summary to stdout; progress stays on stderr\n\nExamples:\n  agentlab run --workspace ./project --image alpine:3.21 -- /bin/sh -c 'printf \"private\\n\" > /workspace/proof.txt'\n  agentlab run --accepted ACCEPTANCE_ID -- HARNESS TASK\n\nThe source workspace is never mounted into the container. An accepted reference supplies and verifies the exact snapshot, immutable OCI image, and workspace path; command and runtime settings remain explicit experiment inputs. Network access uses Docker bridge mode by default; pass --network none for an offline run. Pi authentication uses private runtime memory and is removed before filesystem capture. The guest command can still reveal or copy any credential it receives. AgentLab streams command output, captures the complete persistent guest filesystem, retains the container, and verifies a direct source workspace again after the run."
     )?;
     Ok(())
 }
@@ -738,6 +841,8 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
 
     let mut workspace = None;
     let mut snapshot = None;
+    let mut accepted = None;
+    let mut workspace_path_set = false;
     let mut parsed = RunOptions {
         workspace: WorkspaceSource::Directory(PathBuf::from(".")),
         workspace_capture_mode: CaptureMode::All,
@@ -750,14 +855,15 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         pi_auth: None,
         change_ignore: None,
         captures: Vec::new(),
+        accepted_input: None,
     };
     let mut json = false;
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
             "--workspace" => {
-                if snapshot.is_some() {
-                    bail!("--workspace and --snapshot are mutually exclusive");
+                if snapshot.is_some() || accepted.is_some() {
+                    bail!("--workspace, --snapshot, and --accepted are mutually exclusive");
                 }
                 workspace = Some(PathBuf::from(required_value(
                     options,
@@ -766,13 +872,20 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
                 )?));
             }
             "--snapshot" => {
-                if workspace.is_some() {
-                    bail!("--workspace and --snapshot are mutually exclusive");
+                if workspace.is_some() || accepted.is_some() {
+                    bail!("--workspace, --snapshot, and --accepted are mutually exclusive");
                 }
                 snapshot = Some(required_value(options, &mut index, "--snapshot")?.to_owned());
             }
+            "--accepted" => {
+                if workspace.is_some() || snapshot.is_some() {
+                    bail!("--workspace, --snapshot, and --accepted are mutually exclusive");
+                }
+                accepted = Some(required_value(options, &mut index, "--accepted")?.to_owned());
+            }
             "--image" => parsed.image = required_value(options, &mut index, "--image")?.to_owned(),
             "--workspace-path" => {
+                workspace_path_set = true;
                 parsed.workspace_guest_path =
                     required_value(options, &mut index, "--workspace-path")?.to_owned()
             }
@@ -818,15 +931,36 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         }
         index += 1;
     }
-    if parsed.image.is_empty() {
-        bail!("run requires --image IMAGE");
-    }
-    parsed.workspace = match snapshot {
-        Some(digest) => WorkspaceSource::Snapshot(digest),
-        None => WorkspaceSource::Directory(workspace.unwrap_or_else(|| PathBuf::from("."))),
-    };
-
     let store = Store::open(None)?;
+    if let Some(acceptance_id) = accepted {
+        if !parsed.image.is_empty() {
+            bail!("--accepted supplies the OCI image and cannot be combined with --image");
+        }
+        if workspace_path_set {
+            bail!(
+                "--accepted supplies the guest workspace path and cannot be combined with --workspace-path"
+            );
+        }
+        if parsed.workspace_capture_mode != CaptureMode::All {
+            bail!(
+                "--accepted supplies an exact snapshot and cannot be combined with --respect-gitignore"
+            );
+        }
+        let record = acceptance::find(&store, &acceptance_id)?;
+        acceptance::verify(&store, &record)?;
+        parsed.workspace = WorkspaceSource::Snapshot(record.workspace_snapshot_digest.clone());
+        parsed.workspace_guest_path = record.workspace_guest_path.clone();
+        parsed.image = record.image.execution_reference.clone();
+        parsed.accepted_input = Some(acceptance::reference(&record));
+    } else {
+        if parsed.image.is_empty() {
+            bail!("run requires --image IMAGE unless --accepted ACCEPTANCE_ID is used");
+        }
+        parsed.workspace = match snapshot {
+            Some(digest) => WorkspaceSource::Snapshot(digest),
+            None => WorkspaceSource::Directory(workspace.unwrap_or_else(|| PathBuf::from("."))),
+        };
+    }
     let result = {
         let mut observer = CliRunObserver {
             stdout,
@@ -845,6 +979,14 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         writeln!(stdout, "Exit code: {}", result.exit_code)?;
         writeln!(stdout, "Run input: {}", result.run_input_digest)?;
         writeln!(stdout, "Snapshot: {}", result.workspace_snapshot_digest)?;
+        if let Some(reference) = &result.accepted_input {
+            writeln!(stdout, "Acceptance: {}", reference.acceptance_id)?;
+            writeln!(
+                stdout,
+                "Accepted input: {}",
+                reference.accepted_input_digest
+            )?;
+        }
         writeln!(stdout, "Portable changes: {}", result.changes)?;
         writeln!(stdout, "Ignored changes: {}", result.ignored_changes)?;
         writeln!(
@@ -1116,7 +1258,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "AgentLab inspect\n\nInspect a stored snapshot or retained run without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --json                    Write the underlying snapshot or run record as JSON"
+                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] SNAPSHOT_RUN_OR_ACCEPTANCE\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --json                    Write the underlying snapshot, run, or acceptance record as JSON"
                 )?;
                 return Ok(());
             }
@@ -1125,9 +1267,59 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             value => bail!("unexpected inspect argument {value:?}"),
         }
     }
-    let digest = digest.ok_or_else(|| anyhow::anyhow!("inspect requires SNAPSHOT_OR_RUN"))?;
+    let digest =
+        digest.ok_or_else(|| anyhow::anyhow!("inspect requires SNAPSHOT_RUN_OR_ACCEPTANCE"))?;
     let store = Store::open(None)?;
     if !digest.starts_with("sha256:") {
+        let is_run = store.list_run_ids()?.iter().any(|run_id| run_id == digest);
+        if !is_run {
+            let record = acceptance::find(&store, digest)?;
+            if verify {
+                acceptance::verify(&store, &record)?;
+            }
+            if json {
+                serde_json::to_writer_pretty(&mut *stdout, &record)?;
+                writeln!(stdout)?;
+                return Ok(());
+            }
+            writeln!(stdout, "Acceptance: {}", record.acceptance_id)?;
+            writeln!(stdout, "Schema: {}", record.schema_version)?;
+            writeln!(stdout, "Record: {}", record.digest)?;
+            writeln!(stdout, "Accepted input: {}", record.accepted_input_digest)?;
+            writeln!(stdout, "Kind: {}", record.kind)?;
+            writeln!(stdout, "Decision: {}", record.decision)?;
+            writeln!(stdout, "Accepted at: {}", record.accepted_at)?;
+            writeln!(stdout, "Workspace: {}", record.workspace_snapshot_digest)?;
+            writeln!(stdout, "Workspace path: {}", record.workspace_guest_path)?;
+            writeln!(
+                stdout,
+                "OCI image: {} ({})",
+                record.image.execution_reference, record.image.resolved_digest
+            )?;
+            writeln!(stdout, "Test run: {}", record.tested_by_run_id)?;
+            writeln!(stdout, "Test result: {}", record.test_result_digest)?;
+            writeln!(stdout, "Test exit code: {}", record.test_exit_code)?;
+            if let Some(parent) = &record.parent_accepted_input {
+                writeln!(stdout, "Parent acceptance: {}", parent.acceptance_id)?;
+            }
+            if let Some(lineage) = &record.applied_lineage {
+                writeln!(stdout, "Candidate run: {}", lineage.candidate_run_id)?;
+                writeln!(stdout, "Review: {}", lineage.review_id)?;
+                writeln!(stdout, "Apply: {}", lineage.apply_id)?;
+            }
+            for warning in &record.warnings {
+                writeln!(stdout, "Warning: {warning}")?;
+            }
+            writeln!(
+                stdout,
+                "Run: agentlab run --accepted {} -- COMMAND",
+                record.acceptance_id
+            )?;
+            if verify {
+                writeln!(stdout, "Integrity: verified")?;
+            }
+            return Ok(());
+        }
         if store.run_file_exists(digest, "fork.json")? {
             let fork = lifecycle::load_fork(&store, digest)?;
             if verify {
@@ -1135,6 +1327,9 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 evaluation::verify_all(&store, digest)?;
                 review::verify_all(&store, digest)?;
                 apply::verify_all(&store, digest)?;
+                for record in acceptance::list_for_run(&store, digest)? {
+                    acceptance::verify(&store, &record)?;
+                }
             }
             if json {
                 serde_json::to_writer_pretty(&mut *stdout, &fork)?;
@@ -1174,6 +1369,9 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             evaluation::verify_all(&store, digest)?;
             review::verify_all(&store, digest)?;
             apply::verify_all(&store, digest)?;
+            for record in acceptance::list_for_run(&store, digest)? {
+                acceptance::verify(&store, &record)?;
+            }
         }
         if json {
             serde_json::to_writer_pretty(&mut *stdout, &result)?;
@@ -1211,6 +1409,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             stdout,
             "Applications: {}",
             apply::list(&store, digest)?.len()
+        )?;
+        writeln!(
+            stdout,
+            "Acceptances: {}",
+            acceptance::list_for_run(&store, digest)?.len()
         )?;
         for warning in &result.warnings {
             writeln!(stdout, "Warning: {warning}")?;
@@ -1311,7 +1514,7 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, evaluation, review, and apply metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
     )?;
     Ok(())
 }

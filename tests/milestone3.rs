@@ -77,6 +77,7 @@ test "$count" = 1
         pi_auth: None,
         change_ignore: None,
         captures: Vec::new(),
+        accepted_input: None,
     };
     let left_options = base_options.clone();
     let right_options = base_options;
