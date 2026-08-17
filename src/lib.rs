@@ -1,7 +1,7 @@
-pub mod adoption;
 pub mod app;
 pub mod evaluation;
 pub mod lifecycle;
+pub mod review;
 pub mod rootfs;
 pub mod run;
 pub mod snapshot;

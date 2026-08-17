@@ -254,36 +254,77 @@ fn complete_capture_is_default_and_gitignore_filtering_is_explicit() {
 }
 
 #[test]
-fn command_help_does_not_require_command_separator() {
+fn every_public_command_has_useful_help_without_side_effects() {
     let binary = env!("CARGO_BIN_EXE_agentlab");
     for (command, expected) in [
+        ("snapshot", "agentlab snapshot"),
         ("run", "Capture every supported path"),
+        ("list", "agentlab list"),
+        ("inspect", "agentlab inspect"),
+        ("diff", "agentlab diff"),
+        ("compare", "agentlab compare"),
         ("evaluate", "trusted host command"),
+        ("report", "agentlab report"),
+        ("review", "applies nothing"),
+        ("stop", "agentlab stop"),
         ("resume", "--pi-auth"),
-        ("adopt", "It does not apply changes"),
+        ("fork", "agentlab fork"),
+        ("rm", "agentlab rm"),
     ] {
-        let output = Command::new(binary)
-            .args([command, "--help"])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains(expected),
-            "unexpected help for {command}: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        if command == "run" {
+        for arguments in [[command, "--help"], ["help", command]] {
+            let output = Command::new(binary).args(arguments).output().unwrap();
             assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .contains("Network policy (default: bridge)"),
-                "run help did not declare bridge as the default: {}",
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(expected),
+                "unexpected help for {command}: {}",
                 String::from_utf8_lossy(&output.stdout)
             );
+            assert!(
+                output.stderr.is_empty(),
+                "help for {command} wrote to stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if command == "run" {
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("Network policy (default: bridge)"),
+                    "run help did not declare bridge as the default: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
         }
+    }
+}
+
+#[test]
+fn review_errors_explain_the_missing_part_of_the_command() {
+    let binary = env!("CARGO_BIN_EXE_agentlab");
+    for (arguments, expected) in [
+        (
+            vec!["review", "fixture-run", "--workspace", "."],
+            "review requires `-- COMMAND [ARG ...]`",
+        ),
+        (
+            vec!["review", "fixture-run", "--workspace", ".", "--"],
+            "review requires a reviewer command after `--`",
+        ),
+        (vec!["review", "--", "/bin/true"], "review requires RUN"),
+        (
+            vec!["review", "fixture-run", "--", "/bin/true"],
+            "review requires --workspace CURRENT",
+        ),
+    ] {
+        let output = Command::new(binary).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "unexpected review error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

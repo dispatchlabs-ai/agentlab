@@ -207,7 +207,7 @@ impl Store {
             "evidence",
             "continuations",
             "evaluations",
-            "adoptions",
+            "reviews",
             "lifecycle",
         ] {
             let path = directory.join(child);

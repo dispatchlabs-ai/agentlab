@@ -28,7 +28,7 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - The Pi-workspace lifecycle checkpoint passed: one container ID survived stop/start, session value `1` continued to `2`, the requested capture refreshed, the fork inherited the exact continued base, deleting the fork preserved its parent, and the source snapshot remained unchanged.
 - Milestone 5 is complete: arbitrary host evaluator commands produce integrity-checked structured observations, and reports align actual run-input, workspace, image, portable-base, and scalar-score identities without built-in ranking, statistics, or causal claims.
 - The current four-run conformance case snapshots a real workspace without and with a skill directory, repeats each exact input twice, verifies within-input repetition and the cross-input workspace difference, and produces Markdown and JSON reports while preserving the host workspace after the deliberate edit.
-- Milestone 6 review-only adoption is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, and AgentLab validates and records its proposal without applying it. The next phase is explicit receipt-bound apply with stale-current rejection and recoverable backups.
+- Milestone 6 review-only workflow is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, and AgentLab validates and records its proposal without applying it. The next phase is explicit receipt-bound apply with stale-current rejection and recoverable backups.
 
 ## North-star goal
 
@@ -53,7 +53,7 @@ AgentLab must:
 7. Allow independent runs from the same base to execute without affecting one another.
 8. Retain, inspect, stop, resume, fork when supported, or discard a run while distinguishing filesystem continuation from live-memory resume.
 9. Make results available to external evaluators.
-10. Optionally support AI-assisted adoption of selected changes into a current host workspace or environment definition.
+10. Optionally support AI-assisted review and explicit application of selected changes into a current host workspace or environment definition.
 
 AgentLab should make experiments such as these practical:
 
@@ -75,7 +75,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-The optional adoption convenience is:
+The optional review-and-apply convenience is:
 
 ```text
 base + candidate + current
@@ -83,7 +83,7 @@ base + candidate + current
     → selectively improved workspace/environment
 ```
 
-Keep these layers separate. A user who only wants controlled experiments must not need to configure adoption.
+Keep these layers separate. A user who only wants controlled experiments must not need to configure review or apply.
 
 ## Non-negotiable principles
 
@@ -325,10 +325,11 @@ agentlab fork
 agentlab rm
 ```
 
-Optional adoption may add:
+Optional review and application may add:
 
 ```text
-agentlab adopt
+agentlab review
+agentlab apply
 ```
 
 `agentlab snapshot` is part of the first coherent interface so deterministic snapshotting is independently usable and inspectable before isolated execution exists. `agentlab run` still snapshots automatically when given a workspace.
@@ -411,7 +412,7 @@ After a run, discover repositories anywhere in the base and result filesystems. 
 - untracked files; and
 - broken or externally referenced Git metadata.
 
-The filesystem delta remains authoritative. Git observations exist to improve evaluation and optional adoption.
+The filesystem delta remains authoritative. Git observations exist to improve evaluation and optional review/application.
 
 ## Evaluation layer
 
@@ -437,11 +438,11 @@ Scientific comparisons should use repeated executions because model execution is
 
 The initial version may leave matrix orchestration, statistics, and visualization to external scripts. Preserve enough structured data for those tools to work.
 
-## Optional adoption layer
+## Optional review and application layer
 
-Adoption is convenience porcelain over the core result. It is not required to run or evaluate experiments.
+Review and application are convenience porcelain over the core result. They are not required to run or evaluate experiments.
 
-The adopter receives three states:
+The reviewer receives three states:
 
 ```text
 base       = immutable workspace/image input used by the run
@@ -449,13 +450,13 @@ candidate  = immutable run result and complete machine delta
 current    = freshly snapshotted mutable host workspace and environment source
 ```
 
-The current host workspace is the developer's primary working state. It is not a golden copy. The immutable base exists so candidate changes can be reviewed against both what the run saw and what the developer has changed since. A later accepted baseline records reviewed lineage; adoption does not silently redefine one.
+The current host workspace is the developer's primary working state. It is not a golden copy. The immutable base exists so candidate changes can be reviewed against both what the run saw and what the developer has changed since. A later accepted baseline records reviewed lineage; review and application do not silently redefine one.
 
 Default mode is proposal-only. Applying changes requires a separate explicit operation against the exact review receipt. The smallest harness-neutral interface invokes any command-line reviewer and supplies a materialized review bundle plus paths through environment variables. The command emits a versioned JSON proposal that classifies each candidate path as proposed, rejected, conflicted, or unresolved and may include workspace patch operations. AgentLab validates schema, path scope, base/candidate/current anchors, and disposition counts before accepting the proposal.
 
 The reviewer may be Pi, Codex, another agent, a deterministic program, or a human-authored command wrapper. AgentLab must not understand its prompt protocol. A host reviewer executes with the invoking user's authority and may see sensitive candidate material; it is a trusted process, not an AgentLab sandbox. Proposal-only means AgentLab itself does not apply the proposal. It cannot make a malicious host command non-mutating.
 
-The adoption agent should:
+The review agent should:
 
 - receive faithful materializations of base, candidate workspace, and current plus the full machine-delta manifest;
 - run from a review copy whose current tree contains the applicable workspace instructions;
@@ -467,7 +468,7 @@ The adoption agent should:
 - treat container-runtime state, caches, logs, downloads, and temporary files as evidence to judge rather than predetermined garbage;
 - never print or casually copy credentials;
 - report accepted, rejected, conflicted, and unresolved changes precisely; and
-- emit an immutable adoption receipt.
+- emit an immutable review receipt.
 
 Initial automatic apply should be limited to reviewed workspace changes that can be expressed and checked safely. Valuable changes outside `/workspace` produce explicit environment recommendations or declarative image-source edits; unresolved machine changes must not be copied blindly into the host or silently committed into an accepted image. An explicit allow-unresolved override, if ever provided, must remain visible in the receipt.
 
@@ -487,11 +488,11 @@ Required defaults:
 - If a process writes a secret into persistent storage, it is a captured change unless the user ignored it; warn clearly without printing the value.
 - Record whether secret scanning ran and whether possible sensitive paths or content were detected.
 - Never claim that ignore rules, redaction, or scanning make an untrusted result safe to publish.
-- Destructive host operations and adoption remain explicit.
+- Destructive host operations and application remain explicit.
 
 ## Goal-oriented milestones
 
-Each milestone must end with a documented, user-visible hands-on checkpoint that can be run on a developer machine. Starting with Milestone 1, the checkpoint must accept a workspace chosen by the user rather than working only with internal fixtures. Disposable fixtures remain mandatory for exhaustive and destructive conformance tests; real-workspace checkpoints must be read-only with respect to the source unless the user explicitly invokes adoption with apply authorization.
+Each milestone must end with a documented, user-visible hands-on checkpoint that can be run on a developer machine. Starting with Milestone 1, the checkpoint must accept a workspace chosen by the user rather than working only with internal fixtures. Disposable fixtures remain mandatory for exhaustive and destructive conformance tests; real-workspace checkpoints must be read-only with respect to the source unless the user explicitly invokes `agentlab apply`.
 
 ### Milestone 0: Establish the independent project
 
@@ -589,7 +590,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 **Status:** Complete.
 
-**Goal:** Preserve a Docker run long enough for inspection, harness continuation, filesystem-level fork, and later adoption.
+**Goal:** Preserve a Docker run long enough for inspection, harness continuation, filesystem-level fork, and later review/application.
 
 **Outcomes:**
 
@@ -645,7 +646,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 **Hands-on checkpoint:** Run a harmless Alpine command against a chosen lab workspace that writes distinct files beneath the private workspace and `/etc`. Watch every stage, verify the host workspace remained unchanged, inspect the portable and raw deltas, and follow the printed cleanup command.
 
-### Milestone 6: Add optional AI-assisted adoption
+### Milestone 6: Add optional AI-assisted review and application
 
 **Status:** Review-only phase complete; explicit apply phase remains.
 
@@ -653,7 +654,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 **Outcomes:**
 
-- `agentlab adopt review RUN --workspace CURRENT -- COMMAND...` constructs an integrity-checked base/candidate/current review bundle and invokes an arbitrary reviewer adapter command.
+- `agentlab review RUN --workspace CURRENT -- COMMAND...` constructs an integrity-checked base/candidate/current review bundle and invokes an arbitrary reviewer adapter command.
 - The adapter contract is harness-neutral: it receives request, manifest, delta, and materialized-tree paths through environment variables and emits one versioned JSON proposal. A thin wrapper can adapt any AI harness with a command-line invocation, including Pi, without making that harness part of AgentLab core.
 - The host reviewer is explicitly trusted: it runs with the invoking user's authority and may receive sensitive captured content. Review mode promises only that AgentLab does not apply the proposal; it does not pretend to sandbox or make an arbitrary command non-mutating.
 - The proposal anchors the exact run result, base workspace/image, freshly snapshotted current workspace, reviewer command, and every input artifact digest.
@@ -661,32 +662,32 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Repositories are discovered, not declared.
 - Nonrepository changes use base/candidate/current comparison.
 - Environment changes are evaluated across the entire machine delta, but initial automatic apply is limited to safely expressible workspace changes. Valuable non-workspace changes become explicit recommendations or proposed declarative image-source edits; they are never copied blindly from `/usr`, `/etc`, `/var`, caches, or credentials.
-- `agentlab adopt apply REVIEW_ID --workspace CURRENT` is a separate explicit authorization. It resnapshots current, rejects stale proposals, blocks conflicts or unresolved entries by default, applies only receipt-authorized paths, preserves a recoverable patch/backup artifact, and verifies the resulting snapshot.
+- `agentlab apply REVIEW_ID --workspace CURRENT` is a separate explicit authorization. It resnapshots current, rejects stale proposals, blocks conflicts or unresolved entries by default, applies only receipt-authorized paths, preserves a recoverable patch/backup artifact, and verifies the resulting snapshot.
 - Review and apply emit immutable records with reconciled proposed/rejected/conflicted/unresolved/applied counts and exact before/after identities.
-- Adoption does not silently change the accepted baseline. Acceptance/promotion is a later explicit lineage decision.
+- Application does not silently change the accepted baseline. Acceptance/promotion is a later explicit lineage decision.
 
 **Acceptance:** From a run based on an older snapshot, advance a disposable current workspace independently, invoke a fixture reviewer through the public command adapter, validate a complete three-way proposal, prove review itself causes no AgentLab apply, reject a stale or unresolved apply, then explicitly apply an authorized nonconflicting workspace subset while leaving rejected and non-workspace changes untouched.
 
 **Review-only acceptance completed:** The public adapter now anchors distinct base/candidate/current states, discovers repositories, exposes actual changed-machine content, validates all four dispositions and unsafe-output rejection, records an integrity-checked receipt, and proves the selected host workspace is unchanged. Stale/unresolved rejection and explicit apply remain the next authorization-bound phase.
 
-**Hands-on checkpoint:** Use a disposable copy of a chosen workspace to generate candidate workspace and machine changes, advance the copy independently, and run `agentlab adopt review` with a chosen CLI reviewer (for example a Pi adapter). Inspect the anchored proposed, rejected, conflicted, and unresolved dispositions. Apply the exact review ID only after explicit authorization, then verify the current workspace's before/after snapshots and the untouched non-workspace recommendations.
+**Hands-on checkpoint:** Use a disposable copy of a chosen workspace to generate candidate workspace and machine changes, advance the copy independently, and run `agentlab review` with a chosen CLI reviewer (for example a Pi adapter). Inspect the anchored proposed, rejected, conflicted, and unresolved dispositions. Apply the exact review ID only after explicit authorization, then verify the current workspace's before/after snapshots and the untouched non-workspace recommendations.
 
 ### Milestone 7: Prove the self-improvement loop
 
-**Goal:** Launch a new isolated run from an improved workspace/environment produced through reviewed adoption.
+**Goal:** Launch a new isolated run from an improved workspace/environment produced through reviewed application.
 
 **Outcomes:**
 
 - One accepted input reference produces independent runs A and B.
-- Selected A changes are adopted.
+- Selected A changes are applied.
 - The resulting workspace/image input is tested, reviewed, and explicitly accepted as a new content-addressed baseline reference.
 - Run C begins from that improved base.
 - C contains accepted improvements and excludes rejected or ignored session debris.
 - All prior run evidence remains auditable.
 
-**Acceptance:** A documented short sequence executes the complete accepted-input → isolated run → result → reviewed adoption → retest → explicit acceptance → improved run loop against a disposable fixture workspace, preserving its lineage.
+**Acceptance:** A documented short sequence executes the complete accepted-input → isolated run → result → review → explicit apply → retest → explicit acceptance → improved run loop against a disposable fixture workspace, preserving its lineage.
 
-**Hands-on checkpoint:** Run the documented accepted-input → candidate run → reviewed adoption → new snapshot → retest → explicit acceptance → improved run sequence against a disposable copy of a chosen workspace, and verify that the new run contains accepted improvements but not rejected or ignored debris. The developer's mutable host workspace remains the working tree throughout; “accepted” is a recorded immutable reference, not a hidden golden checkout.
+**Hands-on checkpoint:** Run the documented accepted-input → candidate run → review → explicit apply → new snapshot → retest → explicit acceptance → improved run sequence against a disposable copy of a chosen workspace, and verify that the new run contains accepted improvements but not rejected or ignored debris. The developer's mutable host workspace remains the working tree throughout; “accepted” is a recorded immutable reference, not a hidden golden checkout.
 
 ### Milestone 8: Evaluate whether a second backend earns its complexity
 
@@ -696,7 +697,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 - A time-boxed Dagger spike runs the existing conformance fixture without changing target workspace conventions or portable AgentLab manifests.
 - The spike compares implementation size, correctness, performance, retained-session behavior, portability, operational dependencies, and failure modes with direct Docker.
-- Dagger is adopted only if that comparison demonstrates material value; otherwise the rejection and evidence are documented and no production adapter is added.
+- Dagger is selected only if that comparison demonstrates material value; otherwise the rejection and evidence are documented and no production adapter is added.
 - A Firecracker/E2B-compatible backend is considered separately when strong isolation, remote placement, memory snapshots, or cloud scale is a concrete requirement.
 - Any later backend consumes the same workspace snapshot and emits the same portable delta and result semantics, while its native snapshot or checkpoint remains opaque backend evidence.
 
@@ -720,9 +721,9 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - A second real workspace integrates without core modification.
 - Release notes clearly distinguish stable protocol behavior from experimental backend features.
 
-**Acceptance:** An unfamiliar user can run an isolated arbitrary command against an arbitrary directory, inspect every persistent guest change, repeat the experiment, and understand how to evaluate or optionally adopt the result.
+**Acceptance:** An unfamiliar user can run an isolated arbitrary command against an arbitrary directory, inspect every persistent guest change, repeat the experiment, and understand how to evaluate or optionally review and apply the result.
 
-**Hands-on checkpoint:** On a fresh supported host or clean test environment, follow only the public 15-minute quickstart against a workspace chosen by the tester, inspect the complete result, repeat the run, and exercise review-only adoption without project-specific setup.
+**Hands-on checkpoint:** On a fresh supported host or clean test environment, follow only the public 15-minute quickstart against a workspace chosen by the tester, inspect the complete result, repeat the run, and exercise review without project-specific setup.
 
 ## First end-to-end conformance scenario
 
@@ -785,7 +786,7 @@ Do not build these until the minimal protocol is proven and a concrete need exis
 - a custom environment-definition language;
 - cross-architecture live-memory migration;
 - transparent secret management for every provider;
-- automatic adoption without review; or
+- automatic application without review; or
 - infinite-scale infrastructure.
 
 ## Design pressure tests
@@ -797,7 +798,7 @@ Before accepting a new core concept, ask:
 3. Can this be an opaque command rather than a plugin?
 4. Can this use an existing standard such as OCI, `.gitignore`, Git, tar, or JSON?
 5. Can this be derived by discovery or content identity rather than declared in configuration?
-6. Is this required for isolated execution and observation, or is it optional adoption/evaluation convenience?
+6. Is this required for isolated execution and observation, or is it optional review/application/evaluation convenience?
 7. Does this impose one person's preferred workspace layout?
 8. Does this make the Docker proof unnecessarily resemble the future cloud system or prematurely generalize one backend's lifecycle?
 9. Can the result remain truthful when a backend lacks the capability?
@@ -834,9 +835,9 @@ and rely on all of the following:
 10. Results are complete, structured, integrity-checked, and inspectable without revealing contents by default.
 11. Retained runs survive Docker stop/start and can be managed without confusing filesystem continuation with live-memory resume.
 12. External evaluators can score repeated executions and reports expose their actual input identities.
-13. Optional adoption can use any command-line reviewer to evaluate base, candidate, and current state, then selectively improve future runs through a separate explicit apply.
+13. Optional review can use any command-line reviewer to evaluate base, candidate, and current state, then selectively improve future runs through a separate explicit apply.
 14. A structurally different workspace works without modifying AgentLab core code.
 
 That is AgentLab's durable primitive:
 
-> Content-addressed inputs, isolated agent execution, complete machine-change capture, scientifically comparable results, and optional intelligent adoption.
+> Content-addressed inputs, isolated agent execution, complete machine-change capture, scientifically comparable results, and optional intelligent review and application.

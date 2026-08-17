@@ -16,9 +16,9 @@ use crate::run::{self, Artifact, DeltaManifest};
 use crate::snapshot::{self, Entry, Manifest, Repository};
 use crate::store::{Store, create_new_file, normalize_digest};
 
-pub const ADOPTION_REQUEST_SCHEMA_VERSION: &str = "agentlab.adoption-request/v1";
-pub const ADOPTION_PROPOSAL_SCHEMA_VERSION: &str = "agentlab.adoption-proposal/v1";
-pub const ADOPTION_REVIEW_SCHEMA_VERSION: &str = "agentlab.adoption-review/v1";
+pub const REVIEW_REQUEST_SCHEMA_VERSION: &str = "agentlab.review-request/v1";
+pub const REVIEW_PROPOSAL_SCHEMA_VERSION: &str = "agentlab.review-proposal/v1";
+pub const REVIEW_SCHEMA_VERSION: &str = "agentlab.review/v1";
 
 #[derive(Debug, Clone)]
 pub struct ReviewOptions {
@@ -28,7 +28,7 @@ pub struct ReviewOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionAnchors {
+pub struct ReviewAnchors {
     pub run_id: String,
     pub result_digest: String,
     pub run_input_digest: String,
@@ -42,14 +42,14 @@ pub struct AdoptionAnchors {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionRepositories {
+pub struct ReviewRepositories {
     pub base: Vec<Repository>,
     pub candidate: Vec<Repository>,
     pub current: Vec<Repository>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionCandidate {
+pub struct ReviewCandidate {
     pub path: String,
     pub change: ChangeKind,
     pub scope: String,
@@ -59,15 +59,15 @@ pub struct AdoptionCandidate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionRequest {
+pub struct ReviewRequest {
     pub schema_version: String,
     pub review_id: String,
-    pub anchors: AdoptionAnchors,
+    pub anchors: ReviewAnchors,
     pub workspace_guest_path: String,
     pub reviewer_command: Vec<String>,
     pub input_artifacts: BTreeMap<String, String>,
-    pub repositories: AdoptionRepositories,
-    pub candidates: Vec<AdoptionCandidate>,
+    pub repositories: ReviewRepositories,
+    pub candidates: Vec<ReviewCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub struct WorkspaceOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionDisposition {
+pub struct ReviewDisposition {
     pub path: String,
     pub disposition: String,
     pub reason: String,
@@ -96,18 +96,18 @@ pub struct DispositionCounts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionProposal {
+pub struct ReviewProposal {
     pub schema_version: String,
     pub review_id: String,
-    pub anchors: AdoptionAnchors,
+    pub anchors: ReviewAnchors,
     pub counts: DispositionCounts,
-    pub dispositions: Vec<AdoptionDisposition>,
+    pub dispositions: Vec<ReviewDisposition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdoptionReviewRecord {
+pub struct ReviewRecord {
     pub schema_version: String,
     pub digest: String,
     pub review_id: String,
@@ -116,8 +116,8 @@ pub struct AdoptionReviewRecord {
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub reviewer_exit_code: i64,
-    pub request: AdoptionRequest,
-    pub proposal: AdoptionProposal,
+    pub request: ReviewRequest,
+    pub proposal: ReviewProposal,
     pub request_artifact: Artifact,
     pub proposal_artifact: Artifact,
     pub stdout: Artifact,
@@ -129,7 +129,7 @@ pub struct AdoptionReviewRecord {
 }
 
 #[derive(Serialize)]
-struct AdoptionReviewIdentity<'a> {
+struct ReviewIdentity<'a> {
     schema_version: &'a str,
     review_id: &'a str,
     run_id: &'a str,
@@ -137,8 +137,8 @@ struct AdoptionReviewIdentity<'a> {
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     reviewer_exit_code: i64,
-    request: &'a AdoptionRequest,
-    proposal: &'a AdoptionProposal,
+    request: &'a ReviewRequest,
+    proposal: &'a ReviewProposal,
     request_artifact: &'a Artifact,
     proposal_artifact: &'a Artifact,
     stdout: &'a Artifact,
@@ -149,10 +149,11 @@ struct AdoptionReviewIdentity<'a> {
     integrity: &'a BTreeMap<String, String>,
 }
 
-pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRecord> {
+pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
     if options.reviewer_command.is_empty() {
-        bail!("adopt review requires a reviewer command after --");
+        bail!("review requires a reviewer command after `--`");
     }
+    let reviewer_command = resolve_reviewer_command(&options.reviewer_command)?;
     lifecycle::verify_all(store, &options.run_id)?;
     evaluation::verify_all(store, &options.run_id)?;
     verify_all(store, &options.run_id)?;
@@ -172,7 +173,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
 
     let current_before = snapshot::create(&options.workspace, store)?.manifest;
     let review_id = Uuid::new_v4().to_string();
-    let bundle = tempfile::tempdir().context("create private adoption review bundle")?;
+    let bundle = tempfile::tempdir().context("create private review bundle")?;
     let base_directory = bundle.path().join("base");
     let candidate_directory = bundle.path().join("candidate");
     let current_directory = bundle.path().join("current");
@@ -187,7 +188,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
     let candidate_workspace = snapshot::create(&candidate_directory, store)?.manifest;
     snapshot::materialize(store, &current_before, &current_directory)?;
 
-    let anchors = AdoptionAnchors {
+    let anchors = ReviewAnchors {
         run_id: options.run_id.clone(),
         result_digest: result.digest.clone(),
         run_input_digest: run::compute_run_input_digest(&spec)?,
@@ -207,21 +208,21 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
         &candidate_workspace,
         &current_before,
     )?;
-    let candidates = adoption_candidates(
+    let candidates = review_candidates(
         &raw_delta,
         &spec.workspace_guest_path,
         &base_workspace,
         &current_before,
     )?;
     materialize_machine_changes(store, &raw_delta, &machine_changes_directory)?;
-    let request = AdoptionRequest {
-        schema_version: ADOPTION_REQUEST_SCHEMA_VERSION.to_owned(),
+    let request = ReviewRequest {
+        schema_version: REVIEW_REQUEST_SCHEMA_VERSION.to_owned(),
         review_id: review_id.clone(),
         anchors: anchors.clone(),
         workspace_guest_path: spec.workspace_guest_path.clone(),
-        reviewer_command: options.reviewer_command.clone(),
+        reviewer_command: reviewer_command.clone(),
         input_artifacts,
-        repositories: AdoptionRepositories {
+        repositories: ReviewRepositories {
             base: base_workspace.repositories.clone(),
             candidate: candidate_workspace.repositories.clone(),
             current: current_before.repositories.clone(),
@@ -230,102 +231,94 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
     };
     let request_bytes = run::pretty_json(&request)?;
     fs::write(bundle.path().join("request.json"), &request_bytes)
-        .context("write adoption request into review bundle")?;
+        .context("write review request into review bundle")?;
 
     let started_at = Utc::now();
-    let output = Command::new(&options.reviewer_command[0])
-        .args(&options.reviewer_command[1..])
+    let output = Command::new(&reviewer_command[0])
+        .args(&reviewer_command[1..])
         .current_dir(&current_directory)
         .env("AGENTLAB_RUN_ID", &options.run_id)
-        .env("AGENTLAB_ADOPTION_REVIEW_ID", &review_id)
-        .env("AGENTLAB_ADOPTION_BUNDLE_DIR", bundle.path())
+        .env("AGENTLAB_REVIEW_ID", &review_id)
+        .env("AGENTLAB_REVIEW_BUNDLE_DIR", bundle.path())
         .env(
-            "AGENTLAB_ADOPTION_REQUEST_PATH",
+            "AGENTLAB_REVIEW_REQUEST_PATH",
             bundle.path().join("request.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_BASE_MANIFEST_PATH",
+            "AGENTLAB_REVIEW_BASE_MANIFEST_PATH",
             bundle.path().join("base-manifest.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_CANDIDATE_MANIFEST_PATH",
+            "AGENTLAB_REVIEW_CANDIDATE_MANIFEST_PATH",
             bundle.path().join("candidate-manifest.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_CURRENT_MANIFEST_PATH",
+            "AGENTLAB_REVIEW_CURRENT_MANIFEST_PATH",
             bundle.path().join("current-manifest.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_DELTA_PATH",
+            "AGENTLAB_REVIEW_DELTA_PATH",
             bundle.path().join("delta.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_RAW_DELTA_PATH",
+            "AGENTLAB_REVIEW_RAW_DELTA_PATH",
             bundle.path().join("delta.raw.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_RUN_SPEC_PATH",
+            "AGENTLAB_REVIEW_RUN_SPEC_PATH",
             bundle.path().join("spec.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_RUN_RESULT_PATH",
+            "AGENTLAB_REVIEW_RUN_RESULT_PATH",
             bundle.path().join("result.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_BASE_ROOTFS_MANIFEST_PATH",
+            "AGENTLAB_REVIEW_BASE_ROOTFS_MANIFEST_PATH",
             bundle.path().join("base-rootfs.json"),
         )
         .env(
-            "AGENTLAB_ADOPTION_CANDIDATE_ROOTFS_MANIFEST_PATH",
+            "AGENTLAB_REVIEW_CANDIDATE_ROOTFS_MANIFEST_PATH",
             bundle.path().join("candidate-rootfs.json"),
         )
-        .env("AGENTLAB_ADOPTION_BASE_DIR", &base_directory)
-        .env("AGENTLAB_ADOPTION_CANDIDATE_DIR", &candidate_directory)
-        .env("AGENTLAB_ADOPTION_CURRENT_DIR", &current_directory)
+        .env("AGENTLAB_REVIEW_BASE_DIR", &base_directory)
+        .env("AGENTLAB_REVIEW_CANDIDATE_DIR", &candidate_directory)
+        .env("AGENTLAB_REVIEW_CURRENT_DIR", &current_directory)
         .env(
-            "AGENTLAB_ADOPTION_MACHINE_CHANGES_DIR",
+            "AGENTLAB_REVIEW_MACHINE_CHANGES_DIR",
             &machine_changes_directory,
         )
         .output()
-        .with_context(|| {
-            format!(
-                "execute adoption reviewer command {:?}",
-                options.reviewer_command[0]
-            )
-        })?;
+        .with_context(|| format!("execute reviewer command {:?}", reviewer_command[0]))?;
     let completed_at = Utc::now();
 
     verify_bundle_inputs(bundle.path(), &request, &request_bytes)?;
     lifecycle::verify_all(store, &options.run_id)
-        .context("adoption reviewer mutated immutable run or lifecycle artifacts")?;
+        .context("reviewer mutated immutable run or lifecycle artifacts")?;
     evaluation::verify_all(store, &options.run_id)
-        .context("adoption reviewer mutated evaluation artifacts")?;
-    verify_all(store, &options.run_id)
-        .context("adoption reviewer mutated prior adoption records")?;
+        .context("reviewer mutated evaluation artifacts")?;
+    verify_all(store, &options.run_id).context("reviewer mutated prior review records")?;
     snapshot::verify(store, &base_workspace)
-        .context("adoption reviewer mutated base workspace snapshot content")?;
+        .context("reviewer mutated base workspace snapshot content")?;
     snapshot::verify(store, &candidate_workspace)
-        .context("adoption reviewer mutated candidate workspace snapshot content")?;
+        .context("reviewer mutated candidate workspace snapshot content")?;
     snapshot::verify(store, &current_before)
-        .context("adoption reviewer mutated current workspace snapshot content")?;
+        .context("reviewer mutated current workspace snapshot content")?;
     let current_after = snapshot::create(&options.workspace, store)?.manifest;
     if current_after.digest != current_before.digest {
-        bail!(
-            "adoption reviewer changed the selected current workspace; review receipt was not accepted"
-        );
+        bail!("reviewer changed the selected current workspace; review receipt was not accepted");
     }
     let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
     if !output.status.success() {
         bail!(
-            "adoption reviewer exited with status {exit_code}: {}",
+            "reviewer exited with status {exit_code}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let proposal: AdoptionProposal = serde_json::from_slice(&output.stdout)
-        .context("adoption reviewer stdout was not a valid proposal JSON object")?;
+    let proposal: ReviewProposal = serde_json::from_slice(&output.stdout)
+        .context("reviewer stdout was not a valid proposal JSON object")?;
     validate_proposal(&request, &proposal)?;
 
-    let prefix = format!("adoptions/{review_id}");
+    let prefix = format!("reviews/{review_id}");
     let request_artifact = write_artifact(
         store,
         &options.run_id,
@@ -361,8 +354,8 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
         "captured workspaces, machine deltas, reviewer output, and receipts may contain sensitive information"
             .to_owned(),
     ];
-    let identity = AdoptionReviewIdentity {
-        schema_version: ADOPTION_REVIEW_SCHEMA_VERSION,
+    let identity = ReviewIdentity {
+        schema_version: REVIEW_SCHEMA_VERSION,
         review_id: &review_id,
         run_id: &options.run_id,
         result_digest: &result.digest,
@@ -380,8 +373,8 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
         warnings: &warnings,
         integrity: &integrity,
     };
-    let record = AdoptionReviewRecord {
-        schema_version: ADOPTION_REVIEW_SCHEMA_VERSION.to_owned(),
+    let record = ReviewRecord {
+        schema_version: REVIEW_SCHEMA_VERSION.to_owned(),
         digest: run::sha256_bytes(&serde_json::to_vec(&identity)?),
         review_id,
         run_id: options.run_id.clone(),
@@ -409,12 +402,35 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<AdoptionReviewRe
     Ok(record)
 }
 
-pub fn list(store: &Store, run_id: &str) -> Result<Vec<AdoptionReviewRecord>> {
-    let directory = store.run_path(run_id, "adoptions")?;
+fn resolve_reviewer_command(command: &[String]) -> Result<Vec<String>> {
+    let mut resolved = command.to_vec();
+    let executable = Path::new(&resolved[0]);
+    if !executable.is_absolute() && executable.components().count() > 1 {
+        let invocation_directory = std::env::current_dir().context("resolve current directory")?;
+        let absolute = invocation_directory
+            .join(executable)
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "resolve reviewer executable {:?} from {}",
+                    resolved[0],
+                    invocation_directory.display()
+                )
+            })?;
+        resolved[0] = absolute
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("reviewer executable path is not valid UTF-8"))?;
+    }
+    Ok(resolved)
+}
+
+pub fn list(store: &Store, run_id: &str) -> Result<Vec<ReviewRecord>> {
+    let directory = store.run_path(run_id, "reviews")?;
     if !directory.is_dir() {
         return Ok(Vec::new());
     }
-    let mut records: Vec<AdoptionReviewRecord> = Vec::new();
+    let mut records: Vec<ReviewRecord> = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -423,8 +439,8 @@ pub fn list(store: &Store, run_id: &str) -> Result<Vec<AdoptionReviewRecord>> {
         let id = entry
             .file_name()
             .into_string()
-            .map_err(|_| anyhow::anyhow!("adoption review ID is not valid UTF-8"))?;
-        let relative = format!("adoptions/{id}/review.json");
+            .map_err(|_| anyhow::anyhow!("review ID is not valid UTF-8"))?;
+        let relative = format!("reviews/{id}/review.json");
         if store.run_file_exists(run_id, &relative)? {
             records.push(serde_json::from_slice(
                 &store.read_run_file(run_id, &relative)?,
@@ -446,38 +462,35 @@ pub fn verify_all(store: &Store, run_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn verify(store: &Store, record: &AdoptionReviewRecord) -> Result<()> {
-    if record.schema_version != ADOPTION_REVIEW_SCHEMA_VERSION {
-        bail!(
-            "unsupported adoption review schema {:?}",
-            record.schema_version
-        );
+pub fn verify(store: &Store, record: &ReviewRecord) -> Result<()> {
+    if record.schema_version != REVIEW_SCHEMA_VERSION {
+        bail!("unsupported review schema {:?}", record.schema_version);
     }
     if record.review_id != record.request.review_id
         || record.run_id != record.request.anchors.run_id
         || record.result_digest != record.request.anchors.result_digest
         || record.proposal.review_id != record.review_id
     {
-        bail!("adoption review record fields do not agree with request/proposal anchors");
+        bail!("review record fields do not agree with request/proposal anchors");
     }
     for (relative, expected) in &record.integrity {
         let actual = run::sha256_bytes(&store.read_run_file(&record.run_id, relative)?);
         if &actual != expected {
-            bail!("adoption review artifact integrity mismatch for {relative:?}");
+            bail!("review artifact integrity mismatch for {relative:?}");
         }
     }
-    let stored_request: AdoptionRequest = serde_json::from_slice(
+    let stored_request: ReviewRequest = serde_json::from_slice(
         &store.read_run_file(&record.run_id, &record.request_artifact.path)?,
     )?;
-    let stored_proposal: AdoptionProposal = serde_json::from_slice(
+    let stored_proposal: ReviewProposal = serde_json::from_slice(
         &store.read_run_file(&record.run_id, &record.proposal_artifact.path)?,
     )?;
     if stored_request != record.request || stored_proposal != record.proposal {
-        bail!("adoption review record and stored request/proposal do not agree");
+        bail!("review record and stored request/proposal do not agree");
     }
     validate_proposal(&record.request, &record.proposal)?;
-    let identity = AdoptionReviewIdentity {
-        schema_version: ADOPTION_REVIEW_SCHEMA_VERSION,
+    let identity = ReviewIdentity {
+        schema_version: REVIEW_SCHEMA_VERSION,
         review_id: &record.review_id,
         run_id: &record.run_id,
         result_digest: &record.result_digest,
@@ -496,24 +509,24 @@ pub fn verify(store: &Store, record: &AdoptionReviewRecord) -> Result<()> {
         integrity: &record.integrity,
     };
     if run::sha256_bytes(&serde_json::to_vec(&identity)?) != record.digest {
-        bail!("adoption review record integrity mismatch");
+        bail!("review record integrity mismatch");
     }
     Ok(())
 }
 
-fn validate_proposal(request: &AdoptionRequest, proposal: &AdoptionProposal) -> Result<()> {
+fn validate_proposal(request: &ReviewRequest, proposal: &ReviewProposal) -> Result<()> {
     validate_request(request)?;
-    if proposal.schema_version != ADOPTION_PROPOSAL_SCHEMA_VERSION {
+    if proposal.schema_version != REVIEW_PROPOSAL_SCHEMA_VERSION {
         bail!(
-            "unsupported adoption proposal schema {:?}",
+            "unsupported review proposal schema {:?}",
             proposal.schema_version
         );
     }
     if proposal.review_id != request.review_id {
-        bail!("adoption proposal review ID does not match request");
+        bail!("review proposal review ID does not match request");
     }
     if proposal.anchors != request.anchors {
-        bail!("adoption proposal anchors do not match request");
+        bail!("review proposal anchors do not match request");
     }
     let candidates: BTreeMap<_, _> = request
         .candidates
@@ -524,17 +537,17 @@ fn validate_proposal(request: &AdoptionRequest, proposal: &AdoptionProposal) -> 
     let mut counts = DispositionCounts::default();
     for disposition in &proposal.dispositions {
         if !seen.insert(disposition.path.as_str()) {
-            bail!("duplicate adoption disposition for {:?}", disposition.path);
+            bail!("duplicate review disposition for {:?}", disposition.path);
         }
         let candidate = candidates.get(disposition.path.as_str()).with_context(|| {
             format!(
-                "adoption disposition references non-candidate path {:?}",
+                "review disposition references non-candidate path {:?}",
                 disposition.path
             )
         })?;
         if disposition.reason.trim().is_empty() {
             bail!(
-                "adoption disposition {:?} requires a reason",
+                "review disposition {:?} requires a reason",
                 disposition.path
             );
         }
@@ -543,7 +556,7 @@ fn validate_proposal(request: &AdoptionRequest, proposal: &AdoptionProposal) -> 
             "rejected" => counts.rejected += 1,
             "conflicted" => counts.conflicted += 1,
             "unresolved" => counts.unresolved += 1,
-            value => bail!("invalid adoption disposition {value:?}"),
+            value => bail!("invalid review disposition {value:?}"),
         }
         if disposition.disposition != "proposed" && disposition.workspace_operation.is_some() {
             bail!(
@@ -597,24 +610,24 @@ fn validate_proposal(request: &AdoptionRequest, proposal: &AdoptionProposal) -> 
             .filter(|path| !seen.contains(**path))
             .copied()
             .collect();
-        bail!("adoption proposal omitted candidate paths: {missing:?}");
+        bail!("review proposal omitted candidate paths: {missing:?}");
     }
     if proposal.counts != counts {
-        bail!("adoption proposal disposition counts are inconsistent");
+        bail!("review proposal disposition counts are inconsistent");
     }
     Ok(())
 }
 
-fn validate_request(request: &AdoptionRequest) -> Result<()> {
-    if request.schema_version != ADOPTION_REQUEST_SCHEMA_VERSION {
+fn validate_request(request: &ReviewRequest) -> Result<()> {
+    if request.schema_version != REVIEW_REQUEST_SCHEMA_VERSION {
         bail!(
-            "unsupported adoption request schema {:?}",
+            "unsupported review request schema {:?}",
             request.schema_version
         );
     }
-    Uuid::parse_str(&request.review_id).context("adoption request review ID is not a UUID")?;
+    Uuid::parse_str(&request.review_id).context("review request review ID is not a UUID")?;
     if request.reviewer_command.is_empty() {
-        bail!("adoption request reviewer command is empty");
+        bail!("review request reviewer command is empty");
     }
     for digest in [
         &request.anchors.result_digest,
@@ -627,21 +640,21 @@ fn validate_request(request: &AdoptionRequest) -> Result<()> {
         &request.anchors.portable_delta_digest,
         &request.anchors.raw_delta_digest,
     ] {
-        normalize_digest(digest).context("adoption request contains an invalid anchor digest")?;
+        normalize_digest(digest).context("review request contains an invalid anchor digest")?;
     }
     for digest in request.input_artifacts.values() {
         normalize_digest(digest)
-            .context("adoption request contains an invalid input-artifact digest")?;
+            .context("review request contains an invalid input-artifact digest")?;
     }
     let mut paths = BTreeSet::new();
     for candidate in &request.candidates {
         if !paths.insert(candidate.path.as_str()) {
-            bail!("duplicate adoption candidate path {:?}", candidate.path);
+            bail!("duplicate review candidate path {:?}", candidate.path);
         }
         let relative = candidate
             .path
             .strip_prefix('/')
-            .context("adoption candidate path must be absolute")?;
+            .context("review candidate path must be absolute")?;
         snapshot::validate_relative_path(relative)?;
         let derived_workspace_path =
             workspace_relative(&candidate.path, &request.workspace_guest_path)?;
@@ -650,7 +663,7 @@ fn validate_request(request: &AdoptionRequest) -> Result<()> {
             "environment"
                 if candidate.workspace_path.is_none() && derived_workspace_path.is_none() => {}
             _ => bail!(
-                "adoption candidate {:?} has inconsistent scope or workspace path",
+                "review candidate {:?} has inconsistent scope or workspace path",
                 candidate.path
             ),
         }
@@ -662,13 +675,13 @@ fn validate_request(request: &AdoptionRequest) -> Result<()> {
                 | "not_applicable"
         ) {
             bail!(
-                "adoption candidate {:?} has invalid current relation",
+                "review candidate {:?} has invalid current relation",
                 candidate.path
             );
         }
         if candidate.scope == "environment" && candidate.current_relation != "not_applicable" {
             bail!(
-                "environment adoption candidate {:?} must use not_applicable current relation",
+                "environment candidate {:?} must use not_applicable current relation",
                 candidate.path
             );
         }
@@ -701,7 +714,7 @@ fn write_bundle_inputs(
     ] {
         let bytes = store.read_run_file(run_id, relative)?;
         fs::write(bundle.join(filename), &bytes)
-            .with_context(|| format!("write adoption bundle input {filename:?}"))?;
+            .with_context(|| format!("write review bundle input {filename:?}"))?;
         artifacts.insert(name.to_owned(), run::sha256_bytes(&bytes));
     }
     for (name, filename, bytes) in [
@@ -732,7 +745,7 @@ fn write_bundle_inputs(
         ),
     ] {
         fs::write(bundle.join(filename), &bytes)
-            .with_context(|| format!("write adoption bundle input {filename:?}"))?;
+            .with_context(|| format!("write review bundle input {filename:?}"))?;
         artifacts.insert(name.to_owned(), run::sha256_bytes(&bytes));
     }
     Ok(artifacts)
@@ -740,7 +753,7 @@ fn write_bundle_inputs(
 
 fn verify_bundle_inputs(
     bundle: &Path,
-    request: &AdoptionRequest,
+    request: &ReviewRequest,
     request_bytes: &[u8],
 ) -> Result<()> {
     let mappings = [
@@ -758,28 +771,28 @@ fn verify_bundle_inputs(
         let expected = request
             .input_artifacts
             .get(name)
-            .with_context(|| format!("adoption request omitted input artifact {name:?}"))?;
+            .with_context(|| format!("review request omitted input artifact {name:?}"))?;
         let actual = run::sha256_bytes(
             &fs::read(bundle.join(filename))
-                .with_context(|| format!("re-read adoption bundle input {filename:?}"))?,
+                .with_context(|| format!("re-read review bundle input {filename:?}"))?,
         );
         if &actual != expected {
-            bail!("adoption reviewer mutated bundle input {filename:?}");
+            bail!("reviewer mutated bundle input {filename:?}");
         }
     }
     let actual_request = fs::read(bundle.join("request.json"))?;
     if actual_request != request_bytes {
-        bail!("adoption reviewer mutated request.json");
+        bail!("reviewer mutated request.json");
     }
     Ok(())
 }
 
-fn adoption_candidates(
+fn review_candidates(
     raw_delta: &DeltaManifest,
     workspace_guest_path: &str,
     base: &Manifest,
     current: &Manifest,
-) -> Result<Vec<AdoptionCandidate>> {
+) -> Result<Vec<ReviewCandidate>> {
     let mut candidates = Vec::with_capacity(raw_delta.changes.len());
     for change in &raw_delta.changes {
         let workspace_path = workspace_relative(&change.path, workspace_guest_path)?;
@@ -790,7 +803,7 @@ fn adoption_candidates(
             ),
             None => ("environment".to_owned(), "not_applicable".to_owned()),
         };
-        candidates.push(AdoptionCandidate {
+        candidates.push(ReviewCandidate {
             path: change.path.clone(),
             change: change.change.clone(),
             scope,
@@ -1076,28 +1089,28 @@ mod tests {
         );
     }
 
-    fn fixture_request() -> AdoptionRequest {
-        AdoptionRequest {
-            schema_version: ADOPTION_REQUEST_SCHEMA_VERSION.to_owned(),
+    fn fixture_request() -> ReviewRequest {
+        ReviewRequest {
+            schema_version: REVIEW_REQUEST_SCHEMA_VERSION.to_owned(),
             review_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             anchors: fixture_anchors(),
             workspace_guest_path: "/workspace".to_owned(),
             reviewer_command: vec!["reviewer".to_owned()],
             input_artifacts: BTreeMap::new(),
-            repositories: AdoptionRepositories {
+            repositories: ReviewRepositories {
                 base: Vec::new(),
                 candidate: Vec::new(),
                 current: Vec::new(),
             },
             candidates: vec![
-                AdoptionCandidate {
+                ReviewCandidate {
                     path: "/workspace/safe.txt".to_owned(),
                     change: ChangeKind::Added,
                     scope: "workspace".to_owned(),
                     workspace_path: Some("safe.txt".to_owned()),
                     current_relation: "unchanged_from_base".to_owned(),
                 },
-                AdoptionCandidate {
+                ReviewCandidate {
                     path: "/etc/example.conf".to_owned(),
                     change: ChangeKind::Added,
                     scope: "environment".to_owned(),
@@ -1108,9 +1121,9 @@ mod tests {
         }
     }
 
-    fn fixture_proposal(request: &AdoptionRequest) -> AdoptionProposal {
-        AdoptionProposal {
-            schema_version: ADOPTION_PROPOSAL_SCHEMA_VERSION.to_owned(),
+    fn fixture_proposal(request: &ReviewRequest) -> ReviewProposal {
+        ReviewProposal {
+            schema_version: REVIEW_PROPOSAL_SCHEMA_VERSION.to_owned(),
             review_id: request.review_id.clone(),
             anchors: request.anchors.clone(),
             counts: DispositionCounts {
@@ -1120,7 +1133,7 @@ mod tests {
                 unresolved: 1,
             },
             dispositions: vec![
-                AdoptionDisposition {
+                ReviewDisposition {
                     path: "/workspace/safe.txt".to_owned(),
                     disposition: "proposed".to_owned(),
                     reason: "safe candidate".to_owned(),
@@ -1130,7 +1143,7 @@ mod tests {
                         path: "safe.txt".to_owned(),
                     }),
                 },
-                AdoptionDisposition {
+                ReviewDisposition {
                     path: "/etc/example.conf".to_owned(),
                     disposition: "unresolved".to_owned(),
                     reason: "requires a declarative environment edit".to_owned(),
@@ -1142,8 +1155,8 @@ mod tests {
         }
     }
 
-    fn fixture_anchors() -> AdoptionAnchors {
-        AdoptionAnchors {
+    fn fixture_anchors() -> ReviewAnchors {
+        ReviewAnchors {
             run_id: "00000000-0000-4000-8000-000000000000".to_owned(),
             result_digest: fixture_digest('1'),
             run_input_digest: fixture_digest('2'),

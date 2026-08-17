@@ -12,7 +12,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestones 1 through 5 and the review-only phase of Milestone 6 implement deterministic workspace snapshots, isolated and comparable direct-Docker execution, retained filesystem lifecycle, external evaluation, and optional three-state adoption review. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, records a portable whole-root-filesystem delta without mounting the source workspace, can later stop, continue, fork, inspect, or remove that state, lets arbitrary external commands attach structured observations without turning any score into a universal judgment, and can ask a trusted command-line reviewer what should be adopted without applying its proposal.
+Milestones 1 through 5 and the review-only phase of Milestone 6 implement deterministic workspace snapshots, isolated and comparable direct-Docker execution, retained filesystem lifecycle, external evaluation, and optional three-state review. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, records a portable whole-root-filesystem delta without mounting the source workspace, can later stop, continue, fork, inspect, or remove that state, lets arbitrary external commands attach structured observations without turning any score into a universal judgment, and can ask a trusted command-line reviewer which changes are worth carrying forward without applying its proposal.
 
 ## Current capabilities
 
@@ -225,11 +225,13 @@ The report identifies each row by its real run-input, workspace, resolved-image,
 Review a run against the workspace as it exists now, without applying anything:
 
 ```bash
-agentlab adopt review \
+agentlab review \
   RUN_ID \
   --workspace /path/to/current-workspace \
   -- ./examples/reviewers/pi-review.sh
 ```
+
+Run `agentlab review --help` for the complete command contract. A relative reviewer executable such as `./examples/reviewers/pi-review.sh` is resolved from the directory where you invoke AgentLab before the reviewer starts from the private current-workspace copy.
 
 The selected reviewer runs directly on the host with your authority. AgentLab creates private temporary materializations of the immutable base workspace, the candidate workspace captured from the run, and a fresh snapshot of the current host workspace. It also provides the exact run/result/root-filesystem manifests, portable and raw deltas, and a changed-machine tree containing actual after-content for captured changes outside the workspace. The command runs from the temporary current copy so ordinary `AGENTS.md` and `CLAUDE.md` discovery works without placing the reviewer in the mutable source.
 
@@ -237,25 +239,25 @@ The reviewer receives these environment variables:
 
 ```text
 AGENTLAB_RUN_ID
-AGENTLAB_ADOPTION_REVIEW_ID
-AGENTLAB_ADOPTION_BUNDLE_DIR
-AGENTLAB_ADOPTION_REQUEST_PATH
-AGENTLAB_ADOPTION_RUN_SPEC_PATH
-AGENTLAB_ADOPTION_RUN_RESULT_PATH
-AGENTLAB_ADOPTION_BASE_ROOTFS_MANIFEST_PATH
-AGENTLAB_ADOPTION_CANDIDATE_ROOTFS_MANIFEST_PATH
-AGENTLAB_ADOPTION_BASE_MANIFEST_PATH
-AGENTLAB_ADOPTION_CANDIDATE_MANIFEST_PATH
-AGENTLAB_ADOPTION_CURRENT_MANIFEST_PATH
-AGENTLAB_ADOPTION_DELTA_PATH
-AGENTLAB_ADOPTION_RAW_DELTA_PATH
-AGENTLAB_ADOPTION_BASE_DIR
-AGENTLAB_ADOPTION_CANDIDATE_DIR
-AGENTLAB_ADOPTION_CURRENT_DIR
-AGENTLAB_ADOPTION_MACHINE_CHANGES_DIR
+AGENTLAB_REVIEW_ID
+AGENTLAB_REVIEW_BUNDLE_DIR
+AGENTLAB_REVIEW_REQUEST_PATH
+AGENTLAB_REVIEW_RUN_SPEC_PATH
+AGENTLAB_REVIEW_RUN_RESULT_PATH
+AGENTLAB_REVIEW_BASE_ROOTFS_MANIFEST_PATH
+AGENTLAB_REVIEW_CANDIDATE_ROOTFS_MANIFEST_PATH
+AGENTLAB_REVIEW_BASE_MANIFEST_PATH
+AGENTLAB_REVIEW_CANDIDATE_MANIFEST_PATH
+AGENTLAB_REVIEW_CURRENT_MANIFEST_PATH
+AGENTLAB_REVIEW_DELTA_PATH
+AGENTLAB_REVIEW_RAW_DELTA_PATH
+AGENTLAB_REVIEW_BASE_DIR
+AGENTLAB_REVIEW_CANDIDATE_DIR
+AGENTLAB_REVIEW_CURRENT_DIR
+AGENTLAB_REVIEW_MACHINE_CHANGES_DIR
 ```
 
-Successful stdout must be one `agentlab.adoption-proposal/v1` JSON object. It must copy the request's review ID and anchors exactly, classify every raw-delta candidate exactly once as `proposed`, `rejected`, `conflicted`, or `unresolved`, provide reconciled counts and reasons, keep workspace operations relative and in scope, and express worthwhile environment changes as declarative recommendations rather than copies from `/etc`, `/usr`, `/var`, or other machine paths. AgentLab rejects duplicate, missing, extra, traversing, incorrectly anchored, or inconsistently counted output.
+Successful stdout must be one `agentlab.review-proposal/v1` JSON object. It must copy the request's review ID and anchors exactly, classify every raw-delta candidate exactly once as `proposed`, `rejected`, `conflicted`, or `unresolved`, provide reconciled counts and reasons, keep workspace operations relative and in scope, and express worthwhile environment changes as declarative recommendations rather than copies from `/etc`, `/usr`, `/var`, or other machine paths. AgentLab rejects duplicate, missing, extra, traversing, incorrectly anchored, or inconsistently counted output.
 
 [examples/reviewers/pi-review.sh](examples/reviewers/pi-review.sh) is a thin Pi adapter using noninteractive, no-session, read-only built-in tools. It uses the host's ordinary Pi authentication. Set `AGENTLAB_PI_MODEL` or `AGENTLAB_PI_THINKING` to choose a model or thinking level. The core protocol remains harness-neutral; replace that script with any command that emits the required JSON.
 
@@ -277,7 +279,7 @@ AgentLab stores manifests and blobs in a user-private directory:
     ├── lifecycle/
     ├── continuations/
     ├── evaluations/
-    ├── adoptions/
+    ├── reviews/
     ├── artifacts/
     └── evidence/
 ```

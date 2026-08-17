@@ -5,10 +5,10 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::adoption::{self, ReviewOptions};
 use crate::build_version;
 use crate::evaluation;
 use crate::lifecycle;
+use crate::review::{self, ReviewOptions};
 use crate::run::{self, CaptureSpec, RunOptions, WorkspaceSource};
 use crate::snapshot::{self, CaptureMode, Repository};
 use crate::store::Store;
@@ -29,7 +29,16 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Writ
         return Ok(());
     };
     match command {
-        "--help" | "-h" | "help" => print_help(stdout),
+        "--help" | "-h" => print_help(stdout),
+        "help" => match arguments.as_slice() {
+            [_] => print_help(stdout),
+            [_, command] => execute(
+                vec![command.to_owned(), "--help".to_owned()],
+                stdout,
+                stderr,
+            ),
+            _ => bail!("help accepts at most one COMMAND\n\nRun `agentlab --help` for usage."),
+        },
         "--version" | "version" => {
             writeln!(stdout, "agentlab {}", build_version())?;
             Ok(())
@@ -38,7 +47,7 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Writ
         "run" => run_command(&arguments[1..], stdout, stderr),
         "evaluate" => evaluate_command(&arguments[1..], stdout),
         "report" => report_command(&arguments[1..], stdout),
-        "adopt" => adopt_command(&arguments[1..], stdout, stderr),
+        "review" => review_command(&arguments[1..], stdout, stderr),
         "list" => list_command(&arguments[1..], stdout),
         "stop" => stop_command(&arguments[1..], stdout),
         "resume" => resume_command(&arguments[1..], stdout),
@@ -51,42 +60,31 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Writ
     }
 }
 
-fn adopt_command(
+fn review_command(
     arguments: &[String],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let help_requested = arguments
-        .first()
-        .is_some_and(|argument| matches!(argument.as_str(), "--help" | "-h"))
-        || (arguments.first().map(String::as_str) == Some("review")
-            && arguments
-                .iter()
-                .skip(1)
-                .take_while(|argument| argument.as_str() != "--")
-                .any(|argument| matches!(argument.as_str(), "--help" | "-h")));
-    if arguments.is_empty() || help_requested {
-        writeln!(
-            stdout,
-            "AgentLab adoption\n\nUsage:\n  agentlab adopt review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nReview constructs immutable base, candidate, and current workspace copies; exposes those copies plus the complete machine delta to a trusted command-line reviewer; validates its JSON proposal; and records a review-only receipt. It does not apply changes."
-        )?;
+    let options_end = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len());
+    if arguments.is_empty()
+        || arguments[..options_end]
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        print_review_help(stdout)?;
         return Ok(());
     }
-    if arguments.first().map(String::as_str) != Some("review") {
-        bail!(
-            "unknown adopt command {:?}; expected `review`",
-            arguments[0]
-        );
-    }
-    let arguments = &arguments[1..];
     let separator = arguments
         .iter()
         .position(|argument| argument == "--")
-        .ok_or_else(|| anyhow::anyhow!("adopt review requires `-- COMMAND [ARG ...]`"))?;
+        .ok_or_else(|| anyhow::anyhow!("review requires `-- COMMAND [ARG ...]`"))?;
     let (options, command_with_separator) = arguments.split_at(separator);
     let reviewer_command = &command_with_separator[1..];
     if reviewer_command.is_empty() {
-        bail!("adopt review requires a reviewer command after --");
+        bail!("review requires a reviewer command after `--`");
     }
     let mut run_id = None;
     let mut workspace = None;
@@ -102,22 +100,22 @@ fn adopt_command(
                 )?))
             }
             "--json" => json = true,
-            value if value.starts_with('-') => bail!("unexpected adopt review argument {value:?}"),
+            value if value.starts_with('-') => bail!("unexpected review argument {value:?}"),
             value if run_id.is_none() => run_id = Some(value.to_owned()),
-            value => bail!("unexpected adopt review argument {value:?}"),
+            value => bail!("unexpected review argument {value:?}"),
         }
         index += 1;
     }
-    let run_id = run_id.ok_or_else(|| anyhow::anyhow!("adopt review requires RUN"))?;
+    let run_id = run_id.ok_or_else(|| anyhow::anyhow!("review requires RUN"))?;
     let workspace =
-        workspace.ok_or_else(|| anyhow::anyhow!("adopt review requires --workspace CURRENT"))?;
+        workspace.ok_or_else(|| anyhow::anyhow!("review requires --workspace CURRENT"))?;
     writeln!(
         stderr,
         "AgentLab: launching a trusted host reviewer with private base, candidate, current, and complete machine-delta inputs; review mode will not apply its proposal."
     )?;
     stderr.flush()?;
     let store = Store::open(None)?;
-    let record = adoption::review(
+    let record = review::review(
         &store,
         &ReviewOptions {
             run_id,
@@ -176,6 +174,19 @@ fn adopt_command(
         stdout,
         "AgentLab applied changes: {}",
         record.agentlab_applied_changes
+    )?;
+    writeln!(
+        stdout,
+        "Inspect: agentlab inspect --verify {}",
+        record.run_id
+    )?;
+    Ok(())
+}
+
+fn print_review_help(stdout: &mut dyn Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "AgentLab review\n\nAsk a trusted command-line reviewer which changes from a run are worth carrying forward. AgentLab records the proposal and applies nothing.\n\nUsage:\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nArguments:\n  RUN                       Completed AgentLab run to review\n  --workspace CURRENT       Current host workspace to compare with the run\n  --json                    Write the complete review receipt as JSON\n  -- COMMAND [ARG ...]      Trusted reviewer command and its arguments\n\nExample:\n  agentlab review RUN_ID --workspace ./project -- ./pi-review.sh\n\nThe reviewer receives private base, candidate, and current workspace copies plus the complete machine delta. It runs on the host with your permissions and may see sensitive captured content. AgentLab validates and records its JSON proposal, rechecks that the source workspace did not change, and applies nothing."
     )?;
     Ok(())
 }
@@ -286,7 +297,7 @@ fn report_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN..."
+                    "AgentLab report\n\nShow evaluator observations beside the real inputs for explicit runs. AgentLab does not rank or aggregate them.\n\nUsage:\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n\nOptions:\n  --evaluator NAME          Use the latest successful record from this evaluator\n  --score KEY               Include this scalar score; repeat for more columns\n  --json                    Write a machine-readable table instead of Markdown"
                 )?;
                 return Ok(());
             }
@@ -314,7 +325,10 @@ fn list_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         [] => false,
         [argument] if argument == "--json" => true,
         [argument] if argument == "--help" || argument == "-h" => {
-            writeln!(stdout, "usage: agentlab list [--json]")?;
+            writeln!(
+                stdout,
+                "AgentLab list\n\nList retained runs and their current Docker container state.\n\nUsage:\n  agentlab list [--json]\n\nOptions:\n  --json                    Write machine-readable run records"
+            )?;
             return Ok(());
         }
         _ => bail!("usage: agentlab list [--json]"),
@@ -358,7 +372,10 @@ fn stop_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     {
-        writeln!(stdout, "usage: agentlab stop [--json] RUN")?;
+        writeln!(
+            stdout,
+            "AgentLab stop\n\nStop a retained run while preserving its container filesystem. Process memory is not preserved.\n\nUsage:\n  agentlab stop [--json] RUN"
+        )?;
         return Ok(());
     }
     let (run_id, json) = lifecycle_run_argument(arguments, "stop")?;
@@ -384,7 +401,7 @@ fn resume_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     {
         writeln!(
             stdout,
-            "usage: agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]"
+            "AgentLab resume\n\nRestart a retained container and optionally run a continuation command in its existing filesystem. Process memory is not restored.\n\nUsage:\n  agentlab resume [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN -- COMMAND [ARG ...]\n\nOptions:\n  --pi-auth                 Inject ~/.pi/agent/auth.json only for the continuation command\n  --json                    Write the lifecycle or continuation record as JSON"
         )?;
         return Ok(());
     }
@@ -455,7 +472,10 @@ fn fork_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     {
-        writeln!(stdout, "usage: agentlab fork [--json] RUN")?;
+        writeln!(
+            stdout,
+            "AgentLab fork\n\nCreate an independent retained run from another run's current filesystem. Process memory is not copied.\n\nUsage:\n  agentlab fork [--json] RUN"
+        )?;
         return Ok(());
     }
     let (run_id, json) = lifecycle_run_argument(arguments, "fork")?;
@@ -481,7 +501,10 @@ fn remove_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     {
-        writeln!(stdout, "usage: agentlab rm [--json] RUN")?;
+        writeln!(
+            stdout,
+            "AgentLab rm\n\nDelete exactly one run's owned container, prepared image tag, and local run artifacts.\n\nUsage:\n  agentlab rm [--json] RUN"
+        )?;
         return Ok(());
     }
     let (run_id, json) = lifecycle_run_argument(arguments, "rm")?;
@@ -748,7 +771,7 @@ fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab compare [--json] LEFT_RUN RIGHT_RUN"
+                    "AgentLab compare\n\nCompare two runs using their actual resolved inputs, private containers, and portable outcomes.\n\nUsage:\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN"
                 )?;
                 return Ok(());
             }
@@ -852,7 +875,7 @@ fn snapshot_command(
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]"
+                    "AgentLab snapshot\n\nCapture a workspace as an immutable, content-addressed snapshot. Every supported path is included by default.\n\nUsage:\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n\nOptions:\n  --workspace PATH          Workspace to capture (default: current directory)\n  --respect-gitignore       Deliberately omit paths selected by workspace .gitignore files\n  --json                    Write the snapshot summary as JSON"
                 )?;
                 return Ok(());
             }
@@ -963,7 +986,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "usage: agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN"
+                    "AgentLab inspect\n\nInspect a stored snapshot or retained run without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --json                    Write the underlying snapshot or run record as JSON"
                 )?;
                 return Ok(());
             }
@@ -980,7 +1003,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             if verify {
                 lifecycle::verify_all(&store, digest)?;
                 evaluation::verify_all(&store, digest)?;
-                adoption::verify_all(&store, digest)?;
+                review::verify_all(&store, digest)?;
             }
             if json {
                 serde_json::to_writer_pretty(&mut *stdout, &fork)?;
@@ -1018,7 +1041,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         if verify {
             lifecycle::verify_all(&store, digest)?;
             evaluation::verify_all(&store, digest)?;
-            adoption::verify_all(&store, digest)?;
+            review::verify_all(&store, digest)?;
         }
         if json {
             serde_json::to_writer_pretty(&mut *stdout, &result)?;
@@ -1051,11 +1074,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "Evaluations: {}",
             evaluation::list(&store, digest)?.len()
         )?;
-        writeln!(
-            stdout,
-            "Adoption reviews: {}",
-            adoption::list(&store, digest)?.len()
-        )?;
+        writeln!(stdout, "Reviews: {}", review::list(&store, digest)?.len())?;
         for warning in &result.warnings {
             writeln!(stdout, "Warning: {warning}")?;
         }
@@ -1116,7 +1135,10 @@ fn diff_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--json" => json = true,
             "--raw" => raw = true,
             "--help" | "-h" => {
-                writeln!(stdout, "usage: agentlab diff [--raw] [--json] RUN")?;
+                writeln!(
+                    stdout,
+                    "AgentLab diff\n\nShow persistent filesystem changes from a run. The default respects its portable change-ignore rules.\n\nUsage:\n  agentlab diff [--raw] [--json] RUN\n\nOptions:\n  --raw                     Include every captured machine change\n  --json                    Write the selected delta manifest as JSON"
+                )?;
                 return Ok(());
             }
             value if value.starts_with('-') => bail!("unexpected diff argument {value:?}"),
@@ -1152,7 +1174,7 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab adopt review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, evaluation, and adoption metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  adopt       obtain a validated review-only proposal from a trusted host command\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nWorkspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are the deliberate treatment. Adoption review gives a trusted host command sensitive copies and does not apply its proposal. Filesystem state survives stop/resume. Process trees and live memory do not. Evaluator scores are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, evaluation, and review metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and does not apply its proposal. Filesystem state survives stop/resume; process trees and live memory do not. Evaluator scores are observations, not universal judgments."
     )?;
     Ok(())
 }

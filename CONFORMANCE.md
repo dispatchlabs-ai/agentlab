@@ -133,7 +133,7 @@ Run the case explicitly:
 cargo test --test milestone5 -- --ignored --nocapture
 ```
 
-## Milestone 6: review-only adoption
+## Milestone 6: review proposals
 
 The Docker-gated fixture runs from an immutable Git workspace, creates three candidate workspace changes plus one `/etc` change, and then independently advances the current host workspace. Through the public CLI it invokes a deterministic reviewer command using the same adapter contract available to Pi or any other command-line harness. It proves:
 

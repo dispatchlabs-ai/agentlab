@@ -3,7 +3,7 @@
 use std::fs;
 use std::process::Command;
 
-use agentlab::adoption::{self, AdoptionReviewRecord};
+use agentlab::review::{self, ReviewRecord};
 use agentlab::run::{self, RunOptions, WorkspaceSource};
 use agentlab::snapshot;
 use agentlab::store::Store;
@@ -30,7 +30,7 @@ impl Drop for Cleanup {
 
 #[test]
 #[ignore = "requires a running Docker engine and python3"]
-fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()> {
+fn review_anchors_three_states_and_applies_nothing() -> Result<()> {
     ensure!(
         Command::new("docker")
             .arg("info")
@@ -68,7 +68,7 @@ fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()>
             command: vec![
                 "/bin/sh".to_owned(),
                 "-c".to_owned(),
-                "printf 'candidate adoption\\n' > /workspace/adopt.txt; printf 'candidate conflict\\n' > /workspace/conflict.txt; printf 'candidate reject\\n' > /workspace/reject.txt; printf 'environment recommendation\\n' > /etc/agentlab-review.conf"
+                "printf 'candidate accepted\\n' > /workspace/accepted.txt; printf 'candidate conflict\\n' > /workspace/conflict.txt; printf 'candidate reject\\n' > /workspace/reject.txt; printf 'environment recommendation\\n' > /etc/agentlab-review.conf"
                     .to_owned(),
             ],
             workspace_guest_path: "/workspace".to_owned(),
@@ -92,25 +92,26 @@ fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()>
     fs::write(workspace.join("conflict.txt"), "current conflict\n")?;
     fs::write(workspace.join("current-only.txt"), "current work\n")?;
     let current_before = snapshot::create(&workspace, &store)?.manifest.digest;
-    let reviewer = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/reviewers/fixture-reviewer.py");
     let output = Command::new(env!("CARGO_BIN_EXE_agentlab"))
-        .args(["adopt", "review", "--json", &summary.run_id, "--workspace"])
+        .args(["review", "--json", &summary.run_id, "--workspace"])
         .arg(&workspace)
-        .args(["--", "python3"])
-        .arg(&reviewer)
+        .args(["--", "./examples/reviewers/fixture-reviewer.py"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("AGENTLAB_STATE_DIR", &state)
         .output()?;
     ensure!(
         output.status.success(),
-        "adopt review failed: {}",
+        "review failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     ensure!(
         String::from_utf8_lossy(&output.stderr).contains("trusted host reviewer"),
         "CLI omitted reviewer trust warning"
     );
-    let record: AdoptionReviewRecord = serde_json::from_slice(&output.stdout)?;
+    let record: ReviewRecord = serde_json::from_slice(&output.stdout)?;
+    ensure!(record.schema_version == "agentlab.review/v1");
+    ensure!(record.request.schema_version == "agentlab.review-request/v1");
+    ensure!(record.proposal.schema_version == "agentlab.review-proposal/v1");
     ensure!(record.run_id == summary.run_id);
     ensure!(record.source_workspace_unchanged);
     ensure!(!record.agentlab_applied_changes);
@@ -123,11 +124,13 @@ fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()>
     ensure!(record.request.repositories.candidate.len() == 1);
     ensure!(record.request.repositories.current.len() == 1);
     ensure!(record.request.input_artifacts.len() == 9);
+    ensure!(std::path::Path::new(&record.request.reviewer_command[0]).is_absolute());
+    ensure!(record.request.reviewer_command[0].ends_with("fixture-reviewer.py"));
     ensure!(record.proposal.dispositions.iter().any(|item| {
-        item.path == "/workspace/adopt.txt"
+        item.path == "/workspace/accepted.txt"
             && item.disposition == "proposed"
             && item.workspace_operation.as_ref().is_some_and(|operation| {
-                operation.operation == "replace" && operation.path == "adopt.txt"
+                operation.operation == "replace" && operation.path == "accepted.txt"
             })
     }));
     ensure!(record.proposal.dispositions.iter().any(|item| {
@@ -136,11 +139,11 @@ fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()>
 
     let current_after = snapshot::create(&workspace, &store)?.manifest.digest;
     ensure!(current_after == current_before);
-    ensure!(!workspace.join("adopt.txt").exists());
+    ensure!(!workspace.join("accepted.txt").exists());
     ensure!(fs::read_to_string(workspace.join("reject.txt"))? == "base reject\n");
     ensure!(fs::read_to_string(workspace.join("conflict.txt"))? == "current conflict\n");
-    adoption::verify(&store, &record)?;
-    let records = adoption::list(&store, &summary.run_id)?;
+    review::verify(&store, &record)?;
+    let records = review::list(&store, &summary.run_id)?;
     ensure!(records == [record]);
 
     let inspect = Command::new(env!("CARGO_BIN_EXE_agentlab"))
@@ -152,16 +155,16 @@ fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()>
         "inspect --verify failed: {}",
         String::from_utf8_lossy(&inspect.stderr)
     );
-    ensure!(String::from_utf8_lossy(&inspect.stdout).contains("Adoption reviews: 1"));
+    ensure!(String::from_utf8_lossy(&inspect.stdout).contains("Reviews: 1"));
 
     let mutating_reviewer = Command::new(env!("CARGO_BIN_EXE_agentlab"))
-        .args(["adopt", "review", &summary.run_id, "--workspace"])
+        .args(["review", &summary.run_id, "--workspace"])
         .arg(&workspace)
         .args([
             "--",
             "/bin/sh",
             "-c",
-            "printf 'mutation' >> \"$AGENTLAB_ADOPTION_RAW_DELTA_PATH\"; printf '{}\\n'",
+            "printf 'mutation' >> \"$AGENTLAB_REVIEW_RAW_DELTA_PATH\"; printf '{}\\n'",
         ])
         .env("AGENTLAB_STATE_DIR", &state)
         .output()?;
@@ -170,7 +173,7 @@ fn review_only_adoption_anchors_three_states_and_applies_nothing() -> Result<()>
         String::from_utf8_lossy(&mutating_reviewer.stderr)
             .contains("mutated bundle input \"delta.raw.json\"")
     );
-    ensure!(adoption::list(&store, &summary.run_id)?.len() == 1);
+    ensure!(review::list(&store, &summary.run_id)?.len() == 1);
     Ok(())
 }
 
