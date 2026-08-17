@@ -31,10 +31,10 @@ Given a selected directory, the snapshotter MUST:
 
 1. Traverse every path beneath the selected root without following symbolic links.
 2. Include regular files, directories, hidden paths, empty directories, Git repositories and their in-workspace metadata, untracked paths, large files, modes, and symlink targets by default.
-3. Apply root and nested `.gitignore` files using Git wildmatch, directory-relative, ordering, and negation semantics.
+3. Exclude no supported workspace path by default. When the user explicitly selects `--respect-gitignore`, apply root and nested `.gitignore` files using Git wildmatch, directory-relative, ordering, and negation semantics.
 4. Discover ordinary Git repositories from `.git` directories or files without repository declarations.
-5. Include tracked files inside discovered repositories even when an ignore rule matches them.
-6. Exclude machine-global and system Git ignore configuration from snapshot selection.
+5. In explicit Git-ignore mode, include tracked files inside discovered repositories even when an ignore rule matches them.
+6. Exclude machine-global and system Git ignore configuration from snapshot selection in explicit Git-ignore mode.
 7. Never follow a workspace symlink to capture content outside the selected tree. A symlink itself is captured with its target text.
 8. Never write generated snapshot state into the source workspace by default.
 9. Fail with the exact offending path and type when an included filesystem object is unsupported.
@@ -61,7 +61,7 @@ It excludes:
 - human labels; and
 - repository observations derivable from captured paths.
 
-The active ignore-rule identity is included because ignore rules resolve which workspace content belongs to the immutable input. Each rule record contains its workspace-relative path and content digest, not its contents.
+The active ignore-rule identity is empty for the default complete capture. It is included when Git-ignore filtering is selected because those rules then resolve which workspace content belongs to the immutable input. Each rule record contains its workspace-relative path and content digest, not its contents.
 
 ## 4. Manifest
 
@@ -121,15 +121,19 @@ Snapshot artifacts may contain credentials or other sensitive content. Local-onl
 
 `agentlab run` combines a workspace snapshot, immutable OCI image resolution, materialization settings, an opaque command, resource and network policy, change-ignore identity, and requested captures. `--workspace PATH` captures the directory at invocation; `--snapshot DIGEST` loads and verifies an existing immutable snapshot. They are mutually exclusive. The implementation MUST:
 
+The default network policy is Docker `bridge`, making ordinary model-backed harness invocations usable without another option. `--network none` explicitly selects an offline run. The resolved policy is a controlled input and MUST be recorded in the run specification.
+
 1. Reconstruct the workspace from its snapshot in private storage at `/workspace` by default, never through a writable source mount.
 2. Establish and export a prepared base root filesystem after materialization and before command execution.
 3. start a minimal stable container supervisor and execute the command exactly once through Docker exec;
 4. preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events;
-5. reject image-declared volumes and any container mount outside the exported root filesystem;
+5. reject image-declared volumes and any container mount outside the exported root filesystem, except AgentLab's exact runtime-secret tmpfs;
 6. retain the running supervisor container for direct inspection and later filesystem continuation; and
 7. state explicitly that pseudo-filesystems and live process memory are not portable persistent state.
 
-The version-two run specification contains a canonical run-input digest, snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, resource limits, network policy, capture declarations, workspace- and change-ignore identities, backend evidence, and AgentLab version.
+The version-two run specification contains a canonical run-input digest, snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, resource limits, network policy, capture declarations, runtime secret-injection names, workspace- and change-ignore identities, backend evidence, and AgentLab version.
+
+When `--pi-auth` is selected, AgentLab reads the invoking host's default `~/.pi/agent/auth.json`, requires a JSON object no larger than 1 MiB, and places the bytes in an in-memory tmpfs available only to the retained container. It links that file to the configured container user's Pi auth location for the initial opaque command and removes both paths before inspect, diff, capture, or root-filesystem export. The specification records only the stable name `pi-auth`; host paths, credential bytes, and credential-derived hashes MUST NOT be recorded. This protects against persistence by AgentLab, not against the opaque command deliberately printing or copying credentials. Continuations do not implicitly receive the credential.
 
 `agentlab.run-input/v1` is SHA-256 over canonical compact JSON containing the actual resolved snapshot and immutable image identities; target platform; materialization and working paths; argv; resource/network policy; captures; secret-injection names when supported; workspace- and change-ignore digests; backend name/version; and the complete AgentLab build version. Development installers append an exact source build ID so runs from different development commits cannot be mistaken for repetitions. It excludes run ID, timestamps, requested image alias, backend-native image/container evidence, outcome, and descriptive labels. A version-two specification MUST store this digest and verification MUST recompute it.
 
@@ -145,7 +149,7 @@ Comparison produces one of: `added`, `modified`, `deleted`, `type_changed`, `mod
 
 Docker diff output is retained as path evidence and checked against the authoritative comparison. It does not replace the prepared/result exports: export provides merged content but not deletions, while Docker diff lacks complete portable content and metadata. Any normalized path not covered by Docker diff is recorded explicitly as evidence and a warning rather than silently discarded.
 
-Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds, named volumes, cache mounts, and image volumes are unsupported because their contents would fall outside the captured root filesystem.
+Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds, named volumes, cache mounts, and image volumes are unsupported because their contents would fall outside the captured root filesystem. The sole supported run mount is AgentLab's exact private tmpfs for runtime secret injection; it is empty of the injected secret before persistent observation begins.
 
 ## 9. Delta contract
 

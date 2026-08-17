@@ -16,6 +16,21 @@ use crate::store::{Store, hex_digest, normalize_digest};
 
 pub const SCHEMA_VERSION: &str = "agentlab.snapshot/v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    All,
+    RespectGitignore,
+}
+
+impl CaptureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::RespectGitignore => "respect-gitignore",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub path: String,
@@ -94,14 +109,35 @@ pub(crate) struct Candidate {
 }
 
 pub fn create(workspace: &Path, store: &Store) -> Result<SnapshotResult> {
+    create_with_mode(workspace, store, CaptureMode::All)
+}
+
+pub fn create_with_mode(
+    workspace: &Path,
+    store: &Store,
+    capture_mode: CaptureMode,
+) -> Result<SnapshotResult> {
     let (root, candidates) = scan(workspace)?;
     let discovery = ignore::discover_repositories(&root, &candidates);
-    let ignored = ignore::ignored_paths(&root, &candidates, &discovery.metadata_paths)?;
-    let (ignore_rules, ignore_rules_digest) = ignore::active_ignore_rules(&candidates, &ignored)?;
+    let ignored = match capture_mode {
+        CaptureMode::RespectGitignore => {
+            ignore::ignored_paths(&root, &candidates, &discovery.metadata_paths)?
+        }
+        CaptureMode::All => HashSet::new(),
+    };
+    let (ignore_rules, ignore_rules_digest) = match capture_mode {
+        CaptureMode::RespectGitignore => ignore::active_ignore_rules(&candidates, &ignored)?,
+        CaptureMode::All => {
+            let rules = Vec::new();
+            let digest = ignore::ignore_rules_digest(&rules);
+            (rules, digest)
+        }
+    };
 
     let mut included: HashSet<String> = HashSet::with_capacity(candidates.len());
     for candidate in &candidates {
-        let keep = !ignored.contains(&candidate.path)
+        let keep = capture_mode == CaptureMode::All
+            || !ignored.contains(&candidate.path)
             || discovery.tracked_paths.contains(&candidate.path)
             || discovery.metadata_paths.contains(&candidate.path)
             || beneath_unknown_repository(&candidate.path, &discovery.unknown_repository_roots);

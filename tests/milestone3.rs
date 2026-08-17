@@ -67,12 +67,14 @@ test "$count" = 1
 "#;
     let base_options = RunOptions {
         workspace: WorkspaceSource::Snapshot(source_before.clone()),
+        workspace_capture_mode: snapshot::CaptureMode::All,
         image: "alpine:3.21".to_owned(),
         command: vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
         workspace_guest_path: "/workspace".to_owned(),
         network: "none".to_owned(),
         memory: None,
         cpus: None,
+        pi_auth: None,
         change_ignore: None,
         captures: Vec::new(),
     };

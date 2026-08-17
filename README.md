@@ -17,8 +17,8 @@ Milestones 1 through 5 implement deterministic workspace snapshots, isolated and
 ## Current capabilities
 
 - Snapshots any selected directory without prescribing its layout.
-- Includes regular files, directories, hidden paths, untracked content, Git metadata, empty directories, large files, modes, and symlink targets by default.
-- Uses Git itself to evaluate root and nested `.gitignore` files with wildmatch and negation semantics.
+- Includes regular files, directories, hidden and ignored paths, untracked content, Git metadata, empty directories, large files, modes, and symlink targets by default.
+- Excludes nothing based on `.gitignore` unless the user deliberately selects `--respect-gitignore`; explicit filtering uses Git's root and nested wildmatch and negation semantics.
 - Discovers Git repositories automatically and keeps tracked files even when an ignore rule matches them.
 - Prevents machine-global Git excludes from affecting snapshot selection.
 - Stores file bodies as reusable SHA-256-addressed blobs outside the source workspace.
@@ -27,10 +27,12 @@ Milestones 1 through 5 implement deterministic workspace snapshots, isolated and
 - Verifies manifest and blob integrity.
 - Fails precisely on unsupported special files instead of silently dropping them.
 - Resolves an OCI image immutably and executes one command in a uniquely named retained Docker container.
+- Optionally injects the host's default Pi authentication file from private runtime memory, records only the injection name, and removes it before filesystem export.
 - Captures persistent changes across the complete guest root filesystem, including content, modes, types, symlink targets, and deletions.
 - Records raw and `.agentlabignore`-filtered deltas, stdout, stderr, nonzero exit status, lifecycle events, Docker evidence, requested captures, and integrity hashes.
 - Rejects image volumes and external writable mounts that would escape complete root-filesystem observation.
 - Runs directly from either a mutable host directory (snapshotted at invocation) or an already stored snapshot digest.
+- Shows elapsed-time progress, streams guest stdout/stderr live, and recaptures a direct source workspace after execution to report whether it remained unchanged.
 - Derives a canonical run-input identity from the actual snapshot, resolved image, command, resource/network policy, captures, ignore rules, backend, and AgentLab version.
 - Supports concurrent independent runs and verifies exact repetitions or reports which real controlled inputs differ.
 - Retains a stable container supervisor so stop/start never reruns the original agent command.
@@ -47,7 +49,7 @@ AgentLab does not attempt to make a transactionally consistent snapshot of a wor
 - Git available in `PATH` when a workspace contains `.gitignore` files or Git repositories.
 - Docker Engine for `agentlab run` (Docker Desktop is sufficient on macOS).
 
-Git is used as the ignore-semantics authority. AgentLab evaluates workspace ignore files through temporary Git metadata outside the workspace, disables machine-global and system Git configuration for that evaluation, and uses read-only Git discovery commands with optional locks disabled.
+Git is used as the repository-discovery and explicit ignore-semantics authority. When `--respect-gitignore` is selected, AgentLab evaluates workspace ignore files through temporary Git metadata outside the workspace and disables machine-global and system Git configuration. Repository discovery uses read-only Git commands with optional locks disabled.
 
 ## Quick start
 
@@ -67,18 +69,21 @@ Snapshot a workspace of your choosing:
 ./target/release/agentlab snapshot --workspace /path/to/workspace
 ```
 
-The command prints a stable digest and an inclusion/exclusion summary:
+Complete capture is the default. The command prints a stable digest and an inclusion/exclusion summary:
 
 ```text
 Snapshot: sha256:...
 Workspace: /absolute/path/to/workspace
+Capture: all
 Included paths: ...
-Excluded paths: ...
+Excluded paths: 0
 Repositories discovered: ...
 Logical file bytes: ...
 Content blobs: ... new, ... reused
 Workspace-ignore rules: sha256:...
 ```
+
+Use `--respect-gitignore` only when those exclusions are a deliberate experimental input. The earlier `--capture all` spelling remains accepted as a compatibility alias.
 
 Inspect and integrity-check the snapshot without printing captured contents:
 
@@ -103,7 +108,7 @@ SNAPSHOT=$(./target/release/agentlab snapshot \
   -- /bin/sh -c 'printf "guest only\n" > /workspace/agentlab-proof.txt'
 ```
 
-`run --workspace /path/to/workspace` remains a convenience form: it takes a new snapshot at invocation and runs that result. Use `--snapshot DIGEST` when exact repetition matters. The summary includes a run ID, a canonical run-input digest, the command's exit code, the number of portable and ignored changes, and the retained container name. Inspect and verify the result, then view its normalized delta:
+`run --workspace /path/to/workspace` is the first-run form: it captures every supported workspace path, runs that exact result, streams guest output, and recaptures the source afterward to report whether it remained unchanged. Use `--respect-gitignore` only for a deliberate filtered input. Use `--snapshot DIGEST` when exact repetition matters. Progress and live guest output use stderr when `--json` reserves stdout for the final machine-readable summary. The human summary includes a run ID, canonical run-input digest, command exit code, portable and ignored change counts, source status, retained container, and ready-to-paste follow-up commands.
 
 ```bash
 ./target/release/agentlab inspect --verify RUN_ID
@@ -111,7 +116,19 @@ SNAPSHOT=$(./target/release/agentlab snapshot \
 ./target/release/agentlab diff --raw RUN_ID
 ```
 
-Use `--capture /guest/path=NAME` to export a selected path as a tar artifact and `--change-ignore PATH` to override the snapshotted workspace-root `.agentlabignore`. Network access defaults to `none`; Milestone 2 also accepts `--network bridge`.
+Use `--capture /guest/path=NAME` to export a selected path as a tar artifact and `--change-ignore PATH` to override the snapshotted workspace-root `.agentlabignore`. Network access defaults to Docker `bridge` mode so model-backed harnesses work without another flag. Use `--network none` when the run must be offline.
+
+Use `--pi-auth` when the command needs the invoking host's default `~/.pi/agent/auth.json`:
+
+```bash
+./target/release/agentlab run \
+  --workspace /path/to/workspace \
+  --image IMAGE \
+  --pi-auth \
+  -- pi --help
+```
+
+AgentLab validates the JSON, places it in a private tmpfs, links it at the container user's Pi auth path only while the initial command runs, and removes both paths before inspection and root-filesystem export. The run specification records the name `pi-auth`, never the host path, credential bytes, or a credential digest. This prevents AgentLab itself from persisting the injected file; the opaque command remains trusted with the credential and can still print or copy it. Continuation commands do not currently reinject it.
 
 The container remains running under an inert shell supervisor after the initial `docker exec` command completes. This makes later stop/start truthful: restarting the container starts only the supervisor and never reruns the original command.
 

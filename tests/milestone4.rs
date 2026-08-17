@@ -76,6 +76,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     let summary = run::execute(
         &RunOptions {
             workspace: WorkspaceSource::Directory(workspace.clone()),
+            workspace_capture_mode: snapshot::CaptureMode::All,
             image: "alpine:3.21".to_owned(),
             command: vec![
                 "/bin/sh".to_owned(),
@@ -87,6 +88,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
             network: "none".to_owned(),
             memory: None,
             cpus: None,
+            pi_auth: None,
             change_ignore: None,
             captures: vec![CaptureSpec {
                 guest_path: "/root/session.txt".to_owned(),

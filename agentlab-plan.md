@@ -102,9 +102,9 @@ Everything beneath the selected workspace directory is included by default:
 
 AgentLab must not require an inclusion allowlist.
 
-### Gitignore-compatible workspace exclusion
+### Explicit Gitignore-compatible workspace exclusion
 
-`.gitignore` is the workspace snapshot exclusion standard, including when the selected workspace root is not itself a Git repository.
+No workspace path is excluded by default. When the user deliberately selects `--respect-gitignore`, `.gitignore` is the workspace snapshot exclusion standard, including when the selected workspace root is not itself a Git repository.
 
 Required semantics:
 
@@ -517,12 +517,12 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 **Status:** Complete, including the two schema-freeze verification corrections listed below.
 
-**Goal:** Turn any directory into a content-addressed immutable snapshot with correct default-inclusion and `.gitignore` behavior.
+**Goal:** Turn any directory into a content-addressed immutable snapshot that includes every supported path by default and offers `.gitignore` filtering only as an explicit treatment.
 
 **Outcomes:**
 
-- Hidden, untracked, large, and repository files are included by default.
-- Nested `.gitignore` behavior is tested.
+- Hidden, ignored, untracked, large, and repository files are included by default.
+- Explicit root and nested `.gitignore` behavior is tested.
 - Tracked files inside discovered repositories remain included.
 - The source directory is unchanged.
 - Repeating a snapshot without source changes produces the same digest.
@@ -535,7 +535,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 **Acceptance:** Two structurally different fixture workspaces snapshot correctly without repository declarations or workspace configuration. In addition, a user can run the public CLI against an arbitrary local workspace, receive a stable snapshot digest, inspect included and excluded path metadata without revealing contents by default, reconstruct or verify the snapshot, and confirm that the source workspace remains unchanged.
 
-**Hands-on checkpoint:** Run `agentlab snapshot --workspace /path/to/chosen/workspace`, inspect the returned digest, repeat the snapshot to demonstrate stable identity, and verify that the chosen source workspace is byte-identical afterward.
+**Hands-on checkpoint:** Run `agentlab snapshot --workspace /path/to/chosen/workspace`, confirm that it reports complete capture and zero exclusions, inspect the returned digest, repeat the snapshot to demonstrate stable identity, and verify that the chosen source workspace is byte-identical afterward. Repeat with `--respect-gitignore` only when exclusions are the deliberate input.
 
 ### Milestone 2: Run one isolated Docker command and capture the whole machine
 
@@ -622,6 +622,27 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 **Acceptance:** A supplied example produces a table of actual run-input/workspace/image/base identities and evaluator scores without AgentLab understanding the semantic meaning of the treatment.
 
 **Hands-on checkpoint:** Snapshot a chosen workspace, make one real file or directory treatment and snapshot again, run each exact input at least twice, then invoke the supplied external evaluator to produce an identity-and-score table and compare within-input repetition against the cross-treatment difference.
+
+### Milestone 5A: Make the completed engine manually testable
+
+**Status:** Complete.
+
+**Goal:** Let a developer run the completed Milestone 1–5 engine directly against a chosen workspace and watch it work without manually managing a preliminary snapshot digest or Docker internals.
+
+**Outcomes:**
+
+- `agentlab snapshot --workspace PATH` and direct `agentlab run --workspace PATH` capture every supported workspace path by default.
+- `--respect-gitignore` is an explicit alternative rather than an implicit omission policy; `snapshot --capture all` remains a compatibility alias.
+- Direct runs show elapsed-time stages for capture, image resolution, materialization, preparation, execution, result export, delta construction, and source verification.
+- Guest stdout and stderr stream live while their exact bytes remain retained as run artifacts.
+- `--json` keeps final JSON alone on stdout while progress and live guest output use stderr.
+- A direct workspace run recaptures the source after execution and reports `unchanged`, `changed`, or `verification_failed`; a stored-snapshot run reports `not_applicable`.
+- `agentlab run --help` and `agentlab evaluate --help` work without fake command separators.
+- The human run summary prints ready-to-paste inspect, diff, raw-diff, stop, continue, fork, and remove commands.
+
+**Acceptance:** From any current directory, a developer can run one installed `agentlab run --workspace PATH --image alpine:3.21 -- COMMAND`, see zero default exclusions, watch stdout/stderr live, inspect both private workspace and `/etc` changes, receive an unchanged-source result, and remove exactly the disposable run.
+
+**Hands-on checkpoint:** Run a harmless Alpine command against a chosen lab workspace that writes distinct files beneath the private workspace and `/etc`. Watch every stage, verify the host workspace remained unchanged, inspect the portable and raw deltas, and follow the printed cleanup command.
 
 ### Milestone 6: Add optional AI-assisted adoption
 

@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -21,16 +22,24 @@ pub const LEGACY_RUN_SCHEMA_VERSION: &str = "agentlab.run/v1";
 pub const RUN_INPUT_SCHEMA_VERSION: &str = "agentlab.run-input/v1";
 pub const DELTA_SCHEMA_VERSION: &str = "agentlab.delta/v1";
 pub const RESULT_SCHEMA_VERSION: &str = "agentlab.result/v1";
+const PI_AUTH_SECRET_NAME: &str = "pi-auth";
+const PI_AUTH_SECRET_DIRECTORY: &str = "/run/agentlab-secrets";
+const PI_AUTH_SECRET_PATH: &str = "/run/agentlab-secrets/pi-auth.json";
+const PI_AUTH_TMPFS_MOUNT: &str =
+    "type=tmpfs,destination=/run/agentlab-secrets,tmpfs-mode=0711,tmpfs-size=1048576";
+const MAX_PI_AUTH_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub workspace: WorkspaceSource,
+    pub workspace_capture_mode: snapshot::CaptureMode,
     pub image: String,
     pub command: Vec<String>,
     pub workspace_guest_path: String,
     pub network: String,
     pub memory: Option<String>,
     pub cpus: Option<String>,
+    pub pi_auth: Option<PathBuf>,
     pub change_ignore: Option<PathBuf>,
     pub captures: Vec<CaptureSpec>,
 }
@@ -181,6 +190,29 @@ pub struct RunSummary {
     pub ignored_changes: usize,
     pub retained_container_name: String,
     pub retained_container_id: String,
+    pub source_workspace_status: String,
+}
+
+pub trait RunObserver {
+    fn stage(&mut self, message: &str) -> std::io::Result<()>;
+    fn command_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn command_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+struct SilentRunObserver;
+
+impl RunObserver for SilentRunObserver {
+    fn stage(&mut self, _message: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn command_stdout(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn command_stderr(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,27 +316,72 @@ impl Drop for FailedRunCleanup {
 }
 
 pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
+    execute_with_observer(options, store, &mut SilentRunObserver)
+}
+
+pub fn execute_with_observer(
+    options: &RunOptions,
+    store: &Store,
+    observer: &mut dyn RunObserver,
+) -> Result<RunSummary> {
     validate_options(options)?;
     let started_at = Utc::now();
     let run_id = Uuid::new_v4().to_string();
     let run_directory = store.create_run_directory(&run_id)?;
     let mut lifecycle = vec![event("run_created")];
+    report_stage(observer, &format!("Run created: {run_id}"))?;
 
     let (workspace_manifest, workspace_warnings) = match &options.workspace {
         WorkspaceSource::Directory(workspace) => {
-            let captured = snapshot::create(workspace, store)?;
+            report_stage(
+                observer,
+                &format!(
+                    "Capturing workspace ({}): {}",
+                    options.workspace_capture_mode.as_str(),
+                    workspace.display()
+                ),
+            )?;
+            let captured =
+                snapshot::create_with_mode(workspace, store, options.workspace_capture_mode)?;
             lifecycle.push(event("workspace_snapshotted"));
+            report_stage(
+                observer,
+                &format!(
+                    "Workspace captured: {} paths, {} bytes, excluded {} ({})",
+                    captured.included_paths,
+                    captured.logical_bytes,
+                    captured.excluded_paths,
+                    captured.manifest.digest
+                ),
+            )?;
             (captured.manifest, captured.warnings)
         }
         WorkspaceSource::Snapshot(digest) => {
+            report_stage(observer, &format!("Verifying workspace snapshot: {digest}"))?;
             let manifest = snapshot::load(store, digest)?;
             snapshot::verify(store, &manifest)?;
             lifecycle.push(event("workspace_snapshot_loaded"));
+            report_stage(
+                observer,
+                &format!(
+                    "Workspace snapshot verified: {} paths, {}",
+                    manifest.entries.len(),
+                    manifest.digest
+                ),
+            )?;
             (manifest, Vec::new())
         }
     };
+    report_stage(observer, &format!("Resolving image: {}", options.image))?;
     let resolved_image = resolve_image(&options.image)?;
     lifecycle.push(event("image_resolved"));
+    report_stage(
+        observer,
+        &format!(
+            "Image resolved: {} ({})",
+            resolved_image.resolved_digest, resolved_image.platform
+        ),
+    )?;
     let (change_ignore, change_ignore_rules) =
         resolve_change_ignore(options, &workspace_manifest, store)?;
 
@@ -327,7 +404,11 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         },
         network_policy: options.network.clone(),
         captures: options.captures.clone(),
-        secret_injections: Vec::new(),
+        secret_injections: options
+            .pi_auth
+            .as_ref()
+            .map(|_| vec![PI_AUTH_SECRET_NAME.to_owned()])
+            .unwrap_or_default(),
         workspace_ignore_digest: workspace_manifest.ignore_rules_digest.clone(),
         change_ignore: change_ignore.clone(),
         backend_name: "docker-cli".to_string(),
@@ -347,6 +428,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         store.write_run_file(&run_id, "change-ignore.rules", rules)?;
     }
 
+    report_stage(observer, "Materializing private workspace")?;
     let materialized = tempfile::tempdir().context("create private materialization directory")?;
     snapshot::materialize(store, &workspace_manifest, materialized.path())?;
     lifecycle.push(event("workspace_materialized"));
@@ -363,6 +445,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         armed: true,
     };
 
+    report_stage(observer, "Preparing isolated Docker filesystem")?;
     docker_success(
         Command::new("docker")
             .args(["create", "--name", &preparation_name])
@@ -382,6 +465,22 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         "copy private workspace into preparation container",
     )?;
     lifecycle.push(event("workspace_copied_to_private_rootfs"));
+    if options.pi_auth.is_some() {
+        let runtime_root = tempfile::tempdir().context("create runtime mountpoint fixture")?;
+        let secret_directory = runtime_root.path().join("agentlab-secrets");
+        fs::create_dir(&secret_directory).context("create runtime secret mountpoint")?;
+        docker_status(
+            Command::new("docker").args([
+                "cp",
+                secret_directory
+                    .to_str()
+                    .context("runtime mountpoint path is not UTF-8")?,
+                &format!("{preparation_name}:{PI_AUTH_SECRET_DIRECTORY}"),
+            ]),
+            "prepare runtime secret mountpoint",
+        )?;
+        lifecycle.push(event("runtime_secret_mountpoint_prepared"));
+    }
 
     let preparation_inspect_bytes = docker_output_bytes(
         Command::new("docker").args(["inspect", &preparation_name]),
@@ -412,6 +511,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         "commit prepared base image",
     )?;
     lifecycle.push(event("prepared_base_established"));
+    report_stage(observer, "Prepared immutable container base")?;
 
     let mut create = Command::new("docker");
     create
@@ -426,6 +526,9 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     }
     if let Some(cpus) = &options.cpus {
         create.args(["--cpus", cpus]);
+    }
+    if options.pi_auth.is_some() {
+        create.args(["--mount", PI_AUTH_TMPFS_MOUNT]);
     }
     create.arg(&prepared_image_id).args([
         "/bin/sh",
@@ -449,14 +552,33 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         "start retained container supervisor",
     )?;
     lifecycle.push(event("retained_container_started"));
+    let mut pi_auth_guard = if let Some(auth_path) = &options.pi_auth {
+        report_stage(
+            observer,
+            "Injecting host Pi authentication for this command",
+        )?;
+        Some(inject_pi_auth(&retained_name, auth_path)?)
+    } else {
+        None
+    };
     lifecycle.push(event("command_started"));
-    let command_output = Command::new("docker")
-        .args(["exec", &retained_name])
-        .args(&options.command)
-        .output()
-        .context("execute command in retained run container")?;
+    report_stage(
+        observer,
+        &format!("Running command: {}", display_command(&options.command)),
+    )?;
+    let command_output = execute_guest_command(&retained_name, &options.command, observer);
+    let auth_cleanup = match &mut pi_auth_guard {
+        Some(guard) => guard.cleanup(),
+        None => Ok(()),
+    };
+    let command_output = command_output?;
+    auth_cleanup?;
     let exit_code = command_output.status.code().map(i64::from).unwrap_or(-1);
     lifecycle.push(event("command_completed"));
+    report_stage(
+        observer,
+        &format!("Command completed with exit code {exit_code}"),
+    )?;
     let stdout = write_artifact(
         store,
         &run_id,
@@ -470,6 +592,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         &command_output.stderr,
     )?;
 
+    report_stage(observer, "Capturing complete result filesystem")?;
     let result_inspect_bytes = docker_output_bytes(
         Command::new("docker").args(["inspect", &retained_name]),
         "inspect completed retained container",
@@ -508,6 +631,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     )?;
     lifecycle.push(event("result_rootfs_exported"));
 
+    report_stage(observer, "Computing portable filesystem delta")?;
     let base_manifest = rootfs::scan_export(&base_export_path, None)?;
     let result_manifest = rootfs::scan_export(&result_export_path, Some(store))?;
     let base_manifest_bytes = pretty_json(&base_manifest)?;
@@ -667,6 +791,36 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
     };
     store.write_run_file(&run_id, "result.json", &pretty_json(&result)?)?;
     failed_run_cleanup.armed = false;
+    let source_workspace_status = match &options.workspace {
+        WorkspaceSource::Directory(workspace) => {
+            report_stage(observer, "Verifying source workspace remained unchanged")?;
+            match snapshot::create_with_mode(workspace, store, options.workspace_capture_mode) {
+                Ok(after) if after.manifest.digest == workspace_manifest.digest => {
+                    report_stage(observer, "Source workspace unchanged")?;
+                    "unchanged".to_owned()
+                }
+                Ok(after) => {
+                    report_stage(
+                        observer,
+                        &format!(
+                            "Source workspace changed independently: {} -> {}",
+                            workspace_manifest.digest, after.manifest.digest
+                        ),
+                    )?;
+                    "changed".to_owned()
+                }
+                Err(error) => {
+                    report_stage(
+                        observer,
+                        &format!("Source workspace verification failed: {error:#}"),
+                    )?;
+                    "verification_failed".to_owned()
+                }
+            }
+        }
+        WorkspaceSource::Snapshot(_) => "not_applicable".to_owned(),
+    };
+    report_stage(observer, &format!("Run finalized: {run_id}"))?;
     Ok(RunSummary {
         run_id,
         result_digest,
@@ -678,6 +832,7 @@ pub fn execute(options: &RunOptions, store: &Store) -> Result<RunSummary> {
         ignored_changes: portable_delta.ignored_changes.len(),
         retained_container_name: retained_name,
         retained_container_id: result.docker.retained_container_id,
+        source_workspace_status,
     })
 }
 
@@ -947,6 +1102,9 @@ fn validate_options(options: &RunOptions) -> Result<()> {
     if !matches!(options.network.as_str(), "none" | "bridge") {
         bail!("network policy must be either none or bridge in Milestone 2");
     }
+    if let Some(path) = &options.pi_auth {
+        validate_pi_auth(path)?;
+    }
     for capture in &options.captures {
         validate_guest_path(&capture.guest_path)?;
         if capture.name.is_empty()
@@ -1055,13 +1213,162 @@ pub(crate) fn ensure_no_external_mounts(inspect: &[u8]) -> Result<()> {
         .and_then(|values| values.first())
         .and_then(|container| container["Mounts"].as_array())
         .context("Docker inspect omitted Mounts")?;
-    if !mounts.is_empty() {
+    let unsupported_mounts = mounts
+        .iter()
+        .filter(|mount| {
+            mount["Type"].as_str() != Some("tmpfs")
+                || mount["Destination"].as_str() != Some(PI_AUTH_SECRET_DIRECTORY)
+        })
+        .count();
+    let secret_mounts = mounts
+        .iter()
+        .filter(|mount| {
+            mount["Type"].as_str() == Some("tmpfs")
+                && mount["Destination"].as_str() == Some(PI_AUTH_SECRET_DIRECTORY)
+        })
+        .count();
+    if unsupported_mounts != 0 || secret_mounts > 1 {
         bail!(
-            "agent-writable persistent mounts outside the exported rootfs are unsupported: {} mount(s) found",
-            mounts.len()
+            "agent-writable mounts outside the exported rootfs are unsupported: {unsupported_mounts} unsupported mount(s) found"
         );
     }
     Ok(())
+}
+
+fn validate_pi_auth(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("read host Pi authentication metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("host Pi authentication path is not a regular file");
+    }
+    if metadata.len() > MAX_PI_AUTH_BYTES {
+        bail!("host Pi authentication file exceeds the 1 MiB safety limit");
+    }
+    let bytes = fs::read(path).context("read host Pi authentication file")?;
+    let value: Value =
+        serde_json::from_slice(&bytes).context("decode host Pi authentication JSON")?;
+    if !value.is_object() {
+        bail!("host Pi authentication JSON must be an object");
+    }
+    Ok(())
+}
+
+struct PiAuthGuard {
+    container: String,
+    home: String,
+    active: bool,
+}
+
+impl PiAuthGuard {
+    fn cleanup(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        docker_status(
+            Command::new("docker").args([
+                "exec",
+                "--user",
+                "0",
+                &self.container,
+                "/bin/sh",
+                "-c",
+                "set -eu; rm -f -- \"$1/.pi/agent/auth.json\" /run/agentlab-secrets/pi-auth.json",
+                "agentlab-pi-auth-cleanup",
+                &self.home,
+            ]),
+            "remove runtime Pi authentication",
+        )?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for PiAuthGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn inject_pi_auth(container: &str, source: &Path) -> Result<PiAuthGuard> {
+    validate_pi_auth(source)?;
+    let identity = docker_success(
+        Command::new("docker").args([
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            "set -eu; uid=$(id -u); gid=$(id -g); home=${HOME:-}; if [ -z \"$home\" ]; then home=$(awk -F: -v uid=\"$uid\" '$3 == uid { print $6; exit }' /etc/passwd); fi; case \"$home\" in /*) ;; *) exit 14 ;; esac; printf '%s\\n%s\\n%s\\n' \"$uid\" \"$gid\" \"$home\"",
+        ]),
+        "resolve container user for Pi authentication",
+    )?;
+    let mut lines = identity.lines();
+    let uid = lines.next().context("container user lookup omitted uid")?;
+    let gid = lines.next().context("container user lookup omitted gid")?;
+    let home = lines
+        .next()
+        .context("container user lookup omitted home directory")?
+        .to_owned();
+    if lines.next().is_some()
+        || uid.parse::<u32>().is_err()
+        || gid.parse::<u32>().is_err()
+        || !home.starts_with('/')
+    {
+        bail!("container returned an invalid user identity for Pi authentication");
+    }
+
+    let auth_file = File::open(source).context("open host Pi authentication file")?;
+    let owner = format!("{uid}:{gid}");
+    docker_status(
+        Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "--user",
+                "0",
+                container,
+                "/bin/sh",
+                "-c",
+                "set -eu; umask 077; test -d /run/agentlab-secrets; test ! -e /run/agentlab-secrets/pi-auth.json; cat > /run/agentlab-secrets/pi-auth.json; chown \"$1\" /run/agentlab-secrets/pi-auth.json; chmod 600 /run/agentlab-secrets/pi-auth.json",
+                "agentlab-pi-auth-copy",
+                &owner,
+            ])
+            .stdin(Stdio::from(auth_file)),
+        "copy Pi authentication into runtime memory",
+    )?;
+
+    let link_result = docker_status(
+        Command::new("docker").args([
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            "set -eu; target=\"$1/.pi/agent/auth.json\"; if [ -e \"$target\" ] || [ -L \"$target\" ]; then echo 'Pi authentication target already exists' >&2; exit 15; fi; mkdir -p \"$1/.pi/agent\"; ln -s /run/agentlab-secrets/pi-auth.json \"$target\"",
+            "agentlab-pi-auth-link",
+            &home,
+        ]),
+        "link runtime Pi authentication",
+    );
+    if let Err(error) = link_result {
+        let _ = docker_status(
+            Command::new("docker").args([
+                "exec",
+                "--user",
+                "0",
+                container,
+                "rm",
+                "-f",
+                PI_AUTH_SECRET_PATH,
+            ]),
+            "remove incomplete Pi authentication injection",
+        );
+        return Err(error);
+    }
+
+    Ok(PiAuthGuard {
+        container: container.to_owned(),
+        home,
+        active: true,
+    })
 }
 
 pub(crate) fn container_status(inspect: &[u8]) -> Result<(i64, String)> {
@@ -1280,6 +1587,122 @@ fn sensitive_path_warnings(changes: &[RootFsChange]) -> Vec<String> {
             )
         })
         .collect()
+}
+
+fn report_stage(observer: &mut dyn RunObserver, message: &str) -> Result<()> {
+    observer.stage(message).context("write run progress output")
+}
+
+fn display_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|argument| {
+            if argument
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-._/:=@".contains(character))
+            {
+                argument.clone()
+            } else {
+                format!("{argument:?}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+enum GuestOutputChunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ReadError(String),
+}
+
+fn execute_guest_command(
+    container: &str,
+    command: &[String],
+    observer: &mut dyn RunObserver,
+) -> Result<Output> {
+    let mut child = Command::new("docker")
+        .args(["exec", container])
+        .args(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("execute command in retained run container")?;
+    let child_stdout = child.stdout.take().context("capture guest stdout")?;
+    let child_stderr = child.stderr.take().context("capture guest stderr")?;
+    let (sender, receiver) = mpsc::channel();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut observer_error = None;
+
+    std::thread::scope(|scope| {
+        let stdout_sender = sender.clone();
+        scope.spawn(move || read_guest_stream(child_stdout, true, stdout_sender));
+        let stderr_sender = sender.clone();
+        scope.spawn(move || read_guest_stream(child_stderr, false, stderr_sender));
+        drop(sender);
+
+        for chunk in receiver {
+            match chunk {
+                GuestOutputChunk::Stdout(bytes) => {
+                    stdout.extend_from_slice(&bytes);
+                    if observer_error.is_none() {
+                        if let Err(error) = observer.command_stdout(&bytes) {
+                            observer_error = Some(error);
+                        }
+                    }
+                }
+                GuestOutputChunk::Stderr(bytes) => {
+                    stderr.extend_from_slice(&bytes);
+                    if observer_error.is_none() {
+                        if let Err(error) = observer.command_stderr(&bytes) {
+                            observer_error = Some(error);
+                        }
+                    }
+                }
+                GuestOutputChunk::ReadError(error) => {
+                    if observer_error.is_none() {
+                        observer_error = Some(std::io::Error::other(error));
+                    }
+                }
+            }
+        }
+    });
+    let status = child
+        .wait()
+        .context("wait for command in retained run container")?;
+    if let Some(error) = observer_error {
+        return Err(error).context("stream guest command output");
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_guest_stream(mut stream: impl Read, stdout: bool, sender: mpsc::Sender<GuestOutputChunk>) {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(size) => {
+                let bytes = buffer[..size].to_vec();
+                let chunk = if stdout {
+                    GuestOutputChunk::Stdout(bytes)
+                } else {
+                    GuestOutputChunk::Stderr(bytes)
+                };
+                if sender.send(chunk).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(GuestOutputChunk::ReadError(error.to_string()));
+                return;
+            }
+        }
+    }
 }
 
 fn event(name: &str) -> LifecycleEvent {

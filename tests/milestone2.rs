@@ -16,6 +16,30 @@ struct DockerCleanup {
     image_tag: String,
 }
 
+#[derive(Default)]
+struct RecordingObserver {
+    stages: Vec<String>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl run::RunObserver for RecordingObserver {
+    fn stage(&mut self, message: &str) -> std::io::Result<()> {
+        self.stages.push(message.to_owned());
+        Ok(())
+    }
+
+    fn command_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.stdout.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn command_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.stderr.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 impl Drop for DockerCleanup {
     fn drop(&mut self) {
         let _ = Command::new("docker")
@@ -74,8 +98,12 @@ fn direct_docker_whole_machine_conformance() -> Result<()> {
 
     let store = Store::open(Some(&state))?;
     let source_before = snapshot::create(&workspace, &store)?.manifest.digest;
+    let pi_auth = temporary.path().join("pi-auth.json");
+    fs::write(&pi_auth, b"{\"fixture\":\"not-a-real-secret\"}\n")?;
     let command = r#"
 set -eu
+test -r /root/.pi/agent/auth.json
+test "$(cat /root/.pi/agent/auth.json)" = '{"fixture":"not-a-real-secret"}'
 printf 'after\n' > /workspace/modify.txt
 rm /workspace/delete.txt
 chmod 755 /workspace/mode.txt
@@ -97,17 +125,22 @@ git config user.name 'AgentLab Fixture'
 git config user.email fixture@agentlab.invalid
 git add -A
 git commit -q -m agent-run
+printf 'streamed stdout\n'
+printf 'streamed stderr\n' >&2
 exit 23
 "#;
-    let summary = run::execute(
+    let mut observer = RecordingObserver::default();
+    let summary = run::execute_with_observer(
         &RunOptions {
             workspace: WorkspaceSource::Directory(workspace.clone()),
+            workspace_capture_mode: snapshot::CaptureMode::All,
             image: "ubuntu:24.04".to_owned(),
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
             workspace_guest_path: "/workspace".to_owned(),
             network: "bridge".to_owned(),
             memory: Some("1g".to_owned()),
             cpus: Some("2".to_owned()),
+            pi_auth: Some(pi_auth),
             change_ignore: None,
             captures: vec![CaptureSpec {
                 guest_path: "/root/session.txt".to_owned(),
@@ -115,6 +148,7 @@ exit 23
             }],
         },
         &store,
+        &mut observer,
     )?;
     let compact = summary.run_id.replace('-', "");
     let _cleanup = DockerCleanup {
@@ -126,6 +160,15 @@ exit 23
         summary.exit_code == 23,
         "nonzero exit status was not preserved"
     );
+    ensure!(summary.source_workspace_status == "unchanged");
+    ensure!(observer.stdout.ends_with(b"streamed stdout\n"));
+    ensure!(observer.stderr.ends_with(b"streamed stderr\n"));
+    ensure!(
+        observer
+            .stages
+            .iter()
+            .any(|stage| stage == "Source workspace unchanged")
+    );
     let source_after = snapshot::create(&workspace, &store)?.manifest.digest;
     ensure!(
         source_before == source_after,
@@ -134,6 +177,8 @@ exit 23
 
     let result = run::load_result(&store, &summary.run_id)?;
     run::verify_result(&store, &result)?;
+    let spec = run::load_spec(&store, &summary.run_id)?;
+    ensure!(spec.secret_injections == ["pi-auth"]);
     ensure!(result.docker.retained_container_state == "running");
     ensure!(
         result
@@ -161,6 +206,13 @@ exit 23
     ensure!(change("/etc/agentlab.conf", ChangeKind::Added));
     ensure!(change("/root/session.txt", ChangeKind::Added));
     ensure!(change("/opt/agentlab/proof.txt", ChangeKind::Added));
+    ensure!(
+        !raw.changes
+            .iter()
+            .any(|candidate| candidate.path == "/root/.pi/agent/auth.json"
+                || candidate.path.starts_with("/run/agentlab-secrets")),
+        "runtime Pi authentication leaked into persistent filesystem changes"
+    );
     ensure!(
         portable
             .changes

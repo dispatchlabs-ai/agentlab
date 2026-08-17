@@ -83,6 +83,7 @@ fn external_evaluator_reports_real_input_identities_and_scores() -> Result<()> {
         threads.push(std::thread::spawn(move || {
             let options = RunOptions {
                 workspace: WorkspaceSource::Snapshot(workspace_snapshot),
+                workspace_capture_mode: snapshot::CaptureMode::All,
                 image: "alpine:3.21".to_owned(),
                 command: vec![
                     "/bin/sh".to_owned(),
@@ -94,6 +95,7 @@ fn external_evaluator_reports_real_input_identities_and_scores() -> Result<()> {
                 network: "none".to_owned(),
                 memory: None,
                 cpus: None,
+                pi_auth: None,
                 change_ignore: None,
                 captures: Vec::new(),
             };

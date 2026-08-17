@@ -29,9 +29,9 @@ The automated fixture uses a non-Git root containing:
 - a symlink; and
 - no real credentials.
 
-The test proves:
+The test proves both default complete capture and explicit Git-ignore filtering:
 
-1. Included and excluded paths exactly match the contract.
+1. Default capture includes every supported path with zero exclusions; explicit Git-ignore mode includes and excludes exactly the paths selected by the contract.
 2. Git repositories require no declarations.
 3. Tracked files remain included when ignore rules match.
 4. In-workspace Git metadata is captured.
@@ -43,6 +43,7 @@ The test proves:
 10. An included FIFO or other unsupported special file produces a precise failure and is never silently omitted.
 11. CLI JSON is machine-readable.
 12. Default inspection exposes metadata but not file contents.
+13. Direct `run` and `evaluate` help succeeds without a command separator, and run help declares `bridge` as the default network policy.
 
 The hands-on checkpoint additionally runs the public CLI against a workspace chosen by the user, repeats the snapshot, inspects and verifies the digest, and independently confirms the source is unchanged.
 
@@ -55,11 +56,12 @@ The Docker-gated fixture uses `ubuntu:24.04`, a disposable Git workspace, and a 
 3. Additions, content modifications, deletions, rename-as-delete-plus-add, mode-only changes, type changes, and symlinks are normalized.
 4. A Git commit and its object/ref changes are captured without mutating the source repository.
 5. `.agentlabignore` removes exactly its selected path from the portable delta while the raw delta still reports it.
-6. The source snapshot identity is unchanged after execution.
-7. The nonzero exit status, lifecycle, stdout, stderr, captures, Docker evidence, observations, and integrity hashes are retained.
+6. The source snapshot identity is unchanged after execution and direct-run source verification reports `unchanged`.
+7. The nonzero exit status, lifecycle, live-streamed and retained stdout/stderr, progress stages, captures, Docker evidence, observations, and integrity hashes are retained.
 8. `inspect --verify` recalculates every declared run artifact and result identity.
 9. A file outside `/workspace` can be copied from the retained stopped container for direct inspection.
 10. Persistent root changes are distinguished from pseudo-filesystems and unobserved live process memory.
+11. A fixture Pi auth JSON is readable only while the command runs, only `pi-auth` appears in the run specification, and neither the auth path nor secret tmpfs appears in the persistent raw delta.
 
 Run the Docker-gated case explicitly:
 

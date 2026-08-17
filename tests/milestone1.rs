@@ -91,7 +91,9 @@ fn snapshot_conformance() {
 
     let before = tree_fingerprint(&workspace);
     let store = Store::open(Some(&state)).unwrap();
-    let first = snapshot::create(&workspace, &store).unwrap();
+    let first =
+        snapshot::create_with_mode(&workspace, &store, snapshot::CaptureMode::RespectGitignore)
+            .unwrap();
     let after = tree_fingerprint(&workspace);
     assert_eq!(before, after, "source workspace changed during snapshot");
 
@@ -138,7 +140,9 @@ fn snapshot_conformance() {
     assert_eq!(first.manifest.repositories.len(), 2);
     assert_eq!(first.manifest.ignore_rules.len(), 4);
 
-    let second = snapshot::create(&workspace, &store).unwrap();
+    let second =
+        snapshot::create_with_mode(&workspace, &store, snapshot::CaptureMode::RespectGitignore)
+            .unwrap();
     assert_eq!(first.manifest.digest, second.manifest.digest);
     assert_eq!(second.new_blobs, 0);
     snapshot::verify(&store, &first.manifest).unwrap();
@@ -161,10 +165,124 @@ fn active_ignore_change_changes_identity() {
     write_file(workspace.path().join("kept.txt"), "same\n", 0o644);
     write_file(workspace.path().join("ignored.tmp"), "ignored\n", 0o644);
     let store = Store::open(Some(state.path())).unwrap();
-    let first = snapshot::create(workspace.path(), &store).unwrap();
+    let first = snapshot::create_with_mode(
+        workspace.path(),
+        &store,
+        snapshot::CaptureMode::RespectGitignore,
+    )
+    .unwrap();
     write_file(workspace.path().join(".gitignore"), "ignored.tmp\n", 0o644);
-    let second = snapshot::create(workspace.path(), &store).unwrap();
+    let second = snapshot::create_with_mode(
+        workspace.path(),
+        &store,
+        snapshot::CaptureMode::RespectGitignore,
+    )
+    .unwrap();
     assert_ne!(first.manifest.digest, second.manifest.digest);
+}
+
+#[test]
+fn capture_all_includes_ignored_paths_without_ignore_rules() {
+    require_git();
+    let workspace = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    write_file(
+        workspace.path().join(".gitignore"),
+        "ignored/\n*.tmp\n",
+        0o644,
+    );
+    mkdir(&workspace.path().join("ignored"), 0o755);
+    write_file(
+        workspace.path().join("ignored/artifact.txt"),
+        "included by capture all\n",
+        0o644,
+    );
+    write_file(workspace.path().join("root.tmp"), "included\n", 0o644);
+    let store = Store::open(Some(state.path())).unwrap();
+
+    let result =
+        snapshot::create_with_mode(workspace.path(), &store, snapshot::CaptureMode::All).unwrap();
+    let paths: std::collections::HashSet<_> = result
+        .manifest
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+
+    assert!(paths.contains("ignored/artifact.txt"));
+    assert!(paths.contains("root.tmp"));
+    assert_eq!(result.excluded_paths, 0);
+    assert!(result.manifest.ignore_rules.is_empty());
+    snapshot::verify(&store, &result.manifest).unwrap();
+}
+
+#[test]
+fn complete_capture_is_default_and_gitignore_filtering_is_explicit() {
+    require_git();
+    let workspace = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    write_file(workspace.path().join(".gitignore"), "*.tmp\n", 0o644);
+    write_file(workspace.path().join("included.tmp"), "complete\n", 0o644);
+    let store = Store::open(Some(state.path())).unwrap();
+
+    let complete = snapshot::create(workspace.path(), &store).unwrap();
+    assert!(
+        complete
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path == "included.tmp")
+    );
+    assert_eq!(complete.excluded_paths, 0);
+    assert!(complete.manifest.ignore_rules.is_empty());
+
+    let filtered = snapshot::create_with_mode(
+        workspace.path(),
+        &store,
+        snapshot::CaptureMode::RespectGitignore,
+    )
+    .unwrap();
+    assert!(
+        !filtered
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path == "included.tmp")
+    );
+    assert_eq!(filtered.excluded_paths, 1);
+    assert_eq!(filtered.manifest.ignore_rules.len(), 1);
+}
+
+#[test]
+fn run_and_evaluate_help_do_not_require_command_separator() {
+    let binary = env!("CARGO_BIN_EXE_agentlab");
+    for (command, expected) in [
+        ("run", "Capture every supported path"),
+        ("evaluate", "trusted host command"),
+    ] {
+        let output = Command::new(binary)
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "unexpected help for {command}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if command == "run" {
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("Network policy (default: bridge)"),
+                "run help did not declare bridge as the default: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
 }
 
 #[test]
@@ -175,7 +293,12 @@ fn verification_recomputes_ignore_rule_digest() {
     write_file(workspace.path().join(".gitignore"), "*.tmp\n", 0o644);
     write_file(workspace.path().join("kept.txt"), "same\n", 0o644);
     let store = Store::open(Some(state.path())).unwrap();
-    let result = snapshot::create(workspace.path(), &store).unwrap();
+    let result = snapshot::create_with_mode(
+        workspace.path(),
+        &store,
+        snapshot::CaptureMode::RespectGitignore,
+    )
+    .unwrap();
     let mut manifest = result.manifest;
     manifest.ignore_rules_digest = format!("sha256:{}", "0".repeat(64));
     let error = snapshot::verify(&store, &manifest).unwrap_err();
