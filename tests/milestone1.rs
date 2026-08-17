@@ -254,11 +254,12 @@ fn complete_capture_is_default_and_gitignore_filtering_is_explicit() {
 }
 
 #[test]
-fn run_and_evaluate_help_do_not_require_command_separator() {
+fn command_help_does_not_require_command_separator() {
     let binary = env!("CARGO_BIN_EXE_agentlab");
     for (command, expected) in [
         ("run", "Capture every supported path"),
         ("evaluate", "trusted host command"),
+        ("resume", "--pi-auth"),
     ] {
         let output = Command::new(binary)
             .args([command, "--help"])
@@ -283,6 +284,19 @@ fn run_and_evaluate_help_do_not_require_command_separator() {
             );
         }
     }
+}
+
+#[test]
+fn resume_pi_auth_requires_a_continuation_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .args(["resume", "--pi-auth", "fixture-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("resume --pi-auth requires `-- COMMAND [ARG ...]`")
+    );
 }
 
 #[test]

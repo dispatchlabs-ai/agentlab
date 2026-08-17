@@ -598,6 +598,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Requested capture paths can export harness state outside `/workspace`.
 - Backend-native state is clearly distinguished from the portable filesystem delta.
 - A filesystem-level fork may commit/export the retained container and launch another container from that state.
+- Initial and continued Pi commands can receive the host's current default credential through command-scoped runtime memory without persisting its path or bytes.
 - Live-process and memory resume are explicitly unsupported rather than simulated.
 - Cleanup is explicit and recoverable where practical.
 

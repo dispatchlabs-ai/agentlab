@@ -22,10 +22,10 @@ pub const LEGACY_RUN_SCHEMA_VERSION: &str = "agentlab.run/v1";
 pub const RUN_INPUT_SCHEMA_VERSION: &str = "agentlab.run-input/v1";
 pub const DELTA_SCHEMA_VERSION: &str = "agentlab.delta/v1";
 pub const RESULT_SCHEMA_VERSION: &str = "agentlab.result/v1";
-const PI_AUTH_SECRET_NAME: &str = "pi-auth";
+pub(crate) const PI_AUTH_SECRET_NAME: &str = "pi-auth";
 const PI_AUTH_SECRET_DIRECTORY: &str = "/run/agentlab-secrets";
 const PI_AUTH_SECRET_PATH: &str = "/run/agentlab-secrets/pi-auth.json";
-const PI_AUTH_TMPFS_MOUNT: &str =
+pub(crate) const PI_AUTH_TMPFS_MOUNT: &str =
     "type=tmpfs,destination=/run/agentlab-secrets,tmpfs-mode=0711,tmpfs-size=1048576";
 const MAX_PI_AUTH_BYTES: u64 = 1024 * 1024;
 
@@ -465,22 +465,20 @@ pub fn execute_with_observer(
         "copy private workspace into preparation container",
     )?;
     lifecycle.push(event("workspace_copied_to_private_rootfs"));
-    if options.pi_auth.is_some() {
-        let runtime_root = tempfile::tempdir().context("create runtime mountpoint fixture")?;
-        let secret_directory = runtime_root.path().join("agentlab-secrets");
-        fs::create_dir(&secret_directory).context("create runtime secret mountpoint")?;
-        docker_status(
-            Command::new("docker").args([
-                "cp",
-                secret_directory
-                    .to_str()
-                    .context("runtime mountpoint path is not UTF-8")?,
-                &format!("{preparation_name}:{PI_AUTH_SECRET_DIRECTORY}"),
-            ]),
-            "prepare runtime secret mountpoint",
-        )?;
-        lifecycle.push(event("runtime_secret_mountpoint_prepared"));
-    }
+    let runtime_root = tempfile::tempdir().context("create runtime mountpoint fixture")?;
+    let secret_directory = runtime_root.path().join("agentlab-secrets");
+    fs::create_dir(&secret_directory).context("create runtime secret mountpoint")?;
+    docker_status(
+        Command::new("docker").args([
+            "cp",
+            secret_directory
+                .to_str()
+                .context("runtime mountpoint path is not UTF-8")?,
+            &format!("{preparation_name}:{PI_AUTH_SECRET_DIRECTORY}"),
+        ]),
+        "prepare runtime secret mountpoint",
+    )?;
+    lifecycle.push(event("runtime_secret_mountpoint_prepared"));
 
     let preparation_inspect_bytes = docker_output_bytes(
         Command::new("docker").args(["inspect", &preparation_name]),
@@ -527,9 +525,7 @@ pub fn execute_with_observer(
     if let Some(cpus) = &options.cpus {
         create.args(["--cpus", cpus]);
     }
-    if options.pi_auth.is_some() {
-        create.args(["--mount", PI_AUTH_TMPFS_MOUNT]);
-    }
+    create.args(["--mount", PI_AUTH_TMPFS_MOUNT]);
     create.arg(&prepared_image_id).args([
         "/bin/sh",
         "-c",
@@ -1235,6 +1231,35 @@ pub(crate) fn ensure_no_external_mounts(inspect: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn ensure_pi_auth_tmpfs(inspect: &[u8]) -> Result<()> {
+    ensure_no_external_mounts(inspect)?;
+    let value: Value = serde_json::from_slice(inspect).context("decode Docker inspect evidence")?;
+    let container = value
+        .as_array()
+        .and_then(|values| values.first())
+        .context("Docker inspect returned no container")?;
+    let configured = container
+        .pointer("/HostConfig/Mounts")
+        .and_then(Value::as_array)
+        .is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                mount["Type"].as_str() == Some("tmpfs")
+                    && mount["Target"].as_str() == Some(PI_AUTH_SECRET_DIRECTORY)
+                    && mount
+                        .pointer("/TmpfsOptions/SizeBytes")
+                        .and_then(Value::as_u64)
+                        == Some(MAX_PI_AUTH_BYTES)
+                    && mount.pointer("/TmpfsOptions/Mode").and_then(Value::as_u64) == Some(0o711)
+            })
+        });
+    if !configured {
+        bail!(
+            "retained run predates secure continuation credentials; create a new run before using resume --pi-auth"
+        );
+    }
+    Ok(())
+}
+
 fn validate_pi_auth(path: &Path) -> Result<()> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("read host Pi authentication metadata {}", path.display()))?;
@@ -1253,14 +1278,14 @@ fn validate_pi_auth(path: &Path) -> Result<()> {
     Ok(())
 }
 
-struct PiAuthGuard {
+pub(crate) struct PiAuthGuard {
     container: String,
     home: String,
     active: bool,
 }
 
 impl PiAuthGuard {
-    fn cleanup(&mut self) -> Result<()> {
+    pub(crate) fn cleanup(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
@@ -1289,7 +1314,7 @@ impl Drop for PiAuthGuard {
     }
 }
 
-fn inject_pi_auth(container: &str, source: &Path) -> Result<PiAuthGuard> {
+pub(crate) fn inject_pi_auth(container: &str, source: &Path) -> Result<PiAuthGuard> {
     validate_pi_auth(source)?;
     let identity = docker_success(
         Command::new("docker").args([

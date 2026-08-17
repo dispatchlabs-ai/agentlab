@@ -51,6 +51,8 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     fs::write(workspace.join("source.txt"), "immutable\n")?;
     let store = Store::open(Some(&state))?;
     let source_before = snapshot::create(&workspace, &store)?.manifest.digest;
+    let pi_auth = temporary.path().join("pi-auth.json");
+    fs::write(&pi_auth, b"{\"fixture\":\"continuation-only\"}\n")?;
 
     let unrelated_name = format!(
         "agentlab-unrelated-{}",
@@ -126,15 +128,16 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     ensure!(!restarted.process_memory_restored);
 
     lifecycle::stop(&store, &summary.run_id)?;
-    let continuation = lifecycle::resume(
+    let continuation = lifecycle::resume_with_pi_auth(
         &store,
         &summary.run_id,
         &[
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "test \"$(cat /root/session.txt)\" = 1; printf '2\\n' > /root/session.txt; printf 'continued\\n' > /workspace/continued.txt; exit 29"
+            "test \"$(cat /root/session.txt)\" = 1; test \"$(cat /root/.pi/agent/auth.json)\" = '{\"fixture\":\"continuation-only\"}'; printf '2\\n' > /root/session.txt; printf 'continued\\n' > /workspace/continued.txt; exit 29"
                 .to_owned(),
         ],
+        Some(&pi_auth),
     )?;
     ensure!(continuation.container_restarted);
     ensure!(!continuation.process_memory_restored);
@@ -142,10 +145,25 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
         .continuation
         .context("missing continuation result")?;
     ensure!(continuation.exit_code == 29);
+    ensure!(continuation.secret_injections == ["pi-auth"]);
     ensure!(continuation.filesystem_state_reused);
     ensure!(!continuation.process_memory_restored);
     ensure!(continuation.container_id == summary.retained_container_id);
     ensure!(continuation.captures.len() == 1);
+    let auth_cleanup = Command::new("docker")
+        .args([
+            "exec",
+            &summary.retained_container_name,
+            "/bin/sh",
+            "-c",
+            "test ! -e /root/.pi/agent/auth.json; test ! -e /run/agentlab-secrets/pi-auth.json",
+        ])
+        .output()?;
+    ensure!(
+        auth_cleanup.status.success(),
+        "continuation Pi auth was not removed: {}",
+        String::from_utf8_lossy(&auth_cleanup.stderr)
+    );
     ensure!(
         read_only_regular_file_from_tar(
             &store
@@ -156,6 +174,20 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
         )? == b"2\n"
     );
     lifecycle::verify_all(&store, &summary.run_id)?;
+    let continuation_raw: run::DeltaManifest = serde_json::from_slice(&store.read_run_file(
+        &summary.run_id,
+        &format!(
+            "continuations/{}/delta.raw.json",
+            continuation.continuation_id
+        ),
+    )?)?;
+    ensure!(
+        !continuation_raw.changes.iter().any(|change| {
+            change.path == "/root/.pi/agent/auth.json"
+                || change.path.starts_with("/run/agentlab-secrets")
+        }),
+        "continuation Pi auth leaked into persistent filesystem changes"
+    );
 
     let fork = lifecycle::fork(&store, &summary.run_id)?;
     cleanup.run_ids.push(fork.run_id.clone());

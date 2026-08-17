@@ -97,8 +97,8 @@ The Docker-gated fixture creates session-like state under `/root`, requests it a
 1. The initial opaque command executes through Docker exec, preserves a known nonzero status, and leaves the supervisor running.
 2. `list` discovers the run, live Docker state, lifecycle capability, and continuation count.
 3. `stop` and `resume` preserve the complete container ID and filesystem while reporting that process memory was not preserved or restored.
-4. A continuation after another stop reads prior session state, updates it, writes new workspace state, and preserves its own known nonzero exit.
-5. `agentlab.continuation/v1` captures the complete current rootfs and deltas, Docker evidence, stdout/stderr, and an updated requested session archive.
+4. A continuation after another stop reads prior session state, receives a fixture Pi credential from the host-only source, updates session and workspace state, and preserves its own known nonzero exit.
+5. `agentlab.continuation/v1` records only the stable `pi-auth` injection name, captures the complete current rootfs and deltas, Docker evidence, stdout/stderr, and an updated requested session archive; the credential paths are absent after execution and from the raw persistent delta.
 6. Initial, lifecycle, and continuation integrity verification succeeds.
 7. A filesystem fork's portable base equals the parent's continued result-rootfs identity.
 8. The fork reads inherited session value `2`, changes its private copy to `3`, and leaves the parent value at `2`.

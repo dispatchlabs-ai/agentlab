@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +66,8 @@ pub struct ContinuationResult {
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_injections: Vec<String>,
     pub exit_code: i64,
     pub stdout: Artifact,
     pub stderr: Artifact,
@@ -155,6 +158,8 @@ struct ContinuationIdentity<'a> {
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     command: &'a [String],
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    secret_injections: &'a [String],
     exit_code: i64,
     stdout: &'a Artifact,
     stderr: &'a Artifact,
@@ -203,6 +208,10 @@ struct Subject {
     captures: Vec<CaptureSpec>,
     change_ignore: IgnoreIdentity,
     base_manifest: RootFsManifest,
+}
+
+fn slice_is_empty<T>(value: &&[T]) -> bool {
+    value.is_empty()
 }
 
 struct ForkCleanup {
@@ -263,6 +272,15 @@ pub fn stop(store: &Store, run_id: &str) -> Result<ManagedRun> {
 }
 
 pub fn resume(store: &Store, run_id: &str, command: &[String]) -> Result<ResumeSummary> {
+    resume_with_pi_auth(store, run_id, command, None)
+}
+
+pub fn resume_with_pi_auth(
+    store: &Store,
+    run_id: &str,
+    command: &[String],
+    pi_auth: Option<&Path>,
+) -> Result<ResumeSummary> {
     let subject = load_subject(store, run_id)?;
     let inspect = assert_owned_container(&subject)?;
     let (_, state) = run::container_status(&inspect)?;
@@ -277,7 +295,9 @@ pub fn resume(store: &Store, run_id: &str, command: &[String]) -> Result<ResumeS
     let continuation = if command.is_empty() {
         None
     } else {
-        Some(execute_continuation(store, &subject, command, restarted)?)
+        Some(execute_continuation(
+            store, &subject, command, restarted, pi_auth,
+        )?)
     };
     let inspect = assert_owned_container(&subject)?;
     let (_, state) = run::container_status(&inspect)?;
@@ -347,6 +367,7 @@ pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
     if let Some(cpus) = &parent.resource_limits.cpus {
         create.args(["--cpus", cpus]);
     }
+    create.args(["--mount", run::PI_AUTH_TMPFS_MOUNT]);
     create.arg(&image_id).args([
         "/bin/sh",
         "-c",
@@ -551,6 +572,7 @@ pub fn verify_continuation(store: &Store, result: &ContinuationResult) -> Result
         started_at: result.started_at,
         completed_at: result.completed_at,
         command: &result.command,
+        secret_injections: &result.secret_injections,
         exit_code: result.exit_code,
         stdout: &result.stdout,
         stderr: &result.stderr,
@@ -606,6 +628,7 @@ fn execute_continuation(
     subject: &Subject,
     command: &[String],
     restarted: bool,
+    pi_auth: Option<&Path>,
 ) -> Result<ContinuationResult> {
     let started_at = Utc::now();
     let continuation_id = Uuid::new_v4().to_string();
@@ -614,12 +637,24 @@ fn execute_continuation(
     fs::create_dir_all(directory.join("artifacts"))?;
     fs::create_dir_all(directory.join("evidence"))?;
 
+    let mut pi_auth_guard = if let Some(source) = pi_auth {
+        run::ensure_pi_auth_tmpfs(&assert_owned_container(subject)?)?;
+        Some(run::inject_pi_auth(&subject.container_name, source)?)
+    } else {
+        None
+    };
     let output = Command::new("docker")
         .args(["exec", &subject.container_name])
         .args(command)
         .output()
         .context("execute harness continuation")?;
+    if let Some(guard) = &mut pi_auth_guard {
+        guard.cleanup()?;
+    }
     let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
+    let secret_injections = pi_auth
+        .map(|_| vec![run::PI_AUTH_SECRET_NAME.to_owned()])
+        .unwrap_or_default();
     let stdout = write_bytes_artifact(
         store,
         &subject.run_id,
@@ -757,6 +792,7 @@ fn execute_continuation(
         started_at,
         completed_at,
         command,
+        secret_injections: &secret_injections,
         exit_code,
         stdout: &stdout,
         stderr: &stderr,
@@ -786,6 +822,7 @@ fn execute_continuation(
         started_at,
         completed_at,
         command: command.to_vec(),
+        secret_injections,
         exit_code,
         stdout,
         stderr,

@@ -128,7 +128,7 @@ Use `--pi-auth` when the command needs the invoking host's default `~/.pi/agent/
   -- pi --help
 ```
 
-AgentLab validates the JSON, places it in a private tmpfs, links it at the container user's Pi auth path only while the initial command runs, and removes both paths before inspection and root-filesystem export. The run specification records the name `pi-auth`, never the host path, credential bytes, or a credential digest. This prevents AgentLab itself from persisting the injected file; the opaque command remains trusted with the credential and can still print or copy it. Continuation commands do not currently reinject it.
+AgentLab validates the JSON, places it in a private tmpfs, links it at the container user's Pi auth path only while the selected command runs, and removes both paths before inspection and root-filesystem export. The run or continuation record stores only the stable name `pi-auth`, never the host path, credential bytes, or a credential digest. This prevents AgentLab itself from persisting the injected file; the opaque command remains trusted with the credential and can still print or copy it.
 
 The container remains running under an inert shell supervisor after the initial `docker exec` command completes. This makes later stop/start truthful: restarting the container starts only the supervisor and never reruns the original command.
 
@@ -165,11 +165,12 @@ Manage retained filesystem state:
 ./target/release/agentlab stop RUN_ID
 ./target/release/agentlab resume RUN_ID
 ./target/release/agentlab resume RUN_ID -- /path/to/harness --continue
+./target/release/agentlab resume --pi-auth RUN_ID -- pi --continue
 ./target/release/agentlab fork RUN_ID
 ./target/release/agentlab rm RUN_OR_FORK_ID
 ```
 
-`resume RUN` restarts the same stable container when stopped. Supplying a command executes a harness-level continuation in that container, re-exports and normalizes its complete persistent root filesystem, reapplies the preserved change-ignore rules, refreshes every requested capture, and writes `agentlab.continuation/v1`. It reports `filesystem_state_reused: true` and `process_memory_restored: false`—filesystem continuation is real, but the previous process tree and live memory are gone.
+`resume RUN` restarts the same stable container when stopped. Supplying a command executes a harness-level continuation in that container, re-exports and normalizes its complete persistent root filesystem, reapplies the preserved change-ignore rules, refreshes every requested capture, and writes `agentlab.continuation/v1`. Add `--pi-auth` before the run ID when that continuation needs the host's current default Pi credential. AgentLab injects it only for that command, cleans it before capture, and records only `pi-auth` in the continuation. Newly created runs and forks reserve the private in-memory credential mount even when their initial command does not need it; older retained runs without that mount are rejected rather than receiving a credential through persistent storage. Resume reports `filesystem_state_reused: true` and `process_memory_restored: false`—filesystem continuation is real, but the previous process tree and live memory are gone.
 
 `fork` commits the selected retained filesystem, exports it as the fork's portable base, and launches a separately owned stable container. Its `agentlab.fork/v1` record reports `filesystem_state_copied: true` and `process_memory_copied: false`. Forks can themselves be stopped, resumed, continued, inspected, and removed.
 
