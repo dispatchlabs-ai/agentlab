@@ -241,6 +241,36 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     ensure!(docker_exists(&unrelated_name));
     ensure!(docker_id(&unrelated_name)? == unrelated_id);
 
+    let continuation_directory = store
+        .root()
+        .join("runs")
+        .join(&summary.run_id)
+        .join("continuations");
+    let continuation_count = fs::read_dir(&continuation_directory)?.count();
+    let failed_continuation = lifecycle::resume(
+        &store,
+        &summary.run_id,
+        &[
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "rm -f /root/session.txt".to_owned(),
+        ],
+    );
+    ensure!(
+        failed_continuation.is_err(),
+        "continuation unexpectedly succeeded without its requested capture"
+    );
+    ensure!(
+        format!("{:#}", failed_continuation.unwrap_err())
+            .contains("export continuation capture /root/session.txt"),
+        "continuation failed for an unexpected reason"
+    );
+    ensure!(
+        fs::read_dir(&continuation_directory)?.count() == continuation_count,
+        "failed continuation left an incomplete record directory"
+    );
+    lifecycle::verify_all(&store, &summary.run_id)?;
+
     let source_after = snapshot::create(&workspace, &store)?.manifest.digest;
     ensure!(
         source_before == source_after,
