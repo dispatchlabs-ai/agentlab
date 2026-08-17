@@ -28,7 +28,7 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - The Pi-workspace lifecycle checkpoint passed: one container ID survived stop/start, session value `1` continued to `2`, the requested capture refreshed, the fork inherited the exact continued base, deleting the fork preserved its parent, and the source snapshot remained unchanged.
 - Milestone 5 is complete: arbitrary host evaluator commands produce integrity-checked structured observations, and reports align actual run-input, workspace, image, portable-base, and scalar-score identities without built-in ranking, statistics, or causal claims.
 - The current four-run conformance case snapshots a real workspace without and with a skill directory, repeats each exact input twice, verifies within-input repetition and the cross-input workspace difference, and produces Markdown and JSON reports while preserving the host workspace after the deliberate edit.
-- Milestone 6 review-only workflow is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, and AgentLab validates and records its proposal without applying it. The next phase is explicit receipt-bound apply with stale-current rejection and recoverable backups.
+- Milestone 6 is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, AgentLab validates and records its proposal without applying it, and a separate receipt-bound command applies only authorized workspace paths after stale-current checks, explicit conflict/unresolved acknowledgements, private staging, recoverable backup capture, and exact after-snapshot verification.
 
 ## North-star goal
 
@@ -470,7 +470,7 @@ The review agent should:
 - report accepted, rejected, conflicted, and unresolved changes precisely; and
 - emit an immutable review receipt.
 
-Initial automatic apply should be limited to reviewed workspace changes that can be expressed and checked safely. Valuable changes outside `/workspace` produce explicit environment recommendations or declarative image-source edits; unresolved machine changes must not be copied blindly into the host or silently committed into an accepted image. An explicit allow-unresolved override, if ever provided, must remain visible in the receipt.
+Initial explicit apply should be limited to reviewed workspace changes that can be expressed and checked safely. Valuable changes outside `/workspace` produce explicit environment recommendations or declarative image-source edits; unresolved machine changes must not be copied blindly into the host or silently committed into an accepted image. An explicit unresolved-candidate acknowledgement must remain visible in the receipt.
 
 Before apply, AgentLab snapshots current again and rejects a stale proposal unless the recorded three-way preconditions still hold. Apply writes only the paths authorized by the receipt, preserves a recoverable backup or patch artifact, verifies the resulting snapshot, and records exactly what changed. Review and apply are separate trust and authorization boundaries.
 
@@ -648,7 +648,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 ### Milestone 6: Add optional AI-assisted review and application
 
-**Status:** Review-only phase complete; explicit apply phase remains.
+**Status:** Complete.
 
 **Goal:** Allow selected successful changes to improve a current workspace or future environment without weakening the core isolation model.
 
@@ -661,14 +661,16 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Every candidate delta entry is accounted for exactly once as proposed, rejected, conflicted, or unresolved; semantic validation rejects traversal, duplicate dispositions, inconsistent counts, invalid base references, and operations outside the selected workspace.
 - Repositories are discovered, not declared.
 - Nonrepository changes use base/candidate/current comparison.
-- Environment changes are evaluated across the entire machine delta, but initial automatic apply is limited to safely expressible workspace changes. Valuable non-workspace changes become explicit recommendations or proposed declarative image-source edits; they are never copied blindly from `/usr`, `/etc`, `/var`, caches, or credentials.
+- Environment changes are evaluated across the entire machine delta, but the initial explicit apply implementation is limited to safely expressible workspace changes. Valuable non-workspace changes become explicit recommendations or proposed declarative image-source edits; they are never copied blindly from `/usr`, `/etc`, `/var`, caches, or credentials.
 - `agentlab apply REVIEW_ID --workspace CURRENT` is a separate explicit authorization. It resnapshots current, rejects stale proposals, blocks conflicts or unresolved entries by default, applies only receipt-authorized paths, preserves a recoverable patch/backup artifact, and verifies the resulting snapshot.
+- Apply privately stages the intended workspace, serializes concurrent attempts, refuses recursive removal of unreviewed directory content, rolls back authorized paths after a failed write or verification mismatch, records one immutable `agentlab.apply/v1` receipt per review, and rejects repeated application.
 - Review and apply emit immutable records with reconciled proposed/rejected/conflicted/unresolved/applied counts and exact before/after identities.
+- Human review must ultimately be delightful in a terminal: provide a clear colorized unified or side-by-side diff across base/candidate/current and before/after states, including type, mode, symlink, deletion, binary, and environment-recommendation treatment. Library and renderer selection are deliberately deferred; the view must derive from immutable records and never become an authorization channel.
 - Application does not silently change the accepted baseline. Acceptance/promotion is a later explicit lineage decision.
 
 **Acceptance:** From a run based on an older snapshot, advance a disposable current workspace independently, invoke a fixture reviewer through the public command adapter, validate a complete three-way proposal, prove review itself causes no AgentLab apply, reject a stale or unresolved apply, then explicitly apply an authorized nonconflicting workspace subset while leaving rejected and non-workspace changes untouched.
 
-**Review-only acceptance completed:** The public adapter now anchors distinct base/candidate/current states, discovers repositories, exposes actual changed-machine content, validates all four dispositions and unsafe-output rejection, records an integrity-checked receipt, and proves the selected host workspace is unchanged. Stale/unresolved rejection and explicit apply remain the next authorization-bound phase.
+**Acceptance completed:** The public adapter anchors distinct base/candidate/current states, discovers repositories, exposes actual changed-machine content, validates all four dispositions and unsafe-output rejection, records an integrity-checked review receipt, and proves review changes nothing. Apply then blocks unacknowledged conflicts and unresolved candidates, rejects stale current state, changes only the proposed workspace file, preserves rejected/conflicted/current-only/environment state, retains and verifies a materializable complete backup, detects tampering, records exact before/intended/after identities, and rejects reuse of the review receipt.
 
 **Hands-on checkpoint:** Use a disposable copy of a chosen workspace to generate candidate workspace and machine changes, advance the copy independently, and run `agentlab review` with a chosen CLI reviewer (for example a Pi adapter). Inspect the anchored proposed, rejected, conflicted, and unresolved dispositions. Apply the exact review ID only after explicit authorization, then verify the current workspace's before/after snapshots and the untouched non-workspace recommendations.
 

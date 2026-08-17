@@ -3,6 +3,7 @@
 use std::fs;
 use std::process::Command;
 
+use agentlab::apply::{self, ApplyRecord};
 use agentlab::review::{self, ReviewRecord};
 use agentlab::run::{self, RunOptions, WorkspaceSource};
 use agentlab::snapshot;
@@ -30,7 +31,7 @@ impl Drop for Cleanup {
 
 #[test]
 #[ignore = "requires a running Docker engine and python3"]
-fn review_anchors_three_states_and_applies_nothing() -> Result<()> {
+fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<()> {
     ensure!(
         Command::new("docker")
             .arg("info")
@@ -113,6 +114,7 @@ fn review_anchors_three_states_and_applies_nothing() -> Result<()> {
     ensure!(record.request.schema_version == "agentlab.review-request/v1");
     ensure!(record.proposal.schema_version == "agentlab.review-proposal/v1");
     ensure!(record.run_id == summary.run_id);
+    ensure!(record.source_workspace == fs::canonicalize(&workspace)?.to_string_lossy());
     ensure!(record.source_workspace_unchanged);
     ensure!(!record.agentlab_applied_changes);
     ensure!(record.request.anchors.current_workspace_snapshot_digest == current_before);
@@ -144,18 +146,7 @@ fn review_anchors_three_states_and_applies_nothing() -> Result<()> {
     ensure!(fs::read_to_string(workspace.join("conflict.txt"))? == "current conflict\n");
     review::verify(&store, &record)?;
     let records = review::list(&store, &summary.run_id)?;
-    ensure!(records == [record]);
-
-    let inspect = Command::new(env!("CARGO_BIN_EXE_agentlab"))
-        .args(["inspect", "--verify", &summary.run_id])
-        .env("AGENTLAB_STATE_DIR", &state)
-        .output()?;
-    ensure!(
-        inspect.status.success(),
-        "inspect --verify failed: {}",
-        String::from_utf8_lossy(&inspect.stderr)
-    );
-    ensure!(String::from_utf8_lossy(&inspect.stdout).contains("Reviews: 1"));
+    ensure!(records.as_slice() == std::slice::from_ref(&record));
 
     let mutating_reviewer = Command::new(env!("CARGO_BIN_EXE_agentlab"))
         .args(["review", &summary.run_id, "--workspace"])
@@ -174,7 +165,179 @@ fn review_anchors_three_states_and_applies_nothing() -> Result<()> {
             .contains("mutated bundle input \"delta.raw.json\"")
     );
     ensure!(review::list(&store, &summary.run_id)?.len() == 1);
+
+    let blocked_conflict = apply_command(&record.review_id, &workspace, &state, &[])?;
+    ensure!(!blocked_conflict.status.success());
+    ensure!(
+        String::from_utf8_lossy(&blocked_conflict.stderr)
+            .contains("review contains 1 conflicted candidate(s)")
+    );
+    ensure!(!workspace.join("accepted.txt").exists());
+
+    let blocked_unresolved = apply_command(
+        &record.review_id,
+        &workspace,
+        &state,
+        &["--acknowledge-conflicts"],
+    )?;
+    ensure!(!blocked_unresolved.status.success());
+    ensure!(
+        String::from_utf8_lossy(&blocked_unresolved.stderr)
+            .contains("review contains 1 unresolved candidate(s)")
+    );
+    ensure!(!workspace.join("accepted.txt").exists());
+
+    fs::write(workspace.join("current-only.txt"), "stale work\n")?;
+    let stale = apply_command(
+        &record.review_id,
+        &workspace,
+        &state,
+        &["--acknowledge-conflicts", "--acknowledge-unresolved"],
+    )?;
+    ensure!(!stale.status.success());
+    ensure!(String::from_utf8_lossy(&stale.stderr).contains("current workspace is stale"));
+    ensure!(!workspace.join("accepted.txt").exists());
+    fs::write(workspace.join("current-only.txt"), "current work\n")?;
+    ensure!(snapshot::create(&workspace, &store)?.manifest.digest == current_before);
+
+    let alternate_workspace = temporary.path().join("alternate-workspace");
+    let reviewed_current = snapshot::load(&store, &current_before)?;
+    snapshot::materialize(&store, &reviewed_current, &alternate_workspace)?;
+    let wrong_workspace = apply_command(
+        &record.review_id,
+        &alternate_workspace,
+        &state,
+        &["--acknowledge-conflicts", "--acknowledge-unresolved"],
+    )?;
+    ensure!(!wrong_workspace.status.success());
+    ensure!(String::from_utf8_lossy(&wrong_workspace.stderr).contains("was created for workspace"));
+    ensure!(!alternate_workspace.join("accepted.txt").exists());
+
+    let lock_relative = format!("reviews/{}/apply.lock", record.review_id);
+    store.write_run_file(&summary.run_id, &lock_relative, b"interrupted fixture\n")?;
+    let locked = apply_command(
+        &record.review_id,
+        &workspace,
+        &state,
+        &["--acknowledge-conflicts", "--acknowledge-unresolved"],
+    )?;
+    ensure!(!locked.status.success());
+    ensure!(
+        String::from_utf8_lossy(&locked.stderr).contains("already in progress or was interrupted")
+    );
+    ensure!(!workspace.join("accepted.txt").exists());
+    fs::remove_file(
+        state
+            .join("runs")
+            .join(&summary.run_id)
+            .join(&lock_relative),
+    )?;
+
+    let applied = apply_command(
+        &record.review_id,
+        &workspace,
+        &state,
+        &[
+            "--acknowledge-conflicts",
+            "--acknowledge-unresolved",
+            "--json",
+        ],
+    )?;
+    ensure!(
+        applied.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    ensure!(
+        String::from_utf8_lossy(&applied.stderr)
+            .contains("applying only receipt-authorized workspace paths")
+    );
+    let apply_record: ApplyRecord = serde_json::from_slice(&applied.stdout)?;
+    ensure!(apply_record.schema_version == "agentlab.apply/v1");
+    ensure!(apply_record.review_id == record.review_id);
+    ensure!(apply_record.review_digest == record.digest);
+    ensure!(apply_record.before_workspace_snapshot_digest == current_before);
+    ensure!(
+        apply_record.intended_workspace_snapshot_digest
+            == apply_record.after_workspace_snapshot_digest
+    );
+    ensure!(apply_record.source_workspace_matched_review);
+    ensure!(apply_record.result_workspace_verified);
+    ensure!(apply_record.acknowledged_conflicts);
+    ensure!(apply_record.acknowledged_unresolved);
+    ensure!(apply_record.counts.proposed == 1);
+    ensure!(apply_record.counts.rejected == 1);
+    ensure!(apply_record.counts.conflicted == 1);
+    ensure!(apply_record.counts.unresolved == 1);
+    ensure!(apply_record.counts.applied == 1);
+    ensure!(apply_record.operations.len() == 1);
+    ensure!(apply_record.operations[0].operation == "replace");
+    ensure!(apply_record.operations[0].path == "accepted.txt");
+    ensure!(fs::read_to_string(workspace.join("accepted.txt"))? == "candidate accepted\n");
+    ensure!(fs::read_to_string(workspace.join("reject.txt"))? == "base reject\n");
+    ensure!(fs::read_to_string(workspace.join("conflict.txt"))? == "current conflict\n");
+    ensure!(fs::read_to_string(workspace.join("current-only.txt"))? == "current work\n");
+    ensure!(!workspace.join("etc/agentlab-review.conf").exists());
+    let applied_snapshot = snapshot::create(&workspace, &store)?.manifest;
+    ensure!(applied_snapshot.digest == apply_record.after_workspace_snapshot_digest);
+
+    let backup_bytes = store.read_run_file(&summary.run_id, &apply_record.backup_artifact.path)?;
+    let backup: agentlab::snapshot::Manifest = serde_json::from_slice(&backup_bytes)?;
+    ensure!(backup.digest == current_before);
+    let recovery = temporary.path().join("recovery");
+    snapshot::materialize(&store, &backup, &recovery)?;
+    ensure!(!recovery.join("accepted.txt").exists());
+    ensure!(fs::read_to_string(recovery.join("current-only.txt"))? == "current work\n");
+
+    apply::verify(&store, &apply_record)?;
+    let apply_records = apply::list(&store, &summary.run_id)?;
+    ensure!(apply_records.as_slice() == std::slice::from_ref(&apply_record));
+    store.write_run_file(&summary.run_id, &apply_record.backup_artifact.path, b"{}\n")?;
+    ensure!(apply::verify(&store, &apply_record).is_err());
+    store.write_run_file(
+        &summary.run_id,
+        &apply_record.backup_artifact.path,
+        &backup_bytes,
+    )?;
+    apply::verify(&store, &apply_record)?;
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .args(["inspect", "--verify", &summary.run_id])
+        .env("AGENTLAB_STATE_DIR", &state)
+        .output()?;
+    ensure!(
+        inspect.status.success(),
+        "inspect --verify failed: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    ensure!(String::from_utf8_lossy(&inspect.stdout).contains("Reviews: 1"));
+    ensure!(String::from_utf8_lossy(&inspect.stdout).contains("Applications: 1"));
+
+    let repeated = apply_command(
+        &record.review_id,
+        &workspace,
+        &state,
+        &["--acknowledge-conflicts", "--acknowledge-unresolved"],
+    )?;
+    ensure!(!repeated.status.success());
+    ensure!(
+        String::from_utf8_lossy(&repeated.stderr).contains("already has an accepted apply record")
+    );
     Ok(())
+}
+
+fn apply_command(
+    review_id: &str,
+    workspace: &std::path::Path,
+    state: &std::path::Path,
+    options: &[&str],
+) -> Result<std::process::Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentlab"));
+    command.arg("apply");
+    command.args(options);
+    command.arg(review_id).arg("--workspace").arg(workspace);
+    command.env("AGENTLAB_STATE_DIR", state);
+    Ok(command.output()?)
 }
 
 fn initialize_repository(workspace: &std::path::Path) -> Result<()> {

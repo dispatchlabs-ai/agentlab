@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::apply::{self, ApplyOptions};
 use crate::build_version;
 use crate::evaluation;
 use crate::lifecycle;
@@ -48,6 +49,7 @@ fn execute(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Writ
         "evaluate" => evaluate_command(&arguments[1..], stdout),
         "report" => report_command(&arguments[1..], stdout),
         "review" => review_command(&arguments[1..], stdout, stderr),
+        "apply" => apply_command(&arguments[1..], stdout, stderr),
         "list" => list_command(&arguments[1..], stdout),
         "stop" => stop_command(&arguments[1..], stdout),
         "resume" => resume_command(&arguments[1..], stdout),
@@ -131,6 +133,7 @@ fn review_command(
     writeln!(stdout, "Review: {}", record.review_id)?;
     writeln!(stdout, "Run: {}", record.run_id)?;
     writeln!(stdout, "Receipt: {}", record.digest)?;
+    writeln!(stdout, "Current workspace: {}", record.source_workspace)?;
     writeln!(
         stdout,
         "Base workspace: {}",
@@ -180,6 +183,12 @@ fn review_command(
         "Inspect: agentlab inspect --verify {}",
         record.run_id
     )?;
+    writeln!(
+        stdout,
+        "Apply (mutates workspace): agentlab apply {} --workspace {}",
+        record.review_id,
+        shell_word(&record.source_workspace)
+    )?;
     Ok(())
 }
 
@@ -187,6 +196,115 @@ fn print_review_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
         "AgentLab review\n\nAsk a trusted command-line reviewer which changes from a run are worth carrying forward. AgentLab records the proposal and applies nothing.\n\nUsage:\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nArguments:\n  RUN                       Completed AgentLab run to review\n  --workspace CURRENT       Current host workspace to compare with the run\n  --json                    Write the complete review receipt as JSON\n  -- COMMAND [ARG ...]      Trusted reviewer command and its arguments\n\nExample:\n  agentlab review RUN_ID --workspace ./project -- ./pi-review.sh\n\nThe reviewer receives private base, candidate, and current workspace copies plus the complete machine delta. It runs on the host with your permissions and may see sensitive captured content. AgentLab validates and records its JSON proposal, rechecks that the source workspace did not change, and applies nothing."
+    )?;
+    Ok(())
+}
+
+fn apply_command(
+    arguments: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    if arguments.is_empty()
+        || arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        print_apply_help(stdout)?;
+        return Ok(());
+    }
+    let mut review_id = None;
+    let mut workspace = None;
+    let mut acknowledge_conflicts = false;
+    let mut acknowledge_unresolved = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--workspace" => {
+                workspace = Some(PathBuf::from(required_value(
+                    arguments,
+                    &mut index,
+                    "--workspace",
+                )?))
+            }
+            "--acknowledge-conflicts" => acknowledge_conflicts = true,
+            "--acknowledge-unresolved" => acknowledge_unresolved = true,
+            "--json" => json = true,
+            value if value.starts_with('-') => bail!("unexpected apply argument {value:?}"),
+            value if review_id.is_none() => review_id = Some(value.to_owned()),
+            value => bail!("unexpected apply argument {value:?}"),
+        }
+        index += 1;
+    }
+    let review_id = review_id.ok_or_else(|| anyhow::anyhow!("apply requires REVIEW_ID"))?;
+    let workspace =
+        workspace.ok_or_else(|| anyhow::anyhow!("apply requires --workspace CURRENT"))?;
+    writeln!(
+        stderr,
+        "AgentLab: applying only receipt-authorized workspace paths; the current workspace must exactly match the reviewed state, and a complete backup snapshot will be retained."
+    )?;
+    stderr.flush()?;
+    let store = Store::open(None)?;
+    let record = apply::apply(
+        &store,
+        &ApplyOptions {
+            review_id,
+            workspace,
+            acknowledge_conflicts,
+            acknowledge_unresolved,
+        },
+    )?;
+    if json {
+        serde_json::to_writer_pretty(&mut *stdout, &record)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+    writeln!(stdout, "Apply: {}", record.apply_id)?;
+    writeln!(stdout, "Review: {}", record.review_id)?;
+    writeln!(stdout, "Run: {}", record.run_id)?;
+    writeln!(stdout, "Receipt: {}", record.digest)?;
+    writeln!(
+        stdout,
+        "Before workspace: {}",
+        record.before_workspace_snapshot_digest
+    )?;
+    writeln!(
+        stdout,
+        "After workspace: {}",
+        record.after_workspace_snapshot_digest
+    )?;
+    writeln!(
+        stdout,
+        "Applied workspace operations: {}",
+        record.counts.applied
+    )?;
+    for operation in &record.operations {
+        writeln!(stdout, "  {:<7} {}", operation.operation, operation.path)?;
+    }
+    writeln!(
+        stdout,
+        "Acknowledged candidates: {} conflicted, {} unresolved",
+        record.counts.conflicted, record.counts.unresolved
+    )?;
+    writeln!(
+        stdout,
+        "Backup snapshot: {}",
+        record.before_workspace_snapshot_digest
+    )?;
+    writeln!(stdout, "Result workspace verified: true")?;
+    writeln!(
+        stdout,
+        "Inspect: agentlab inspect --verify {}",
+        record.run_id
+    )?;
+    Ok(())
+}
+
+fn print_apply_help(stdout: &mut dyn Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "AgentLab apply\n\nApply only the workspace operations authorized by one immutable review receipt. This command mutates the selected host workspace.\n\nUsage:\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n\nArguments:\n  REVIEW_ID                    Review receipt to apply exactly once\n  --workspace CURRENT          Host workspace that was captured by the review\n  --acknowledge-conflicts      Acknowledge conflicted candidates without applying them\n  --acknowledge-unresolved     Acknowledge unresolved candidates without applying them\n  --json                       Write the complete apply receipt as JSON\n\nExample:\n  agentlab apply REVIEW_ID --workspace ./project --acknowledge-conflicts --acknowledge-unresolved\n\nThe current workspace must exactly match the snapshot anchored by the review. AgentLab privately stages the authorized result, retains a complete recoverable before snapshot, changes no rejected/conflicted/unresolved or environment path, verifies the exact after snapshot, and rejects a second apply from the same review."
     )?;
     Ok(())
 }
@@ -843,6 +961,18 @@ fn display_names(names: &[String]) -> String {
     }
 }
 
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.:".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
 fn snapshot_command(
     arguments: &[String],
     stdout: &mut dyn Write,
@@ -1004,6 +1134,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 lifecycle::verify_all(&store, digest)?;
                 evaluation::verify_all(&store, digest)?;
                 review::verify_all(&store, digest)?;
+                apply::verify_all(&store, digest)?;
             }
             if json {
                 serde_json::to_writer_pretty(&mut *stdout, &fork)?;
@@ -1042,6 +1173,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             lifecycle::verify_all(&store, digest)?;
             evaluation::verify_all(&store, digest)?;
             review::verify_all(&store, digest)?;
+            apply::verify_all(&store, digest)?;
         }
         if json {
             serde_json::to_writer_pretty(&mut *stdout, &result)?;
@@ -1075,6 +1207,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             evaluation::list(&store, digest)?.len()
         )?;
         writeln!(stdout, "Reviews: {}", review::list(&store, digest)?.len())?;
+        writeln!(
+            stdout,
+            "Applications: {}",
+            apply::list(&store, digest)?.len()
+        )?;
         for warning in &result.warnings {
             writeln!(stdout, "Warning: {warning}")?;
         }
@@ -1174,7 +1311,21 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, evaluation, and review metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and does not apply its proposal. Filesystem state survives stop/resume; process trees and live memory do not. Evaluator scores are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run --image IMAGE [--workspace PATH | --snapshot DIGEST] [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] SNAPSHOT_OR_RUN\n  agentlab diff [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a newly captured or stored workspace snapshot\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshot, run, fork, lifecycle, evaluation, review, and apply metadata\n  diff        show normalized persistent filesystem changes\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete exactly one run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores are observations, not universal judgments."
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_word;
+
+    #[test]
+    fn follow_up_workspace_paths_are_shell_safe() {
+        assert_eq!(shell_word("/tmp/plain-workspace"), "/tmp/plain-workspace");
+        assert_eq!(
+            shell_word("/tmp/Chris's workspace"),
+            "'/tmp/Chris'\"'\"'s workspace'"
+        );
+    }
 }

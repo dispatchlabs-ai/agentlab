@@ -1,6 +1,6 @@
 # AgentLab Specification
 
-Status: Milestones 1–5 plus Milestone 6 review-only working contract
+Status: Milestones 1–6 working contract
 Snapshot schema: `agentlab.snapshot/v1`
 Run schema: `agentlab.run/v2` (`agentlab.run/v1` read compatibility)
 Run-input schema: `agentlab.run-input/v1`
@@ -13,6 +13,7 @@ Evaluation schema: `agentlab.evaluation/v1`
 Review request schema: `agentlab.review-request/v1`
 Review proposal schema: `agentlab.review-proposal/v1`
 Review record schema: `agentlab.review/v1`
+Apply record schema: `agentlab.apply/v1`
 
 ## 1. Scope
 
@@ -24,7 +25,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained filesystem state and harness-level continuation. Milestone 5 records observations from arbitrary external evaluators. The review-only phase of Milestone 6 records a trusted external reviewer's anchored proposal without applying it. None defines a workspace layout, repository registry, harness integration, authoritative evaluator, automatic apply process, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
+Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained filesystem state and harness-level continuation. Milestone 5 records observations from arbitrary external evaluators. Milestone 6 records a trusted external reviewer's anchored proposal without applying it and provides a separate receipt-bound command for explicitly applying its authorized workspace operations. None defines a workspace layout, repository registry, harness integration, authoritative evaluator, automatic apply process, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
 
 The selected workspace is opaque user content. Names such as `AGENTS.md`, `MEMORY.md`, `repos/`, `skills/`, and `worktrees/` have no meaning to the snapshot protocol.
 
@@ -253,10 +254,31 @@ The reviewer receives absolute environment paths for the versioned request; run 
 
 Successful reviewer stdout MUST be exactly one `agentlab.review-proposal/v1` JSON object. It copies the request review ID and anchors exactly and contains one disposition for every candidate path. Each disposition is `proposed`, `rejected`, `conflicted`, or `unresolved`, has a nonempty reason, and contributes to exact reconciled counts. Duplicate, missing, extra, incorrectly anchored, or inconsistently counted dispositions are invalid. An optional workspace operation is allowed only on a proposed workspace candidate, uses its exact safe relative path, and is `delete` for a deletion or `replace` for any other change. Environment paths never receive workspace operations; a proposed environment path requires a declarative recommendation.
 
-After the reviewer exits, AgentLab re-verifies immutable run and review inputs and freshly snapshots CURRENT again. It accepts a receipt only if the source workspace identity is unchanged. `agentlab.review/v1` stores the request and validated proposal, reviewer timing and exit status, exact stdout/stderr and canonical request/proposal artifacts, source-unchanged and `agentlab_applied_changes: false` declarations, warnings, and integrity hashes. `agentlab inspect --verify RUN` verifies every accepted review.
+After the reviewer exits, AgentLab re-verifies immutable run and review inputs and freshly snapshots CURRENT again. It accepts a receipt only if the source workspace identity is unchanged. `agentlab.review/v1` stores the canonical absolute source-workspace path, request and validated proposal, reviewer timing and exit status, exact stdout/stderr and canonical request/proposal artifacts, source-unchanged and `agentlab_applied_changes: false` declarations, warnings, and integrity hashes. `agentlab inspect --verify RUN` verifies every accepted review.
 
 The reviewer is a trusted host process with the invoking user's full authority and may see sensitive captured material. Review-only means AgentLab does not apply the proposal; it cannot prevent the reviewer from affecting other host resources. The supplied Pi wrapper deliberately disables sessions, extensions, skills, prompt templates, and mutating built-in tools, but that wrapper is convenience rather than a security boundary.
 
-## 15. Current boundary
+## 15. Receipt-bound application
 
-AgentLab does not yet apply a review proposal or provide another backend. The host workspace is mutable developer state, not an AgentLab-owned golden copy; a future accepted baseline is a reference to reviewed immutable input/result lineage. Workspace treatments are ordinary host changes captured as new snapshots. A treatment outside the workspace is currently prepared through the backend—for example, by committing a changed Docker container as a new image—and supplied by immutable image identity. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.
+`agentlab apply REVIEW_ID --workspace CURRENT` is the only operation in Milestone 6 that authorizes AgentLab to mutate the selected host workspace. The review ID resolves to exactly one integrity-verified `agentlab.review/v1` record. A review accepts at most one successful apply. Concurrent or interrupted attempts are serialized by an exclusive per-review lock; an interrupted lock is an explicit recovery condition rather than permission to guess or retry automatically.
+
+Before changing the source, apply MUST:
+
+1. Reject a review with conflicted candidates unless `--acknowledge-conflicts` is explicit.
+2. Reject a review with unresolved candidates unless `--acknowledge-unresolved` is explicit.
+3. Interpret those flags only as acknowledgement; conflicted, unresolved, rejected, and non-workspace paths remain unapplied.
+4. Resolve CURRENT to the same absolute host path recorded by the review, freshly snapshot it, and require exact identity with the review's anchored current-workspace snapshot.
+5. Load and verify the anchored candidate-workspace snapshot and ensure every operation still agrees with candidate presence or deletion.
+6. Materialize the complete reviewed current snapshot privately, apply only proposed workspace operations there, and snapshot the intended result.
+7. Snapshot CURRENT again immediately before the first write and reject any intervening source change.
+8. Retain the canonical complete before-workspace manifest and all of its content-addressed blobs as recovery evidence.
+
+Apply performs only exact relative `replace` and `delete` operations authorized by the receipt. It MUST reject traversal and parent-symlink escape, MUST NOT recursively remove directory content absent corresponding reviewed operations, and MUST NOT copy environment paths. Directory creation and mode restoration may support exact authorized child operations, but missing unreviewed parents are not synthesized. If a path-scoped write fails or the resulting snapshot differs from the privately staged identity, AgentLab attempts to restore every authorized path from the before snapshot and reports whether rollback succeeded. A process interruption may require recovery from the retained before snapshot; it must not be silently retried.
+
+`agentlab.apply/v1` records a unique apply ID; exact review, run, and result identities; absolute selected workspace path; timestamps; explicit conflict/unresolved acknowledgements; reconciled proposed/rejected/conflicted/unresolved/applied counts; exact authorized operations; before, privately intended, and actual after snapshot identities; the canonical backup-manifest artifact; required source-match and result-verification declarations; warnings; and integrity hashes. Intended and actual after identities MUST match. `agentlab inspect --verify RUN` verifies all accepted apply records, referenced review receipts, snapshots, and backup bytes. A second apply for the same review is rejected.
+
+Human-readable review currently reports every disposition, reason, recommendation, operation, and path. A future terminal diff MAY add unified or side-by-side, colorized base/candidate/current and before/after content views, including binary, type, and mode changes. Diff rendering is a read-only projection over immutable records and MUST NOT become an alternative authorization channel or change apply semantics.
+
+## 16. Current boundary
+
+The host workspace is mutable developer state, not an AgentLab-owned golden copy; a future accepted baseline is a reference to reviewed immutable input/result lineage. Workspace treatments are ordinary host changes captured as new snapshots. A treatment outside the workspace is currently prepared through the backend—for example, by committing a changed Docker container as a new image—and supplied by immutable image identity. Apply deliberately leaves environment recommendations unapplied. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.

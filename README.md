@@ -12,7 +12,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestones 1 through 5 and the review-only phase of Milestone 6 implement deterministic workspace snapshots, isolated and comparable direct-Docker execution, retained filesystem lifecycle, external evaluation, and optional three-state review. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, records a portable whole-root-filesystem delta without mounting the source workspace, can later stop, continue, fork, inspect, or remove that state, lets arbitrary external commands attach structured observations without turning any score into a universal judgment, and can ask a trusted command-line reviewer which changes are worth carrying forward without applying its proposal.
+Milestones 1 through 6 implement deterministic workspace snapshots, isolated and comparable direct-Docker execution, retained filesystem lifecycle, external evaluation, optional three-state review, and explicit receipt-bound application. AgentLab reconstructs the snapshot in private container storage, runs one opaque command, records a portable whole-root-filesystem delta without mounting the source workspace, can later stop, continue, fork, inspect, or remove that state, lets arbitrary external commands attach structured observations without turning any score into a universal judgment, and can ask a trusted command-line reviewer which changes are worth carrying forward before applying only the authorized workspace paths.
 
 ## Current capabilities
 
@@ -41,6 +41,7 @@ Milestones 1 through 5 and the review-only phase of Milestone 6 implement determ
 - Invokes arbitrary external evaluators against integrity-checked results and records their command, output, status, stdout/stderr, and named JSON observations.
 - Aligns actual run-input, workspace, image, portable-base identities, and evaluator score names into Markdown or JSON rows without aggregation, ranking, statistics, or causal claims.
 - Constructs immutable base/candidate/current review bundles, exposes actual changed-machine content to any trusted command-line reviewer, validates complete proposed/rejected/conflicted/unresolved dispositions, and records a proposal without applying it.
+- Applies one review receipt only when the host workspace still exactly matches the reviewed current snapshot, requires explicit acknowledgement of conflicts or unresolved candidates, privately stages the result, retains a complete before snapshot, changes only proposed workspace operations, rolls back path-scoped failures, and verifies the exact after snapshot.
 
 AgentLab does not attempt to make a transactionally consistent snapshot of a workspace that is being modified concurrently. It detects changes to regular files while reading them and asks the user to retry from a stable source.
 
@@ -261,7 +262,29 @@ Successful stdout must be one `agentlab.review-proposal/v1` JSON object. It must
 
 [examples/reviewers/pi-review.sh](examples/reviewers/pi-review.sh) is a thin Pi adapter using noninteractive, no-session, read-only built-in tools. It uses the host's ordinary Pi authentication. Set `AGENTLAB_PI_MODEL` or `AGENTLAB_PI_THINKING` to choose a model or thinking level. The core protocol remains harness-neutral; replace that script with any command that emits the required JSON.
 
-Review mode means AgentLab itself applies no changes. It re-snapshots the selected source after the reviewer and accepts a receipt only when the source identity is unchanged, but an arbitrary host command is still trusted and cannot be sandboxed by this promise. Explicit receipt-bound apply, stale-current rejection, backups, and after-snapshot verification remain the next Milestone 6 phase.
+Review mode means AgentLab itself applies no changes. It re-snapshots the selected source after the reviewer and accepts a receipt only when the source identity is unchanged, but an arbitrary host command is still trusted and cannot be sandboxed by this promise.
+
+Apply one accepted review explicitly:
+
+```bash
+agentlab apply \
+  REVIEW_ID \
+  --workspace /path/to/current-workspace
+```
+
+The selected path must resolve to the same host workspace recorded by the review, and its contents must still match the exact current snapshot captured there. By default, apply stops if the proposal contains any `conflicted` or `unresolved` candidate. A deliberate partial application acknowledges those untouched candidates explicitly:
+
+```bash
+agentlab apply \
+  REVIEW_ID \
+  --workspace /path/to/current-workspace \
+  --acknowledge-conflicts \
+  --acknowledge-unresolved
+```
+
+Those flags do not apply conflicted or unresolved paths; they authorize AgentLab to continue with only the proposal's `proposed` workspace operations. Rejected paths and all environment paths remain untouched. AgentLab permits one accepted apply per review, privately stages the exact intended result, takes a complete content-addressed before snapshot, serializes concurrent attempts, applies only exact relative paths without recursively deleting unreviewed directory content, verifies the resulting snapshot, and records `agentlab.apply/v1`. If a path-scoped operation fails, AgentLab attempts to restore every authorized path from the before snapshot. An interrupted apply leaves an exclusive lock and backup evidence so a later invocation does not guess whether it is safe to continue.
+
+The current human output deliberately emphasizes disposition, reason, operation, path, and exact snapshot identity. A polished terminal diff remains planned: it should offer an excellent unified or side-by-side view over immutable base/candidate/current and before/after content, with color and binary/type/mode handling. That renderer will be a read-only view; review receipts—not presentation output—remain the authority for apply.
 
 ## Local state
 
@@ -286,7 +309,7 @@ AgentLab stores manifests and blobs in a user-private directory:
 
 Set `AGENTLAB_STATE_DIR` to use a different state location, which is especially useful for tests and disposable demonstrations. Generated snapshot content is never written into the selected source workspace by default.
 
-Inspection is metadata-only by default. Captured file contents remain sensitive even though this milestone does not provide a command that prints them.
+Inspection is metadata-only by default. Captured file contents remain sensitive even though the current CLI does not print them by default.
 
 ## Development
 
@@ -303,7 +326,7 @@ cargo test --test milestone5 -- --ignored --nocapture
 cargo test --test milestone6 -- --ignored --nocapture
 ```
 
-The ordinary test suite covers deterministic snapshots and proposal validation without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity. The Milestone 3 Docker test launches overlapping runs from one stored Alpine-backed snapshot, forces conflicting writes, and proves distinct writable layers, equal run-input identities, comparable repetition, different private outcomes, and an unchanged source. The Milestone 4 test proves stable stop/start identity, session continuation and refreshed capture, full-rootfs continuation evidence, filesystem fork divergence, explicit memory disclaimers, and exact deletion while an unrelated control container survives. The Milestone 5 test creates real workspace snapshots without and with a skill directory, repeats each immutable input twice, runs a supplied external evaluator, verifies every evaluation, records invalid output explicitly, produces identity-and-score tables, and preserves source immutability. The Milestone 6 review-only test advances a current Git workspace independently, invokes a reviewer through the public command adapter, validates all four dispositions across workspace and machine changes, verifies the immutable receipt, and proves AgentLab applied nothing.
+The ordinary test suite covers deterministic snapshots, proposal validation, exact path application, unreviewed-directory protection, and rollback without requiring Docker. The explicitly invoked Milestone 2 conformance test uses `ubuntu:24.04` and a disposable workspace to prove whole-machine capture, package changes, repository commits, ignore behavior, source immutability, retained-container inspection, nonzero exit preservation, and result integrity. The Milestone 3 Docker test launches overlapping runs from one stored Alpine-backed snapshot, forces conflicting writes, and proves distinct writable layers, equal run-input identities, comparable repetition, different private outcomes, and an unchanged source. The Milestone 4 test proves stable stop/start identity, session continuation and refreshed capture, full-rootfs continuation evidence, filesystem fork divergence, explicit memory disclaimers, and exact deletion while an unrelated control container survives. The Milestone 5 test creates real workspace snapshots without and with a skill directory, repeats each immutable input twice, runs a supplied external evaluator, verifies every evaluation, records invalid output explicitly, produces identity-and-score tables, and preserves source immutability. The Milestone 6 test advances a current Git workspace independently, validates review-only behavior and all four dispositions, blocks unacknowledged conflicts and unresolved paths, rejects stale current state, applies only one authorized workspace file, proves rejected/conflicted/environment paths stayed untouched, materializes the complete backup, detects backup tampering, verifies the apply receipt, and rejects repeated application.
 
 Lifecycle-capable images currently need `/bin/sh`, `sleep`, and `/bin/true`; typical Ubuntu, Alpine, and agent-development images satisfy this. Minimal `scratch`-style images fail explicitly because AgentLab cannot keep a stable supervisor inside them.
 

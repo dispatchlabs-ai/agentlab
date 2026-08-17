@@ -266,6 +266,7 @@ fn every_public_command_has_useful_help_without_side_effects() {
         ("evaluate", "trusted host command"),
         ("report", "agentlab report"),
         ("review", "applies nothing"),
+        ("apply", "mutates the selected host workspace"),
         ("stop", "agentlab stop"),
         ("resume", "--pi-auth"),
         ("fork", "agentlab fork"),
@@ -323,6 +324,25 @@ fn review_errors_explain_the_missing_part_of_the_command() {
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(expected),
             "unexpected review error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for (arguments, expected) in [
+        (
+            vec!["apply", "--workspace", "."],
+            "apply requires REVIEW_ID",
+        ),
+        (
+            vec!["apply", "00000000-0000-4000-8000-000000000000"],
+            "apply requires --workspace CURRENT",
+        ),
+    ] {
+        let output = Command::new(binary).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "unexpected apply error: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

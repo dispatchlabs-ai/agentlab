@@ -113,6 +113,7 @@ pub struct ReviewRecord {
     pub review_id: String,
     pub run_id: String,
     pub result_digest: String,
+    pub source_workspace: String,
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub reviewer_exit_code: i64,
@@ -134,6 +135,7 @@ struct ReviewIdentity<'a> {
     review_id: &'a str,
     run_id: &'a str,
     result_digest: &'a str,
+    source_workspace: &'a str,
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     reviewer_exit_code: i64,
@@ -171,7 +173,13 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         bail!("candidate root filesystem does not match selected run result");
     }
 
-    let current_before = snapshot::create(&options.workspace, store)?.manifest;
+    let current_capture = snapshot::create(&options.workspace, store)?;
+    let source_workspace = current_capture
+        .workspace
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("source workspace path is not valid UTF-8"))?;
+    let current_before = current_capture.manifest;
     let review_id = Uuid::new_v4().to_string();
     let bundle = tempfile::tempdir().context("create private review bundle")?;
     let base_directory = bundle.path().join("base");
@@ -359,6 +367,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         review_id: &review_id,
         run_id: &options.run_id,
         result_digest: &result.digest,
+        source_workspace: &source_workspace,
         started_at,
         completed_at,
         reviewer_exit_code: exit_code,
@@ -379,6 +388,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         review_id,
         run_id: options.run_id.clone(),
         result_digest: result.digest,
+        source_workspace,
         started_at,
         completed_at,
         reviewer_exit_code: exit_code,
@@ -455,6 +465,27 @@ pub fn list(store: &Store, run_id: &str) -> Result<Vec<ReviewRecord>> {
     Ok(records)
 }
 
+pub fn find(store: &Store, review_id: &str) -> Result<ReviewRecord> {
+    Uuid::parse_str(review_id).context("review ID is not a UUID")?;
+    let mut found = None;
+    let relative = format!("reviews/{review_id}/review.json");
+    for run_id in store.list_run_ids()? {
+        if !store.run_file_exists(&run_id, &relative)? {
+            continue;
+        }
+        let record: ReviewRecord =
+            serde_json::from_slice(&store.read_run_file(&run_id, &relative)?)?;
+        if record.review_id != review_id {
+            bail!("review path and record ID do not agree");
+        }
+        if found.is_some() {
+            bail!("review ID {review_id:?} is not unique");
+        }
+        found = Some(record);
+    }
+    found.with_context(|| format!("review {review_id:?} not found"))
+}
+
 pub fn verify_all(store: &Store, run_id: &str) -> Result<()> {
     for record in list(store, run_id)? {
         verify(store, &record)?;
@@ -472,6 +503,9 @@ pub fn verify(store: &Store, record: &ReviewRecord) -> Result<()> {
         || record.proposal.review_id != record.review_id
     {
         bail!("review record fields do not agree with request/proposal anchors");
+    }
+    if !Path::new(&record.source_workspace).is_absolute() {
+        bail!("review record source workspace path is not absolute");
     }
     for (relative, expected) in &record.integrity {
         let actual = run::sha256_bytes(&store.read_run_file(&record.run_id, relative)?);
@@ -494,6 +528,7 @@ pub fn verify(store: &Store, record: &ReviewRecord) -> Result<()> {
         review_id: &record.review_id,
         run_id: &record.run_id,
         result_digest: &record.result_digest,
+        source_workspace: &record.source_workspace,
         started_at: record.started_at,
         completed_at: record.completed_at,
         reviewer_exit_code: record.reviewer_exit_code,

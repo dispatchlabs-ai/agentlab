@@ -133,7 +133,7 @@ Run the case explicitly:
 cargo test --test milestone5 -- --ignored --nocapture
 ```
 
-## Milestone 6: review proposals
+## Milestone 6: review and receipt-bound apply
 
 The Docker-gated fixture runs from an immutable Git workspace, creates three candidate workspace changes plus one `/etc` change, and then independently advances the current host workspace. Through the public CLI it invokes a deterministic reviewer command using the same adapter contract available to Pi or any other command-line harness. It proves:
 
@@ -145,6 +145,15 @@ The Docker-gated fixture runs from an immutable Git workspace, creates three can
 6. Duplicate, omitted, traversing, incorrectly anchored, and inconsistently counted proposals fail semantic validation.
 7. The canonical request, proposal, exact reviewer stdout/stderr, receipt identity, and all artifacts pass independent verification and `agentlab inspect --verify`.
 8. The current source snapshot is identical before and after review; current-only work remains, the proposed file is absent, the rejected file is unchanged, and AgentLab explicitly records that it applied nothing.
+9. Apply without `--acknowledge-conflicts` is rejected, and acknowledging conflicts alone still rejects the unresolved environment candidate; neither attempt changes the workspace.
+10. Advancing the current workspace after review causes stale-current rejection even with both acknowledgements, and restoring the exact reviewed content restores eligibility.
+11. A byte-identical copy at another path remains unauthorized because it is not the host workspace selected during review.
+12. An existing per-review apply lock is treated as an active or interrupted operation and blocks mutation until explicitly recovered.
+13. The successful apply changes only the one proposed workspace file. Rejected and conflicted files, independent current-only work, and the non-workspace recommendation remain untouched.
+14. The apply receipt reconciles all four review dispositions with exactly one applied workspace operation, anchors equal privately intended and actual after snapshots, and verifies through `agentlab inspect --verify`.
+15. The canonical complete before-workspace manifest materializes as a usable recovery copy; intentional backup tampering is detected, and restored bytes verify again.
+16. A second apply using the same review receipt is rejected.
+17. Unit coverage additionally proves exact replacement/deletion while preserving unauthorized paths and successful rollback when a later path would require recursively deleting unreviewed directory content.
 
 Run the case explicitly:
 
@@ -152,4 +161,4 @@ Run the case explicitly:
 cargo test --test milestone6 -- --ignored --nocapture
 ```
 
-The explicit receipt-bound apply phase remains unimplemented. Later suites cover stale-current apply protection, the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints remain in `agentlab-plan.md` until implemented.
+Later suites cover the baseline-to-improved-run loop, backend capability equivalence, and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints remain in `agentlab-plan.md` until implemented.
