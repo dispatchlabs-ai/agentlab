@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -19,12 +21,27 @@ use crate::store::{Store, create_new_file, normalize_digest};
 pub const REVIEW_REQUEST_SCHEMA_VERSION: &str = "agentlab.review-request/v1";
 pub const REVIEW_PROPOSAL_SCHEMA_VERSION: &str = "agentlab.review-proposal/v1";
 pub const REVIEW_SCHEMA_VERSION: &str = "agentlab.review/v1";
+pub const REVIEW_ATTEMPT_SCHEMA_VERSION: &str = "agentlab.review-attempt/v1";
+
+const REVIEWER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct ReviewOptions {
     pub run_id: String,
     pub workspace: PathBuf,
     pub reviewer_command: Vec<String>,
+}
+
+pub trait ReviewObserver {
+    fn stage(&mut self, message: &str) -> io::Result<()>;
+}
+
+struct SilentReviewObserver;
+
+impl ReviewObserver for SilentReviewObserver {
+    fn stage(&mut self, _message: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,8 +119,17 @@ pub struct ReviewProposal {
     pub anchors: ReviewAnchors,
     pub counts: DispositionCounts,
     pub dispositions: Vec<ReviewDisposition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<DeclarativeRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeclarativeRecommendation {
+    pub target: String,
+    pub recommendation: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,6 +149,41 @@ pub struct ReviewRecord {
     pub proposal_artifact: Artifact,
     pub stdout: Artifact,
     pub stderr: Artifact,
+    pub source_workspace_unchanged: bool,
+    pub agentlab_applied_changes: bool,
+    pub warnings: Vec<String>,
+    pub integrity: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewerInvocation {
+    pub attempt: usize,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub exit_code: i64,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_error: Option<String>,
+    pub stdout: Artifact,
+    pub stderr: Artifact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewAttemptRecord {
+    pub schema_version: String,
+    pub digest: String,
+    pub review_id: String,
+    pub run_id: String,
+    pub result_digest: String,
+    pub source_workspace: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    pub request: ReviewRequest,
+    pub request_artifact: Artifact,
+    pub invocations: Vec<ReviewerInvocation>,
     pub source_workspace_unchanged: bool,
     pub agentlab_applied_changes: bool,
     pub warnings: Vec<String>,
@@ -151,10 +212,42 @@ struct ReviewIdentity<'a> {
     integrity: &'a BTreeMap<String, String>,
 }
 
+#[derive(Serialize)]
+struct ReviewAttemptIdentity<'a> {
+    schema_version: &'a str,
+    review_id: &'a str,
+    run_id: &'a str,
+    result_digest: &'a str,
+    source_workspace: &'a str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    status: &'a str,
+    failure: &'a Option<String>,
+    request: &'a ReviewRequest,
+    request_artifact: &'a Artifact,
+    invocations: &'a [ReviewerInvocation],
+    source_workspace_unchanged: bool,
+    agentlab_applied_changes: bool,
+    warnings: &'a [String],
+    integrity: &'a BTreeMap<String, String>,
+}
+
 pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
+    review_with_observer(store, options, &mut SilentReviewObserver)
+}
+
+pub fn review_with_observer(
+    store: &Store,
+    options: &ReviewOptions,
+    observer: &mut dyn ReviewObserver,
+) -> Result<ReviewRecord> {
     if options.reviewer_command.is_empty() {
         bail!("review requires a reviewer command after `--`");
     }
+    report_stage(
+        observer,
+        "Preparing trusted host reviewer; verifying immutable run and prior review evidence",
+    )?;
     let reviewer_command = resolve_reviewer_command(&options.reviewer_command)?;
     lifecycle::verify_all(store, &options.run_id)?;
     evaluation::verify_all(store, &options.run_id)?;
@@ -173,6 +266,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         bail!("candidate root filesystem does not match selected run result");
     }
 
+    report_stage(observer, "Capturing the current host workspace")?;
     let current_capture = snapshot::create(&options.workspace, store)?;
     let source_workspace = current_capture
         .workspace
@@ -186,6 +280,10 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
     let candidate_directory = bundle.path().join("candidate");
     let current_directory = bundle.path().join("current");
     let machine_changes_directory = bundle.path().join("machine-changes");
+    report_stage(
+        observer,
+        "Materializing private base, candidate, and current workspace copies",
+    )?;
     snapshot::materialize(store, &base_workspace, &base_directory)?;
     materialize_candidate_workspace(
         store,
@@ -212,6 +310,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         store,
         &options.run_id,
         bundle.path(),
+        &result,
         &base_workspace,
         &candidate_workspace,
         &current_before,
@@ -242,97 +341,147 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         .context("write review request into review bundle")?;
 
     let started_at = Utc::now();
-    let output = Command::new(&reviewer_command[0])
-        .args(&reviewer_command[1..])
-        .current_dir(&current_directory)
-        .env("AGENTLAB_RUN_ID", &options.run_id)
-        .env("AGENTLAB_REVIEW_ID", &review_id)
-        .env("AGENTLAB_REVIEW_BUNDLE_DIR", bundle.path())
-        .env(
-            "AGENTLAB_REVIEW_REQUEST_PATH",
-            bundle.path().join("request.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_BASE_MANIFEST_PATH",
-            bundle.path().join("base-manifest.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_CANDIDATE_MANIFEST_PATH",
-            bundle.path().join("candidate-manifest.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_CURRENT_MANIFEST_PATH",
-            bundle.path().join("current-manifest.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_DELTA_PATH",
-            bundle.path().join("delta.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_RAW_DELTA_PATH",
-            bundle.path().join("delta.raw.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_RUN_SPEC_PATH",
-            bundle.path().join("spec.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_RUN_RESULT_PATH",
-            bundle.path().join("result.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_BASE_ROOTFS_MANIFEST_PATH",
-            bundle.path().join("base-rootfs.json"),
-        )
-        .env(
-            "AGENTLAB_REVIEW_CANDIDATE_ROOTFS_MANIFEST_PATH",
-            bundle.path().join("candidate-rootfs.json"),
-        )
-        .env("AGENTLAB_REVIEW_BASE_DIR", &base_directory)
-        .env("AGENTLAB_REVIEW_CANDIDATE_DIR", &candidate_directory)
-        .env("AGENTLAB_REVIEW_CURRENT_DIR", &current_directory)
-        .env(
-            "AGENTLAB_REVIEW_MACHINE_CHANGES_DIR",
+    let mut captures = Vec::new();
+    let mut proposal = None;
+    let mut repair = None;
+    let mut failure = None;
+    for attempt in 1..=2 {
+        let output = execute_reviewer(
+            &reviewer_command,
+            &options.run_id,
+            &review_id,
+            bundle.path(),
+            &base_directory,
+            &candidate_directory,
+            &current_directory,
             &machine_changes_directory,
-        )
-        .output()
-        .with_context(|| format!("execute reviewer command {:?}", reviewer_command[0]))?;
+            repair.as_ref(),
+            attempt,
+            observer,
+        )?;
+        verify_reviewer_postconditions(
+            store,
+            &options.run_id,
+            bundle.path(),
+            &request,
+            &request_bytes,
+            &base_workspace,
+            &candidate_workspace,
+            &current_before,
+            &options.workspace,
+        )?;
+
+        let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
+        if !output.status.success() {
+            let message = format!(
+                "reviewer command exited with status {exit_code}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            captures.push(InvocationCapture {
+                attempt,
+                started_at: output.started_at,
+                completed_at: output.completed_at,
+                exit_code,
+                status: "command_failed".to_owned(),
+                validation_error: Some(message.clone()),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+            failure = Some(message);
+            break;
+        }
+
+        match decode_proposal(&request, &output.stdout) {
+            Ok(valid) => {
+                captures.push(InvocationCapture {
+                    attempt,
+                    started_at: output.started_at,
+                    completed_at: output.completed_at,
+                    exit_code,
+                    status: "accepted".to_owned(),
+                    validation_error: None,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+                proposal = Some(valid);
+                break;
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                let previous_stdout = output.stdout.clone();
+                captures.push(InvocationCapture {
+                    attempt,
+                    started_at: output.started_at,
+                    completed_at: output.completed_at,
+                    exit_code,
+                    status: "invalid_proposal".to_owned(),
+                    validation_error: Some(message.clone()),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+                if attempt == 1 {
+                    report_stage(
+                        observer,
+                        "Reviewer attempt 1 returned an invalid proposal; requesting one schema correction",
+                    )?;
+                    let stdout_path = bundle.path().join("previous-reviewer-stdout.bin");
+                    let error_path = bundle.path().join("proposal-validation-error.txt");
+                    fs::write(&stdout_path, previous_stdout)
+                        .context("write previous reviewer output for correction")?;
+                    fs::write(&error_path, message.as_bytes())
+                        .context("write proposal validation error for correction")?;
+                    repair = Some(RepairInput {
+                        previous_stdout_path: stdout_path,
+                        validation_error_path: error_path,
+                    });
+                } else {
+                    failure = Some(format!(
+                        "reviewer proposal still violated the contract after one correction: {message}"
+                    ));
+                }
+            }
+        }
+    }
     let completed_at = Utc::now();
-
-    verify_bundle_inputs(bundle.path(), &request, &request_bytes)?;
-    lifecycle::verify_all(store, &options.run_id)
-        .context("reviewer mutated immutable run or lifecycle artifacts")?;
-    evaluation::verify_all(store, &options.run_id)
-        .context("reviewer mutated evaluation artifacts")?;
-    verify_all(store, &options.run_id).context("reviewer mutated prior review records")?;
-    snapshot::verify(store, &base_workspace)
-        .context("reviewer mutated base workspace snapshot content")?;
-    snapshot::verify(store, &candidate_workspace)
-        .context("reviewer mutated candidate workspace snapshot content")?;
-    snapshot::verify(store, &current_before)
-        .context("reviewer mutated current workspace snapshot content")?;
-    let current_after = snapshot::create(&options.workspace, store)?.manifest;
-    if current_after.digest != current_before.digest {
-        bail!("reviewer changed the selected current workspace; review receipt was not accepted");
-    }
-    let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
-    if !output.status.success() {
-        bail!(
-            "reviewer exited with status {exit_code}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let proposal: ReviewProposal = serde_json::from_slice(&output.stdout)
-        .context("reviewer stdout was not a valid proposal JSON object")?;
-    validate_proposal(&request, &proposal)?;
-
-    let prefix = format!("reviews/{review_id}");
-    let request_artifact = write_artifact(
+    let attempt_status = if proposal.is_some() {
+        "accepted"
+    } else {
+        "rejected"
+    };
+    let attempt_record = persist_attempt_record(
         store,
         &options.run_id,
-        &format!("{prefix}/request.json"),
+        &review_id,
+        &result.digest,
+        &source_workspace,
+        started_at,
+        completed_at,
+        attempt_status,
+        failure.clone(),
+        &request,
         &request_bytes,
+        &captures,
     )?;
+    if let Some(failure) = failure {
+        report_stage(observer, &format!("Rejected review recorded: {review_id}"))?;
+        let last = attempt_record
+            .invocations
+            .last()
+            .context("rejected review recorded no reviewer invocation")?;
+        let output_path = store.run_path(&options.run_id, &last.stdout.path)?;
+        bail!(
+            "review {review_id} was rejected: {failure}\nInspect: agentlab inspect --verify {review_id}\nReviewer output: {}",
+            output_path.display()
+        );
+    }
+    let proposal = proposal.context("review ended without a proposal or recorded failure")?;
+    report_stage(
+        observer,
+        "Proposal contract validated; recording immutable review",
+    )?;
+
+    let prefix = format!("reviews/{review_id}");
+    let request_artifact = attempt_record.request_artifact.clone();
     let proposal_bytes = run::pretty_json(&proposal)?;
     let proposal_artifact = write_artifact(
         store,
@@ -340,28 +489,37 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         &format!("{prefix}/proposal.json"),
         &proposal_bytes,
     )?;
+    let final_capture = captures
+        .last()
+        .context("accepted review recorded no reviewer invocation")?;
     let stdout = write_artifact(
         store,
         &options.run_id,
         &format!("{prefix}/artifacts/stdout.bin"),
-        &output.stdout,
+        &final_capture.stdout,
     )?;
     let stderr = write_artifact(
         store,
         &options.run_id,
         &format!("{prefix}/artifacts/stderr.bin"),
-        &output.stderr,
+        &final_capture.stderr,
     )?;
     let mut integrity = BTreeMap::new();
     for artifact in [&request_artifact, &proposal_artifact, &stdout, &stderr] {
         integrity.insert(artifact.path.clone(), artifact.digest.clone());
     }
-    let warnings = vec![
+    let mut warnings = vec![
         "the reviewer ran as a trusted host process with the invoking user's authority".to_owned(),
         "review mode recorded a proposal only; AgentLab applied no changes".to_owned(),
         "captured workspaces, machine deltas, reviewer output, and receipts may contain sensitive information"
             .to_owned(),
     ];
+    if captures.len() > 1 {
+        warnings.push(
+            "the first reviewer response violated the proposal contract; a second constrained correction was validated and retained"
+                .to_owned(),
+        );
+    }
     let identity = ReviewIdentity {
         schema_version: REVIEW_SCHEMA_VERSION,
         review_id: &review_id,
@@ -370,7 +528,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         source_workspace: &source_workspace,
         started_at,
         completed_at,
-        reviewer_exit_code: exit_code,
+        reviewer_exit_code: final_capture.exit_code,
         request: &request,
         proposal: &proposal,
         request_artifact: &request_artifact,
@@ -391,7 +549,7 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         source_workspace,
         started_at,
         completed_at,
-        reviewer_exit_code: exit_code,
+        reviewer_exit_code: final_capture.exit_code,
         request,
         proposal,
         request_artifact,
@@ -409,6 +567,333 @@ pub fn review(store: &Store, options: &ReviewOptions) -> Result<ReviewRecord> {
         &run::pretty_json(&record)?,
     )?;
     verify(store, &record)?;
+    report_stage(observer, &format!("Review accepted: {}", record.review_id))?;
+    Ok(record)
+}
+
+#[derive(Debug)]
+struct ReviewerOutput {
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct InvocationCapture {
+    attempt: usize,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    exit_code: i64,
+    status: String,
+    validation_error: Option<String>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct RepairInput {
+    previous_stdout_path: PathBuf,
+    validation_error_path: PathBuf,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_reviewer(
+    reviewer_command: &[String],
+    run_id: &str,
+    review_id: &str,
+    bundle: &Path,
+    base_directory: &Path,
+    candidate_directory: &Path,
+    current_directory: &Path,
+    machine_changes_directory: &Path,
+    repair: Option<&RepairInput>,
+    attempt: usize,
+    observer: &mut dyn ReviewObserver,
+) -> Result<ReviewerOutput> {
+    report_stage(observer, &format!("Reviewer attempt {attempt} started"))?;
+    let started_at = Utc::now();
+    let mut command = Command::new(&reviewer_command[0]);
+    command
+        .args(&reviewer_command[1..])
+        .current_dir(current_directory)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("AGENTLAB_RUN_ID", run_id)
+        .env("AGENTLAB_REVIEW_ID", review_id)
+        .env("AGENTLAB_REVIEW_BUNDLE_DIR", bundle)
+        .env("AGENTLAB_REVIEW_REQUEST_PATH", bundle.join("request.json"))
+        .env(
+            "AGENTLAB_REVIEW_BASE_MANIFEST_PATH",
+            bundle.join("base-manifest.json"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_CANDIDATE_MANIFEST_PATH",
+            bundle.join("candidate-manifest.json"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_CURRENT_MANIFEST_PATH",
+            bundle.join("current-manifest.json"),
+        )
+        .env("AGENTLAB_REVIEW_DELTA_PATH", bundle.join("delta.json"))
+        .env(
+            "AGENTLAB_REVIEW_RAW_DELTA_PATH",
+            bundle.join("delta.raw.json"),
+        )
+        .env("AGENTLAB_REVIEW_RUN_SPEC_PATH", bundle.join("spec.json"))
+        .env(
+            "AGENTLAB_REVIEW_RUN_RESULT_PATH",
+            bundle.join("result.json"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_RUN_STDOUT_PATH",
+            bundle.join("run-stdout.bin"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_RUN_STDERR_PATH",
+            bundle.join("run-stderr.bin"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_EVALUATIONS_PATH",
+            bundle.join("evaluations.json"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_BASE_ROOTFS_MANIFEST_PATH",
+            bundle.join("base-rootfs.json"),
+        )
+        .env(
+            "AGENTLAB_REVIEW_CANDIDATE_ROOTFS_MANIFEST_PATH",
+            bundle.join("candidate-rootfs.json"),
+        )
+        .env("AGENTLAB_REVIEW_BASE_DIR", base_directory)
+        .env("AGENTLAB_REVIEW_CANDIDATE_DIR", candidate_directory)
+        .env("AGENTLAB_REVIEW_CURRENT_DIR", current_directory)
+        .env(
+            "AGENTLAB_REVIEW_MACHINE_CHANGES_DIR",
+            machine_changes_directory,
+        );
+    if let Some(repair) = repair {
+        command
+            .env("AGENTLAB_REVIEW_REPAIR", "1")
+            .env(
+                "AGENTLAB_REVIEW_PREVIOUS_STDOUT_PATH",
+                &repair.previous_stdout_path,
+            )
+            .env(
+                "AGENTLAB_REVIEW_VALIDATION_ERROR_PATH",
+                &repair.validation_error_path,
+            );
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("execute reviewer command {:?}", reviewer_command[0]))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture reviewer stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture reviewer stderr pipe")?;
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+    let wait_started = Instant::now();
+    let mut next_heartbeat = REVIEWER_HEARTBEAT_INTERVAL;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for reviewer command")? {
+            break status;
+        }
+        if wait_started.elapsed() >= next_heartbeat {
+            if let Err(error) = observer.stage(&format!(
+                "Reviewer attempt {attempt} still running ({:.0}s)",
+                wait_started.elapsed().as_secs_f64()
+            )) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("report review progress");
+            }
+            next_heartbeat += REVIEWER_HEARTBEAT_INTERVAL;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reviewer stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reviewer stderr reader panicked"))??;
+    let completed_at = Utc::now();
+    report_stage(
+        observer,
+        &format!(
+            "Reviewer attempt {attempt} completed with exit code {}",
+            status.code().map(i64::from).unwrap_or(-1)
+        ),
+    )?;
+    Ok(ReviewerOutput {
+        started_at,
+        completed_at,
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_pipe(mut source: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    source.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn report_stage(observer: &mut dyn ReviewObserver, message: &str) -> Result<()> {
+    observer.stage(message).context("report review progress")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_reviewer_postconditions(
+    store: &Store,
+    run_id: &str,
+    bundle: &Path,
+    request: &ReviewRequest,
+    request_bytes: &[u8],
+    base_workspace: &Manifest,
+    candidate_workspace: &Manifest,
+    current_before: &Manifest,
+    source_workspace: &Path,
+) -> Result<()> {
+    verify_bundle_inputs(bundle, request, request_bytes)?;
+    lifecycle::verify_all(store, run_id)
+        .context("reviewer mutated immutable run or lifecycle artifacts")?;
+    evaluation::verify_all(store, run_id).context("reviewer mutated evaluation artifacts")?;
+    verify_all(store, run_id).context("reviewer mutated prior review records")?;
+    snapshot::verify(store, base_workspace)
+        .context("reviewer mutated base workspace snapshot content")?;
+    snapshot::verify(store, candidate_workspace)
+        .context("reviewer mutated candidate workspace snapshot content")?;
+    snapshot::verify(store, current_before)
+        .context("reviewer mutated current workspace snapshot content")?;
+    let current_after = snapshot::create(source_workspace, store)?.manifest;
+    if current_after.digest != current_before.digest {
+        bail!("reviewer changed the selected current workspace; review receipt was not accepted");
+    }
+    Ok(())
+}
+
+fn decode_proposal(request: &ReviewRequest, stdout: &[u8]) -> Result<ReviewProposal> {
+    let value: serde_json::Value =
+        serde_json::from_slice(stdout).context("reviewer stdout was not valid JSON")?;
+    let proposal: ReviewProposal = serde_json::from_value(value)
+        .context("reviewer JSON did not match agentlab.review-proposal/v1")?;
+    validate_proposal(request, &proposal)
+        .context("reviewer proposal violated agentlab.review-proposal/v1")?;
+    Ok(proposal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_attempt_record(
+    store: &Store,
+    run_id: &str,
+    review_id: &str,
+    result_digest: &str,
+    source_workspace: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    status: &str,
+    failure: Option<String>,
+    request: &ReviewRequest,
+    request_bytes: &[u8],
+    captures: &[InvocationCapture],
+) -> Result<ReviewAttemptRecord> {
+    let prefix = format!("reviews/{review_id}");
+    let request_artifact = write_artifact(
+        store,
+        run_id,
+        &format!("{prefix}/request.json"),
+        request_bytes,
+    )?;
+    let mut invocations = Vec::with_capacity(captures.len());
+    let mut integrity = BTreeMap::new();
+    integrity.insert(
+        request_artifact.path.clone(),
+        request_artifact.digest.clone(),
+    );
+    for capture in captures {
+        let stdout = write_artifact(
+            store,
+            run_id,
+            &format!("{prefix}/artifacts/attempt-{}-stdout.bin", capture.attempt),
+            &capture.stdout,
+        )?;
+        let stderr = write_artifact(
+            store,
+            run_id,
+            &format!("{prefix}/artifacts/attempt-{}-stderr.bin", capture.attempt),
+            &capture.stderr,
+        )?;
+        integrity.insert(stdout.path.clone(), stdout.digest.clone());
+        integrity.insert(stderr.path.clone(), stderr.digest.clone());
+        invocations.push(ReviewerInvocation {
+            attempt: capture.attempt,
+            started_at: capture.started_at,
+            completed_at: capture.completed_at,
+            exit_code: capture.exit_code,
+            status: capture.status.clone(),
+            validation_error: capture.validation_error.clone(),
+            stdout,
+            stderr,
+        });
+    }
+    let warnings = vec![
+        "the reviewer ran as a trusted host process with the invoking user's authority".to_owned(),
+        "review attempts retain raw reviewer stdout and stderr, which may contain sensitive information"
+            .to_owned(),
+        "AgentLab applied no changes during review".to_owned(),
+    ];
+    let identity = ReviewAttemptIdentity {
+        schema_version: REVIEW_ATTEMPT_SCHEMA_VERSION,
+        review_id,
+        run_id,
+        result_digest,
+        source_workspace,
+        started_at,
+        completed_at,
+        status,
+        failure: &failure,
+        request,
+        request_artifact: &request_artifact,
+        invocations: &invocations,
+        source_workspace_unchanged: true,
+        agentlab_applied_changes: false,
+        warnings: &warnings,
+        integrity: &integrity,
+    };
+    let record = ReviewAttemptRecord {
+        schema_version: REVIEW_ATTEMPT_SCHEMA_VERSION.to_owned(),
+        digest: run::sha256_bytes(&serde_json::to_vec(&identity)?),
+        review_id: review_id.to_owned(),
+        run_id: run_id.to_owned(),
+        result_digest: result_digest.to_owned(),
+        source_workspace: source_workspace.to_owned(),
+        started_at,
+        completed_at,
+        status: status.to_owned(),
+        failure,
+        request: request.clone(),
+        request_artifact,
+        invocations,
+        source_workspace_unchanged: true,
+        agentlab_applied_changes: false,
+        warnings,
+        integrity,
+    };
+    store.write_run_file(
+        run_id,
+        &format!("{prefix}/review-attempt.json"),
+        &run::pretty_json(&record)?,
+    )?;
+    verify_attempt(store, &record)?;
     Ok(record)
 }
 
@@ -466,6 +951,10 @@ pub fn list(store: &Store, run_id: &str) -> Result<Vec<ReviewRecord>> {
 }
 
 pub fn find(store: &Store, review_id: &str) -> Result<ReviewRecord> {
+    find_optional(store, review_id)?.with_context(|| format!("review {review_id:?} not found"))
+}
+
+pub fn find_optional(store: &Store, review_id: &str) -> Result<Option<ReviewRecord>> {
     Uuid::parse_str(review_id).context("review ID is not a UUID")?;
     let mut found = None;
     let relative = format!("reviews/{review_id}/review.json");
@@ -483,12 +972,162 @@ pub fn find(store: &Store, review_id: &str) -> Result<ReviewRecord> {
         }
         found = Some(record);
     }
-    found.with_context(|| format!("review {review_id:?} not found"))
+    Ok(found)
+}
+
+pub fn list_attempts(store: &Store, run_id: &str) -> Result<Vec<ReviewAttemptRecord>> {
+    let directory = store.run_path(run_id, "reviews")?;
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("review ID is not valid UTF-8"))?;
+        let relative = format!("reviews/{id}/review-attempt.json");
+        if store.run_file_exists(run_id, &relative)? {
+            records.push(serde_json::from_slice(
+                &store.read_run_file(run_id, &relative)?,
+            )?);
+        }
+    }
+    records.sort_by(|left: &ReviewAttemptRecord, right: &ReviewAttemptRecord| {
+        left.completed_at
+            .cmp(&right.completed_at)
+            .then_with(|| left.review_id.cmp(&right.review_id))
+    });
+    Ok(records)
+}
+
+pub fn find_attempt(store: &Store, review_id: &str) -> Result<ReviewAttemptRecord> {
+    find_attempt_optional(store, review_id)?
+        .with_context(|| format!("review attempt {review_id:?} not found"))
+}
+
+pub fn find_attempt_optional(
+    store: &Store,
+    review_id: &str,
+) -> Result<Option<ReviewAttemptRecord>> {
+    Uuid::parse_str(review_id).context("review ID is not a UUID")?;
+    let mut found = None;
+    let relative = format!("reviews/{review_id}/review-attempt.json");
+    for run_id in store.list_run_ids()? {
+        if !store.run_file_exists(&run_id, &relative)? {
+            continue;
+        }
+        let record: ReviewAttemptRecord =
+            serde_json::from_slice(&store.read_run_file(&run_id, &relative)?)?;
+        if record.review_id != review_id {
+            bail!("review-attempt path and record ID do not agree");
+        }
+        if found.is_some() {
+            bail!("review attempt ID {review_id:?} is not unique");
+        }
+        found = Some(record);
+    }
+    Ok(found)
 }
 
 pub fn verify_all(store: &Store, run_id: &str) -> Result<()> {
+    for record in list_attempts(store, run_id)? {
+        verify_attempt(store, &record)?;
+    }
     for record in list(store, run_id)? {
         verify(store, &record)?;
+    }
+    Ok(())
+}
+
+pub fn verify_attempt(store: &Store, record: &ReviewAttemptRecord) -> Result<()> {
+    if record.schema_version != REVIEW_ATTEMPT_SCHEMA_VERSION {
+        bail!(
+            "unsupported review-attempt schema {:?}",
+            record.schema_version
+        );
+    }
+    if record.review_id != record.request.review_id
+        || record.run_id != record.request.anchors.run_id
+        || record.result_digest != record.request.anchors.result_digest
+    {
+        bail!("review-attempt record fields do not agree with request anchors");
+    }
+    if !Path::new(&record.source_workspace).is_absolute() {
+        bail!("review-attempt source workspace path is not absolute");
+    }
+    if !record.source_workspace_unchanged || record.agentlab_applied_changes {
+        bail!("review-attempt safety fields are inconsistent");
+    }
+    if record.invocations.is_empty() || record.invocations.len() > 2 {
+        bail!("review attempt must retain one or two reviewer invocations");
+    }
+    for (index, invocation) in record.invocations.iter().enumerate() {
+        if invocation.attempt != index + 1 {
+            bail!("reviewer invocation sequence is inconsistent");
+        }
+        if !matches!(
+            invocation.status.as_str(),
+            "accepted" | "invalid_proposal" | "command_failed"
+        ) {
+            bail!("invalid reviewer invocation status {:?}", invocation.status);
+        }
+        if invocation.status == "accepted" && invocation.validation_error.is_some() {
+            bail!("accepted reviewer invocation contains a validation error");
+        }
+        if invocation.status != "accepted" && invocation.validation_error.is_none() {
+            bail!("failed reviewer invocation omitted its validation error");
+        }
+    }
+    let last = record
+        .invocations
+        .last()
+        .context("review attempt omitted reviewer invocations")?;
+    match record.status.as_str() {
+        "accepted" if record.failure.is_none() && last.status == "accepted" => {}
+        "rejected" if record.failure.is_some() && last.status != "accepted" => {}
+        "accepted" | "rejected" => bail!("review-attempt outcome fields are inconsistent"),
+        value => bail!("invalid review-attempt status {value:?}"),
+    }
+    if record.invocations.len() == 2 && record.invocations[0].status != "invalid_proposal" {
+        bail!("only an invalid proposal may trigger a second reviewer invocation");
+    }
+    for (relative, expected) in &record.integrity {
+        let actual = run::sha256_bytes(&store.read_run_file(&record.run_id, relative)?);
+        if &actual != expected {
+            bail!("review-attempt artifact integrity mismatch for {relative:?}");
+        }
+    }
+    let stored_request: ReviewRequest = serde_json::from_slice(
+        &store.read_run_file(&record.run_id, &record.request_artifact.path)?,
+    )?;
+    if stored_request != record.request {
+        bail!("review-attempt record and stored request do not agree");
+    }
+    let identity = ReviewAttemptIdentity {
+        schema_version: REVIEW_ATTEMPT_SCHEMA_VERSION,
+        review_id: &record.review_id,
+        run_id: &record.run_id,
+        result_digest: &record.result_digest,
+        source_workspace: &record.source_workspace,
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+        status: &record.status,
+        failure: &record.failure,
+        request: &record.request,
+        request_artifact: &record.request_artifact,
+        invocations: &record.invocations,
+        source_workspace_unchanged: record.source_workspace_unchanged,
+        agentlab_applied_changes: record.agentlab_applied_changes,
+        warnings: &record.warnings,
+        integrity: &record.integrity,
+    };
+    if run::sha256_bytes(&serde_json::to_vec(&identity)?) != record.digest {
+        bail!("review-attempt record integrity mismatch");
     }
     Ok(())
 }
@@ -650,6 +1289,19 @@ fn validate_proposal(request: &ReviewRequest, proposal: &ReviewProposal) -> Resu
     if proposal.counts != counts {
         bail!("review proposal disposition counts are inconsistent");
     }
+    for recommendation in &proposal.recommendations {
+        if recommendation.target != "environment" {
+            bail!(
+                "review recommendation target must be \"environment\", got {:?}",
+                recommendation.target
+            );
+        }
+        if recommendation.recommendation.trim().is_empty()
+            || recommendation.reason.trim().is_empty()
+        {
+            bail!("review recommendations require nonempty recommendation and reason");
+        }
+    }
     Ok(())
 }
 
@@ -728,6 +1380,7 @@ fn write_bundle_inputs(
     store: &Store,
     run_id: &str,
     bundle: &Path,
+    result: &run::RunResult,
     base: &Manifest,
     candidate: &Manifest,
     current: &Manifest,
@@ -753,6 +1406,21 @@ fn write_bundle_inputs(
         artifacts.insert(name.to_owned(), run::sha256_bytes(&bytes));
     }
     for (name, filename, bytes) in [
+        (
+            "run_stdout",
+            "run-stdout.bin",
+            store.read_run_file(run_id, &result.stdout.path)?,
+        ),
+        (
+            "run_stderr",
+            "run-stderr.bin",
+            store.read_run_file(run_id, &result.stderr.path)?,
+        ),
+        (
+            "evaluations",
+            "evaluations.json",
+            run::pretty_json(&evaluation::list(store, run_id)?)?,
+        ),
         (
             "base_workspace_manifest",
             "base-manifest.json",
@@ -794,6 +1462,9 @@ fn verify_bundle_inputs(
     let mappings = [
         ("run_spec", "spec.json"),
         ("run_result", "result.json"),
+        ("run_stdout", "run-stdout.bin"),
+        ("run_stderr", "run-stderr.bin"),
+        ("evaluations", "evaluations.json"),
         ("base_rootfs_manifest", "base-rootfs.json"),
         ("candidate_rootfs_manifest", "candidate-rootfs.json"),
         ("base_workspace_manifest", "base-manifest.json"),
@@ -1122,6 +1793,97 @@ mod tests {
                 .to_string()
                 .contains("traversal")
         );
+
+        let mut recommendation = proposal.clone();
+        recommendation
+            .recommendations
+            .push(DeclarativeRecommendation {
+                target: "environment".to_owned(),
+                recommendation: "Install the AWS CLI in the Containerfile".to_owned(),
+                reason: "The run could not inspect the requested AWS state".to_owned(),
+            });
+        validate_proposal(&request, &recommendation).unwrap();
+
+        recommendation.recommendations[0].target = "host".to_owned();
+        assert!(
+            validate_proposal(&request, &recommendation)
+                .unwrap_err()
+                .to_string()
+                .contains("target")
+        );
+    }
+
+    #[test]
+    fn invalid_json_shape_is_reported_as_a_proposal_contract_error() {
+        let request = fixture_request();
+        let mut value = serde_json::to_value(fixture_proposal(&request)).unwrap();
+        value.as_object_mut().unwrap().remove("dispositions");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let error = decode_proposal(&request, &bytes).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("reviewer JSON did not match agentlab.review-proposal/v1")
+        );
+        assert!(format!("{error:#}").contains("dispositions"));
+    }
+
+    #[test]
+    fn rejected_review_attempt_retains_and_verifies_raw_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(temporary.path())).unwrap();
+        let request = fixture_request();
+        store.create_run_directory(&request.anchors.run_id).unwrap();
+        let request_bytes = run::pretty_json(&request).unwrap();
+        let now = Utc::now();
+        let captures = vec![InvocationCapture {
+            attempt: 1,
+            started_at: now,
+            completed_at: now,
+            exit_code: 0,
+            status: "invalid_proposal".to_owned(),
+            validation_error: Some("missing field dispositions".to_owned()),
+            stdout: br#"{"summary":"useful but malformed"}"#.to_vec(),
+            stderr: Vec::new(),
+        }];
+        let record = persist_attempt_record(
+            &store,
+            &request.anchors.run_id,
+            &request.review_id,
+            &request.anchors.result_digest,
+            "/tmp/workspace",
+            now,
+            now,
+            "rejected",
+            Some("proposal contract failed".to_owned()),
+            &request,
+            &request_bytes,
+            &captures,
+        )
+        .unwrap();
+
+        verify_attempt(&store, &record).unwrap();
+        let found = find_attempt(&store, &request.review_id).unwrap();
+        assert_eq!(found, record);
+        assert_eq!(
+            store
+                .read_run_file(&record.run_id, &record.invocations[0].stdout.path)
+                .unwrap(),
+            captures[0].stdout
+        );
+
+        store
+            .write_run_file(
+                &record.run_id,
+                &record.invocations[0].stdout.path,
+                b"tampered",
+            )
+            .unwrap();
+        assert!(
+            verify_attempt(&store, &record)
+                .unwrap_err()
+                .to_string()
+                .contains("integrity")
+        );
     }
 
     fn fixture_request() -> ReviewRequest {
@@ -1186,6 +1948,7 @@ mod tests {
                     workspace_operation: None,
                 },
             ],
+            recommendations: Vec::new(),
             summary: None,
         }
     }

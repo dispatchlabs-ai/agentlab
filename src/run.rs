@@ -1999,6 +1999,7 @@ mod tests {
             pi_auth: None,
             change_ignore: None,
             captures,
+            accepted_input: None,
         }
     }
 

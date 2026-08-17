@@ -40,7 +40,8 @@ Milestones 1 through 7 implement deterministic workspace snapshots, isolated and
 - Creates independent filesystem-level forks and deletes only the selected run's owned container, image tag, and local artifacts.
 - Invokes arbitrary external evaluators against integrity-checked results and records their command, output, status, stdout/stderr, and named JSON observations.
 - Aligns actual run-input, workspace, image, portable-base identities, and evaluator score names into Markdown or JSON rows without aggregation, ranking, statistics, or causal claims.
-- Constructs immutable base/candidate/current review bundles, exposes actual changed-machine content to any trusted command-line reviewer, validates complete proposed/rejected/conflicted/unresolved dispositions, and records a proposal without applying it.
+- Constructs immutable base/candidate/current review bundles, exposes the original command output, structured evaluator observations, and actual changed-machine content to any trusted command-line reviewer, validates complete proposed/rejected/conflicted/unresolved dispositions and declarative environment recommendations, and records a proposal without applying it.
+- Shows elapsed review progress, retains every reviewer invocation as integrity-checked evidence, permits one constrained schema-correction attempt, and keeps rejected output inspectable without treating it as an actionable proposal.
 - Applies one review receipt only when the host workspace still exactly matches the reviewed current snapshot, requires explicit acknowledgement of conflicts or unresolved candidates, privately stages the result, retains a complete before snapshot, changes only proposed workspace operations, rolls back path-scoped failures, and verifies the exact after snapshot.
 - Records an explicit `agentlab.acceptance/v1` decision for the exact workspace snapshot, immutable OCI image, platform, and guest workspace path tested by a completed run; exit status remains evidence rather than an automatic verdict.
 - Runs directly from an accepted input without repeating workspace/image flags, preserves parent review/apply/retest lineage, excludes test-session output from the next base, and protects referenced evidence from ordinary removal.
@@ -236,7 +237,7 @@ agentlab review \
 
 Run `agentlab review --help` for the complete command contract. A relative reviewer executable such as `./examples/reviewers/pi-review.sh` is resolved from the directory where you invoke AgentLab before the reviewer starts from the private current-workspace copy.
 
-The selected reviewer runs directly on the host with your authority. AgentLab creates private temporary materializations of the immutable base workspace, the candidate workspace captured from the run, and a fresh snapshot of the current host workspace. It also provides the exact run/result/root-filesystem manifests, portable and raw deltas, and a changed-machine tree containing actual after-content for captured changes outside the workspace. The command runs from the temporary current copy so ordinary `AGENTS.md` and `CLAUDE.md` discovery works without placing the reviewer in the mutable source.
+The selected reviewer runs directly on the host with your authority. AgentLab creates private temporary materializations of the immutable base workspace, the candidate workspace captured from the run, and a fresh snapshot of the current host workspace. It also provides the exact run specification and result, exact command stdout and stderr, all structured evaluator records, root-filesystem manifests, portable and raw deltas, and a changed-machine tree containing actual after-content for captured changes outside the workspace. The command runs from the temporary current copy so ordinary `AGENTS.md` and `CLAUDE.md` discovery works without placing the reviewer in the mutable source.
 
 The reviewer receives these environment variables:
 
@@ -247,6 +248,9 @@ AGENTLAB_REVIEW_BUNDLE_DIR
 AGENTLAB_REVIEW_REQUEST_PATH
 AGENTLAB_REVIEW_RUN_SPEC_PATH
 AGENTLAB_REVIEW_RUN_RESULT_PATH
+AGENTLAB_REVIEW_RUN_STDOUT_PATH
+AGENTLAB_REVIEW_RUN_STDERR_PATH
+AGENTLAB_REVIEW_EVALUATIONS_PATH
 AGENTLAB_REVIEW_BASE_ROOTFS_MANIFEST_PATH
 AGENTLAB_REVIEW_CANDIDATE_ROOTFS_MANIFEST_PATH
 AGENTLAB_REVIEW_BASE_MANIFEST_PATH
@@ -260,9 +264,20 @@ AGENTLAB_REVIEW_CURRENT_DIR
 AGENTLAB_REVIEW_MACHINE_CHANGES_DIR
 ```
 
-Successful stdout must be one `agentlab.review-proposal/v1` JSON object. It must copy the request's review ID and anchors exactly, classify every raw-delta candidate exactly once as `proposed`, `rejected`, `conflicted`, or `unresolved`, provide reconciled counts and reasons, keep workspace operations relative and in scope, and express worthwhile environment changes as declarative recommendations rather than copies from `/etc`, `/usr`, `/var`, or other machine paths. AgentLab rejects duplicate, missing, extra, traversing, incorrectly anchored, or inconsistently counted output.
+Successful stdout must be one `agentlab.review-proposal/v1` JSON object. It must copy the request's review ID and anchors exactly, classify every raw-delta candidate exactly once as `proposed`, `rejected`, `conflicted`, or `unresolved`, provide reconciled counts and reasons, keep workspace operations relative and in scope, and express worthwhile environment changes as declarative recommendations rather than copies from `/etc`, `/usr`, `/var`, or other machine paths. Missing capabilities discovered from the command answer—such as a required package or runtime-only credential—can be returned in the proposal's optional `recommendations` array with `target: "environment"`, a concrete recommendation, and a reason. AgentLab rejects duplicate, missing, extra, traversing, incorrectly anchored, or inconsistently counted output.
 
-[examples/reviewers/pi-review.sh](examples/reviewers/pi-review.sh) is a thin Pi adapter using noninteractive, no-session, read-only built-in tools. It uses the host's ordinary Pi authentication. Set `AGENTLAB_PI_MODEL` or `AGENTLAB_PI_THINKING` to choose a model or thinking level. The core protocol remains harness-neutral; replace that script with any command that emits the required JSON.
+AgentLab emits elapsed-time stages and a heartbeat every 15 seconds while a reviewer is running. If a successful reviewer process emits JSON that fails the proposal contract, AgentLab invokes the same adapter once more with `AGENTLAB_REVIEW_REPAIR=1`, `AGENTLAB_REVIEW_PREVIOUS_STDOUT_PATH`, and `AGENTLAB_REVIEW_VALIDATION_ERROR_PATH`. An adapter may use those inputs to make one constrained correction; there is no open-ended retry loop. Every invocation's stdout, stderr, exit status, and validation error is retained in an immutable `agentlab.review-attempt/v1` record whether the final proposal is accepted or rejected.
+
+A rejected review prints its review ID, an integrity-check command, and the private path to the final raw reviewer output:
+
+```bash
+agentlab inspect --verify REVIEW_ID
+agentlab inspect --verbose REVIEW_ID
+```
+
+The normal inspection shows status, timing, failure, and invocation outcomes. `--verbose` adds the retained stdout and stderr paths without printing potentially sensitive captured content.
+
+[examples/reviewers/pi-review.sh](examples/reviewers/pi-review.sh) is a thin Pi adapter using noninteractive, no-session, read-only built-in tools. It explicitly reads the original prompt-bearing run specification, exact agent answer and errors, evaluator observations, filesystem changes, and current workspace. It uses the host's ordinary Pi authentication. Set `AGENTLAB_PI_MODEL` or `AGENTLAB_PI_THINKING` to choose a model or thinking level. The core protocol remains harness-neutral; replace that script with any command that emits the required JSON.
 
 Review mode means AgentLab itself applies no changes. It re-snapshots the selected source after the reviewer and accepts a receipt only when the source identity is unchanged, but an arbitrary host command is still trusted and cannot be sandboxed by this promise.
 

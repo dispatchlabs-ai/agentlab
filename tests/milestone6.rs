@@ -126,7 +126,11 @@ fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<
     ensure!(record.request.repositories.base.len() == 1);
     ensure!(record.request.repositories.candidate.len() == 1);
     ensure!(record.request.repositories.current.len() == 1);
-    ensure!(record.request.input_artifacts.len() == 9);
+    ensure!(record.request.input_artifacts.len() == 12);
+    let attempt = review::find_attempt(&store, &record.review_id)?;
+    ensure!(attempt.status == "accepted");
+    ensure!(attempt.invocations.len() == 1);
+    ensure!(attempt.invocations[0].status == "accepted");
     ensure!(std::path::Path::new(&record.request.reviewer_command[0]).is_absolute());
     ensure!(record.request.reviewer_command[0].ends_with("fixture-reviewer.py"));
     ensure!(record.proposal.dispositions.iter().any(|item| {
@@ -324,6 +328,74 @@ fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<
     ensure!(
         String::from_utf8_lossy(&repeated.stderr).contains("already has an accepted apply record")
     );
+
+    let repaired = Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .args(["review", "--json", &summary.run_id, "--workspace"])
+        .arg(&workspace)
+        .args(["--", "./examples/reviewers/fixture-reviewer.py"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("AGENTLAB_STATE_DIR", &state)
+        .env("AGENTLAB_FIXTURE_INVALID_FIRST", "1")
+        .output()?;
+    ensure!(
+        repaired.status.success(),
+        "repairing review failed: {}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    ensure!(String::from_utf8_lossy(&repaired.stderr).contains("requesting one schema correction"));
+    let repaired_review: ReviewRecord = serde_json::from_slice(&repaired.stdout)?;
+    let repaired_attempt = review::find_attempt(&store, &repaired_review.review_id)?;
+    ensure!(repaired_attempt.status == "accepted");
+    ensure!(repaired_attempt.invocations.len() == 2);
+    ensure!(repaired_attempt.invocations[0].status == "invalid_proposal");
+    ensure!(repaired_attempt.invocations[1].status == "accepted");
+    let first_response: serde_json::Value = serde_json::from_slice(&store.read_run_file(
+        &summary.run_id,
+        &repaired_attempt.invocations[0].stdout.path,
+    )?)?;
+    ensure!(first_response.get("dispositions").is_none());
+    review::verify_attempt(&store, &repaired_attempt)?;
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .args(["review", &summary.run_id, "--workspace"])
+        .arg(&workspace)
+        .args(["--", "./examples/reviewers/fixture-reviewer.py"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("AGENTLAB_STATE_DIR", &state)
+        .env("AGENTLAB_FIXTURE_ALWAYS_INVALID", "1")
+        .output()?;
+    ensure!(!rejected.status.success());
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+    ensure!(rejected_stderr.contains("still violated the contract after one correction"));
+    ensure!(rejected_stderr.contains("Inspect: agentlab inspect --verify"));
+    ensure!(rejected_stderr.contains("Reviewer output:"));
+    let rejected_id = rejected_stderr
+        .split("agentlab: review ")
+        .nth(1)
+        .and_then(|value| value.split(" was rejected").next())
+        .context("rejected review error omitted its review ID")?;
+    let rejected_attempt = review::find_attempt(&store, rejected_id)?;
+    ensure!(rejected_attempt.status == "rejected");
+    ensure!(rejected_attempt.invocations.len() == 2);
+    ensure!(
+        rejected_attempt
+            .invocations
+            .iter()
+            .all(|invocation| invocation.status == "invalid_proposal")
+    );
+    let rejected_inspect = Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .args(["inspect", "--verify", rejected_id])
+        .env("AGENTLAB_STATE_DIR", &state)
+        .output()?;
+    ensure!(
+        rejected_inspect.status.success(),
+        "inspect rejected review attempt: {}",
+        String::from_utf8_lossy(&rejected_inspect.stderr)
+    );
+    let rejected_inspect_text = String::from_utf8(rejected_inspect.stdout)?;
+    ensure!(rejected_inspect_text.contains("Status: rejected"));
+    ensure!(rejected_inspect_text.contains("Reviewer attempts: 2"));
+    ensure!(rejected_inspect_text.contains("Integrity: verified"));
     Ok(())
 }
 

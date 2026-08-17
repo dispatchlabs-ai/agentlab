@@ -113,20 +113,22 @@ fn review_command(
     let run_id = run_id.ok_or_else(|| anyhow::anyhow!("review requires RUN"))?;
     let workspace =
         workspace.ok_or_else(|| anyhow::anyhow!("review requires --workspace CURRENT"))?;
-    writeln!(
-        stderr,
-        "AgentLab: launching a trusted host reviewer with private base, candidate, current, and complete machine-delta inputs; review mode will not apply its proposal."
-    )?;
-    stderr.flush()?;
     let store = Store::open(None)?;
-    let record = review::review(
-        &store,
-        &ReviewOptions {
-            run_id,
-            workspace,
-            reviewer_command: reviewer_command.to_vec(),
-        },
-    )?;
+    let record = {
+        let mut observer = CliReviewObserver {
+            stderr,
+            started: Instant::now(),
+        };
+        review::review_with_observer(
+            &store,
+            &ReviewOptions {
+                run_id,
+                workspace,
+                reviewer_command: reviewer_command.to_vec(),
+            },
+            &mut observer,
+        )?
+    };
     if json {
         serde_json::to_writer_pretty(&mut *stdout, &record)?;
         writeln!(stdout)?;
@@ -135,23 +137,25 @@ fn review_command(
     writeln!(stdout, "Review: {}", record.review_id)?;
     writeln!(stdout, "Run: {}", record.run_id)?;
     writeln!(stdout, "Receipt: {}", record.digest)?;
-    writeln!(stdout, "Current workspace: {}", record.source_workspace)?;
+    writeln!(stdout, "Workspace path: {}", record.source_workspace)?;
     writeln!(
         stdout,
-        "Base workspace: {}",
+        "Base snapshot: {}",
         record.request.anchors.base_workspace_snapshot_digest
     )?;
     writeln!(
         stdout,
-        "Candidate workspace: {}",
+        "Candidate snapshot: {}",
         record.request.anchors.candidate_workspace_snapshot_digest
     )?;
     writeln!(
         stdout,
-        "Current workspace: {}",
+        "Current snapshot: {}",
         record.request.anchors.current_workspace_snapshot_digest
     )?;
     writeln!(stdout, "Candidates: {}", record.request.candidates.len())?;
+    let attempt = review::find_attempt(&store, &record.review_id)?;
+    writeln!(stdout, "Reviewer attempts: {}", attempt.invocations.len())?;
     writeln!(
         stdout,
         "Dispositions: {} proposed, {} rejected, {} conflicted, {} unresolved",
@@ -170,6 +174,13 @@ fn review_command(
             writeln!(stdout, "    recommendation: {recommendation}")?;
         }
     }
+    if !record.proposal.recommendations.is_empty() {
+        writeln!(stdout, "Environment recommendations:")?;
+        for recommendation in &record.proposal.recommendations {
+            writeln!(stdout, "  {}", recommendation.recommendation)?;
+            writeln!(stdout, "    reason: {}", recommendation.reason)?;
+        }
+    }
     writeln!(
         stdout,
         "Source workspace unchanged: {}",
@@ -180,9 +191,17 @@ fn review_command(
         "AgentLab applied changes: {}",
         record.agentlab_applied_changes
     )?;
+    for warning in &record.warnings {
+        writeln!(stdout, "Warning: {warning}")?;
+    }
     writeln!(
         stdout,
-        "Inspect: agentlab inspect --verify {}",
+        "Inspect review: agentlab inspect --verify {}",
+        record.review_id
+    )?;
+    writeln!(
+        stdout,
+        "Inspect run: agentlab inspect --verify {}",
         record.run_id
     )?;
     writeln!(
@@ -197,7 +216,7 @@ fn review_command(
 fn print_review_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
-        "AgentLab review\n\nAsk a trusted command-line reviewer which changes from a run are worth carrying forward. AgentLab records the proposal and applies nothing.\n\nUsage:\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nArguments:\n  RUN                       Completed AgentLab run to review\n  --workspace CURRENT       Current host workspace to compare with the run\n  --json                    Write the complete review receipt as JSON\n  -- COMMAND [ARG ...]      Trusted reviewer command and its arguments\n\nExample:\n  agentlab review RUN_ID --workspace ./project -- ./pi-review.sh\n\nThe reviewer receives private base, candidate, and current workspace copies plus the complete machine delta. It runs on the host with your permissions and may see sensitive captured content. AgentLab validates and records its JSON proposal, rechecks that the source workspace did not change, and applies nothing."
+        "AgentLab review\n\nAsk a trusted command-line reviewer which changes from a run are worth carrying forward. AgentLab records the proposal and applies nothing.\n\nUsage:\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nArguments:\n  RUN                       Completed AgentLab run to review\n  --workspace CURRENT       Current host workspace to compare with the run\n  --json                    Write the complete review receipt as JSON\n  -- COMMAND [ARG ...]      Trusted reviewer command and its arguments\n\nExample:\n  agentlab review RUN_ID --workspace ./project -- ./pi-review.sh\n\nThe reviewer receives private base, candidate, and current workspace copies; the original command output; evaluator observations; and the complete machine delta. It runs on the host with your permissions and may see sensitive captured content. AgentLab shows elapsed progress, retains every invocation, allows one correction for a structurally invalid proposal, rechecks that the source workspace did not change, and applies nothing."
     )?;
     Ok(())
 }
@@ -775,6 +794,22 @@ struct CliRunObserver<'a> {
     started: Instant,
 }
 
+struct CliReviewObserver<'a> {
+    stderr: &'a mut dyn Write,
+    started: Instant,
+}
+
+impl review::ReviewObserver for CliReviewObserver<'_> {
+    fn stage(&mut self, message: &str) -> std::io::Result<()> {
+        writeln!(
+            self.stderr,
+            "[{:.1}s] {message}",
+            self.started.elapsed().as_secs_f64()
+        )?;
+        self.stderr.flush()
+    }
+}
+
 impl run::RunObserver for CliRunObserver<'_> {
     fn stage(&mut self, message: &str) -> std::io::Result<()> {
         writeln!(
@@ -1260,7 +1295,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --verbose, -v             List repositories and every captured snapshot path\n  --json                    Write the complete underlying record as JSON"
+                    "AgentLab inspect\n\nInspect a stored snapshot, retained run, review attempt, or accepted input without printing captured file contents.\n\nUsage:\n  agentlab inspect [--json] [--verify] [--verbose] ID_OR_DIGEST\n\nOptions:\n  --verify                  Recompute and verify referenced identities and artifacts\n  --verbose, -v             List repositories, snapshot paths, or reviewer artifact paths\n  --json                    Write the complete underlying record as JSON"
                 )?;
                 return Ok(());
             }
@@ -1269,12 +1304,83 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             value => bail!("unexpected inspect argument {value:?}"),
         }
     }
-    let digest =
-        digest.ok_or_else(|| anyhow::anyhow!("inspect requires SNAPSHOT_RUN_OR_ACCEPTANCE"))?;
+    let digest = digest.ok_or_else(|| anyhow::anyhow!("inspect requires ID_OR_DIGEST"))?;
     let store = Store::open(None)?;
     if !digest.starts_with("sha256:") {
         let is_run = store.list_run_ids()?.iter().any(|run_id| run_id == digest);
         if !is_run {
+            if let Some(attempt) = review::find_attempt_optional(&store, digest)? {
+                if verify {
+                    review::verify_attempt(&store, &attempt)?;
+                    if let Some(record) = review::find_optional(&store, digest)? {
+                        review::verify(&store, &record)?;
+                    }
+                }
+                if json {
+                    serde_json::to_writer_pretty(&mut *stdout, &attempt)?;
+                    writeln!(stdout)?;
+                    return Ok(());
+                }
+                writeln!(stdout, "Review attempt: {}", attempt.review_id)?;
+                writeln!(stdout, "Schema: {}", attempt.schema_version)?;
+                writeln!(stdout, "Record: {}", attempt.digest)?;
+                writeln!(stdout, "Status: {}", attempt.status)?;
+                writeln!(stdout, "Run: {}", attempt.run_id)?;
+                writeln!(stdout, "Current workspace: {}", attempt.source_workspace)?;
+                writeln!(stdout, "Started: {}", attempt.started_at)?;
+                writeln!(stdout, "Completed: {}", attempt.completed_at)?;
+                writeln!(stdout, "Reviewer attempts: {}", attempt.invocations.len())?;
+                if let Some(failure) = &attempt.failure {
+                    writeln!(stdout, "Failure: {failure}")?;
+                }
+                for invocation in &attempt.invocations {
+                    writeln!(
+                        stdout,
+                        "  Attempt {}: {} (exit {})",
+                        invocation.attempt, invocation.status, invocation.exit_code
+                    )?;
+                    if let Some(error) = &invocation.validation_error {
+                        writeln!(stdout, "    Validation: {error}")?;
+                    }
+                    if verbose {
+                        writeln!(
+                            stdout,
+                            "    Stdout: {}",
+                            store
+                                .run_path(&attempt.run_id, &invocation.stdout.path)?
+                                .display()
+                        )?;
+                        writeln!(
+                            stdout,
+                            "    Stderr: {}",
+                            store
+                                .run_path(&attempt.run_id, &invocation.stderr.path)?
+                                .display()
+                        )?;
+                    }
+                }
+                writeln!(
+                    stdout,
+                    "Source workspace unchanged: {}",
+                    attempt.source_workspace_unchanged
+                )?;
+                writeln!(
+                    stdout,
+                    "AgentLab applied changes: {}",
+                    attempt.agentlab_applied_changes
+                )?;
+                if !verbose {
+                    writeln!(
+                        stdout,
+                        "Artifacts: agentlab inspect --verbose {}",
+                        attempt.review_id
+                    )?;
+                }
+                if verify {
+                    writeln!(stdout, "Integrity: verified")?;
+                }
+                return Ok(());
+            }
             let record = acceptance::find(&store, digest)?;
             if verify {
                 acceptance::verify(&store, &record)?;
@@ -1407,6 +1513,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             evaluation::list(&store, digest)?.len()
         )?;
         writeln!(stdout, "Reviews: {}", review::list(&store, digest)?.len())?;
+        writeln!(
+            stdout,
+            "Review attempts: {}",
+            review::list_attempts(&store, digest)?.len()
+        )?;
         writeln!(
             stdout,
             "Applications: {}",
