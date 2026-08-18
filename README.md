@@ -25,6 +25,7 @@ Milestones 1 through 7 implement deterministic workspace snapshots, isolated and
 - Produces a canonical snapshot identity and a versioned JSON manifest.
 - Inspects paths, hashes, sizes, modes, symlink targets, repositories, and ignore-rule identity without printing file contents.
 - Verifies manifest and blob integrity.
+- Opens blobs and source files without following symlinks, re-hashes the exact open descriptor before use, detects same-metadata source substitution, and replaces corrupt local cache objects only with verified bytes.
 - Fails precisely on unsupported special files instead of silently dropping them.
 - Resolves an OCI image immutably and executes one command in a uniquely named retained Docker container.
 - Optionally injects the host's default Pi authentication file from private runtime memory, records only the injection name, and removes it before filesystem export.
@@ -33,16 +34,19 @@ Milestones 1 through 7 implement deterministic workspace snapshots, isolated and
 - Rejects image volumes and external writable mounts that would escape complete root-filesystem observation.
 - Runs directly from either a mutable host directory (snapshotted at invocation) or an already stored snapshot digest.
 - Shows elapsed-time progress, streams guest stdout/stderr live, and recaptures a direct source workspace after execution to report whether it remained unchanged.
+- Escapes terminal control and bidirectional-display characters in human output while keeping original receipt bytes, and bounds live/retained guest output to 64 MiB per stream with an explicit warning if truncation occurs.
 - Derives a canonical run-input identity from the actual snapshot, resolved image, command, resource/network policy, captures, ignore rules, backend, and AgentLab version.
 - Supports concurrent independent runs and verifies exact repetitions or reports which real controlled inputs differ.
 - Retains a stable container supervisor so stop/start never reruns the original agent command.
 - Supports integrity-checked harness continuation from the exact filesystem, while explicitly reporting that process memory was not restored.
 - Creates independent filesystem-level forks and deletes only the selected run's owned container, image tag, and local artifacts.
 - Invokes arbitrary external evaluators against integrity-checked results and records their command, output, status, stdout/stderr, and named JSON observations.
+- Runs diff presenters, reviewers, and evaluators in isolated process groups with descendant cleanup, bounded output, and generous default timeouts; ordinary successful commands require no additional flags.
 - Aligns actual run-input, workspace, image, portable-base identities, and evaluator score names into Markdown or JSON rows without aggregation, ranking, statistics, or causal claims.
 - Constructs immutable base/candidate/current review bundles, exposes the original command output, structured evaluator observations, and actual changed-machine content to any trusted command-line reviewer, validates complete proposed/rejected/conflicted/unresolved dispositions and declarative environment recommendations, and records a proposal without applying it.
 - Shows elapsed review progress, retains every reviewer invocation as integrity-checked evidence, permits one constrained schema-correction attempt, and keeps rejected output inspectable without treating it as an actionable proposal.
 - Applies one review receipt only when the host workspace still exactly matches the reviewed current snapshot, requires explicit acknowledgement of conflicts or unresolved candidates, privately stages the result, retains a complete before snapshot, changes only proposed workspace operations, rolls back path-scoped failures, and verifies the exact after snapshot.
+- Performs apply mutations relative to pinned no-follow directory handles so a parent-path symlink swap cannot redirect an authorized operation outside the workspace.
 - Records an explicit `agentlab.acceptance/v1` decision for the exact workspace snapshot, immutable OCI image, platform, and guest workspace path tested by a completed run; exit status remains evidence rather than an automatic verdict.
 - Runs directly from an accepted input without repeating workspace/image flags, preserves parent review/apply/retest lineage, excludes test-session output from the next base, and protects referenced evidence from ordinary removal.
 
@@ -134,6 +138,13 @@ and selects one exact path regardless of either kind of ignore rule. `--json`
 without an explicit `--agent` or `--file` preserves the deterministic
 delta-manifest contract for scripts and never invokes a model.
 
+New per-file evidence uses `agentlab.file-diffs/v2`. Text patch construction is
+bounded to 2 MiB per file and 16 MiB per run, and a presenter request is bounded
+to 32 MiB. A path that exceeds a presentation budget retains exact metadata and
+content-addressed source evidence with an explicit omission warning; the limit
+does not turn presentation filtering into evidence deletion. Version-one
+bundles and their existing presentation receipts remain verifiable.
+
 The normal presentation can hide explicitly configured paths and can ask an
 optional trusted host harness to reduce the remaining diff to the parts a
 human needs to see. These are presentation choices only: the immutable raw and
@@ -163,7 +174,7 @@ timeout_seconds = 600
 [diff]
 use_agent = true
 ignore = [
-  "/tmp/jiti/**",
+  "/tmp/jiti/",
   "/workspace/.pi/sessions/*.lock.*",
   "/root/.pi/agent/models-store.json",
 ]
@@ -172,8 +183,11 @@ show_omitted_count = true
 
 `diff.ignore` accepts ordered Git-compatible patterns. AgentLab filters those
 paths before any content is sent to the configured harness and reports how
-many changes were hidden. It also collapses an added directory record when
-added child paths already account for that directory. Both decisions are
+many changes were hidden. A trailing slash is the clearest spelling for an
+entire directory and its descendants. It also collapses an added directory
+record only when its mode is the ordinary `0755` and at least one visible added
+descendant already accounts for that directory; unusual modes and directories
+whose only children were hidden stay visible. Both decisions are
 deterministic and reversible with `--raw`; no default ignore list is built in.
 Use `.agentlabignore` only when a path should be excluded from the portable
 run delta itself.
@@ -325,6 +339,12 @@ Successful evaluator stdout must be one JSON object:
 
 Score values must be JSON scalars; observations and extension fields may contain arbitrary JSON. Nonzero commands and malformed output are retained as `command_failed` or `invalid_output` records and are never silently treated as successful scores.
 
+Evaluators default to a 30-minute per-run limit and 16 MiB per stdout/stderr
+stream. `--timeout SECONDS` can select a shorter or longer limit (up to one
+day). A timeout or output-limit failure is retained explicitly and never
+promoted to a score. AgentLab also terminates evaluator descendants after the
+direct command exits so a background child cannot keep the invocation alive.
+
 Produce a row table from the latest successful matching evaluation for each run:
 
 ```bash
@@ -346,6 +366,11 @@ agentlab review \
   --workspace /path/to/current-workspace \
   -- ./examples/reviewers/pi-review.sh
 ```
+
+Reviewers likewise default to 30 minutes and 16 MiB per output stream. Use
+`agentlab review --timeout SECONDS ...` when a particular reviewer needs a
+different bound. Timeout, output-limit, and nonzero-command failures produce a
+rejected, inspectable review attempt rather than an actionable proposal.
 
 Run `agentlab review --help` for the complete command contract. A relative reviewer executable such as `./examples/reviewers/pi-review.sh` is resolved from the directory where you invoke AgentLab before the reviewer starts from the private current-workspace copy.
 
@@ -411,7 +436,7 @@ agentlab apply \
   --acknowledge-unresolved
 ```
 
-Those flags do not apply conflicted or unresolved paths; they authorize AgentLab to continue with only the proposal's `proposed` workspace operations. Rejected paths and all environment paths remain untouched. AgentLab permits one accepted apply per review, privately stages the exact intended result, takes a complete content-addressed before snapshot, serializes concurrent attempts, applies only exact relative paths without recursively deleting unreviewed directory content, verifies the resulting snapshot, and records `agentlab.apply/v1`. If a path-scoped operation fails, AgentLab attempts to restore every authorized path from the before snapshot. An interrupted apply leaves an exclusive lock and backup evidence so a later invocation does not guess whether it is safe to continue.
+Those flags do not apply conflicted or unresolved paths; they authorize AgentLab to continue with only the proposal's `proposed` workspace operations. Rejected paths and all environment paths remain untouched. AgentLab permits one accepted apply per review, privately stages the exact intended result, takes a complete content-addressed before snapshot, serializes concurrent attempts, and performs each exact mutation through pinned workspace directory handles that never follow parent symlinks. It does not recursively delete unreviewed directory content, verifies the resulting snapshot, and records `agentlab.apply/v1`. If a path-scoped operation fails, AgentLab attempts to restore every authorized path from the before snapshot. An interrupted apply leaves an exclusive lock and backup evidence so a later invocation does not guess whether it is safe to continue.
 
 The current human output deliberately emphasizes disposition, reason, operation, path, and exact snapshot identity. A polished terminal diff remains planned: it should offer an excellent unified or side-by-side view over immutable base/candidate/current and before/after content, with color and binary/type/mode handling. That renderer will be a read-only view; review receipts—not presentation output—remain the authority for apply.
 

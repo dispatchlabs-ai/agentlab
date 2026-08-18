@@ -16,12 +16,14 @@ use crate::review::{self, ReviewOptions};
 use crate::run::{self, CaptureSpec, RunOptions, SecretFileSpec, WorkspaceSource};
 use crate::snapshot::{self, CaptureMode, Repository};
 use crate::store::Store;
+use crate::terminal;
 
 pub fn run(arguments: Vec<String>, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     match execute(arguments, stdout, stderr) {
         Ok(()) => 0,
         Err(error) => {
-            let _ = writeln!(stderr, "agentlab: {error:#}");
+            let rendered = terminal::sanitize_external(&format!("{error:#}"));
+            let _ = writeln!(stderr, "agentlab: {rendered}");
             1
         }
     }
@@ -95,6 +97,7 @@ fn review_command(
     let mut run_id = None;
     let mut workspace = None;
     let mut json = false;
+    let mut timeout_seconds = crate::process::DEFAULT_EXTERNAL_TIMEOUT_SECONDS;
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
@@ -106,6 +109,14 @@ fn review_command(
                 )?))
             }
             "--json" => json = true,
+            "--timeout" => {
+                timeout_seconds = required_value(options, &mut index, "--timeout")?
+                    .parse::<u64>()
+                    .context("--timeout requires a whole number of seconds")?;
+                if !(1..=86_400).contains(&timeout_seconds) {
+                    bail!("--timeout must be between 1 and 86400 seconds");
+                }
+            }
             value if value.starts_with('-') => bail!("unexpected review argument {value:?}"),
             value if run_id.is_none() => run_id = Some(value.to_owned()),
             value => bail!("unexpected review argument {value:?}"),
@@ -127,6 +138,7 @@ fn review_command(
                 run_id,
                 workspace,
                 reviewer_command: reviewer_command.to_vec(),
+                timeout_seconds,
             },
             &mut observer,
         )?
@@ -139,7 +151,11 @@ fn review_command(
     writeln!(stdout, "Review: {}", record.review_id)?;
     writeln!(stdout, "Run: {}", record.run_id)?;
     writeln!(stdout, "Receipt: {}", record.digest)?;
-    writeln!(stdout, "Workspace path: {}", record.source_workspace)?;
+    writeln!(
+        stdout,
+        "Workspace path: {}",
+        terminal::escape(&record.source_workspace)
+    )?;
     writeln!(
         stdout,
         "Base snapshot: {}",
@@ -170,17 +186,31 @@ fn review_command(
         writeln!(
             stdout,
             "  {:<10} {} — {}",
-            disposition.disposition, disposition.path, disposition.reason
+            terminal::escape(&disposition.disposition),
+            terminal::escape(&disposition.path),
+            terminal::escape(&disposition.reason)
         )?;
         if let Some(recommendation) = &disposition.recommendation {
-            writeln!(stdout, "    recommendation: {recommendation}")?;
+            writeln!(
+                stdout,
+                "    recommendation: {}",
+                terminal::escape(recommendation)
+            )?;
         }
     }
     if !record.proposal.recommendations.is_empty() {
         writeln!(stdout, "Environment recommendations:")?;
         for recommendation in &record.proposal.recommendations {
-            writeln!(stdout, "  {}", recommendation.recommendation)?;
-            writeln!(stdout, "    reason: {}", recommendation.reason)?;
+            writeln!(
+                stdout,
+                "  {}",
+                terminal::escape(&recommendation.recommendation)
+            )?;
+            writeln!(
+                stdout,
+                "    reason: {}",
+                terminal::escape(&recommendation.reason)
+            )?;
         }
     }
     writeln!(
@@ -194,7 +224,7 @@ fn review_command(
         record.agentlab_applied_changes
     )?;
     for warning in &record.warnings {
-        writeln!(stdout, "Warning: {warning}")?;
+        writeln!(stdout, "Warning: {}", terminal::escape(warning))?;
     }
     writeln!(
         stdout,
@@ -218,7 +248,7 @@ fn review_command(
 fn print_review_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
-        "AgentLab review\n\nAsk a trusted command-line reviewer which changes from a run are worth carrying forward. AgentLab records the proposal and applies nothing.\n\nUsage:\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nArguments:\n  RUN                       Completed AgentLab run to review\n  --workspace CURRENT       Current host workspace to compare with the run\n  --json                    Write the complete review receipt as JSON\n  -- COMMAND [ARG ...]      Trusted reviewer command and its arguments\n\nExample:\n  agentlab review RUN_ID --workspace ./project -- ./pi-review.sh\n\nThe reviewer receives private base, candidate, and current workspace copies; the original command output; evaluator observations; and the complete machine delta. It runs on the host with your permissions and may see sensitive captured content. AgentLab shows elapsed progress, retains every invocation, allows one correction for a structurally invalid proposal, rechecks that the source workspace did not change, and applies nothing."
+        "AgentLab review\n\nAsk a trusted command-line reviewer which changes from a run are worth carrying forward. AgentLab records the proposal and applies nothing.\n\nUsage:\n  agentlab review [--json] [--timeout SECONDS] RUN --workspace CURRENT -- COMMAND [ARG ...]\n\nArguments:\n  RUN                       Completed AgentLab run to review\n  --workspace CURRENT       Current host workspace to compare with the run\n  --timeout SECONDS         Reviewer limit (default: 1800)\n  --json                    Write the complete review receipt as JSON\n  -- COMMAND [ARG ...]      Trusted reviewer command and its arguments\n\nExample:\n  agentlab review RUN_ID --workspace ./project -- ./pi-review.sh\n\nThe reviewer receives private base, candidate, and current workspace copies; the original command output; evaluator observations; and the complete machine delta. It runs on the host with your permissions and may see sensitive captured content. AgentLab shows elapsed progress, retains every invocation, allows one correction for a structurally invalid proposal, rechecks that the source workspace did not change, and applies nothing."
     )?;
     Ok(())
 }
@@ -303,7 +333,12 @@ fn apply_command(
         record.counts.applied
     )?;
     for operation in &record.operations {
-        writeln!(stdout, "  {:<7} {}", operation.operation, operation.path)?;
+        writeln!(
+            stdout,
+            "  {:<7} {}",
+            terminal::escape(&operation.operation),
+            terminal::escape(&operation.path)
+        )?;
     }
     writeln!(
         stdout,
@@ -456,11 +491,20 @@ fn evaluate_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> 
     }
     let mut name = None;
     let mut json = false;
+    let mut timeout_seconds = crate::process::DEFAULT_EXTERNAL_TIMEOUT_SECONDS;
     let mut run_ids = Vec::new();
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
             "--name" => name = Some(required_value(options, &mut index, "--name")?.to_owned()),
+            "--timeout" => {
+                timeout_seconds = required_value(options, &mut index, "--timeout")?
+                    .parse::<u64>()
+                    .context("--timeout requires a whole number of seconds")?;
+                if !(1..=86_400).contains(&timeout_seconds) {
+                    bail!("--timeout must be between 1 and 86400 seconds");
+                }
+            }
             "--json" => json = true,
             value if value.starts_with('-') => bail!("unexpected evaluate argument {value:?}"),
             value => run_ids.push(value.to_owned()),
@@ -480,11 +524,12 @@ fn evaluate_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> 
     let store = Store::open(None)?;
     let mut records = Vec::new();
     for run_id in &run_ids {
-        records.push(evaluation::evaluate(
+        records.push(evaluation::evaluate_with_timeout(
             &store,
             run_id,
             &evaluator_name,
             command,
+            timeout_seconds,
         )?);
     }
     if json {
@@ -494,7 +539,11 @@ fn evaluate_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> 
         for record in &records {
             writeln!(stdout, "Run: {}", record.run_id)?;
             writeln!(stdout, "Evaluation: {}", record.evaluation_id)?;
-            writeln!(stdout, "Evaluator: {}", record.evaluator_name)?;
+            writeln!(
+                stdout,
+                "Evaluator: {}",
+                terminal::escape(&record.evaluator_name)
+            )?;
             writeln!(stdout, "Status: {}", record.status)?;
             writeln!(stdout, "Exit code: {}", record.exit_code)?;
             if let Some(output) = &record.output {
@@ -504,11 +553,16 @@ fn evaluate_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> 
                     if output.scores.is_empty() {
                         "none".to_owned()
                     } else {
-                        output.scores.keys().cloned().collect::<Vec<_>>().join(", ")
+                        output
+                            .scores
+                            .keys()
+                            .map(|key| terminal::escape(key))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 )?;
                 if let Some(summary) = &output.summary {
-                    writeln!(stdout, "Summary: {summary}")?;
+                    writeln!(stdout, "Summary: {}", terminal::escape(summary))?;
                 }
             }
         }
@@ -554,9 +608,13 @@ fn report_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         serde_json::to_writer_pretty(&mut *stdout, &table)?;
         writeln!(stdout)?;
     } else {
-        write!(stdout, "{}", evaluation::markdown_table(&table))?;
+        write!(
+            stdout,
+            "{}",
+            terminal::sanitize_external(&evaluation::markdown_table(&table))
+        )?;
         for warning in &table.warnings {
-            writeln!(stdout, "Warning: {warning}")?;
+            writeln!(stdout, "Warning: {}", terminal::escape(warning))?;
         }
     }
     Ok(())
@@ -816,6 +874,19 @@ struct CliRunObserver<'a> {
     stderr: &'a mut dyn Write,
     json: bool,
     started: Instant,
+    command_stdout_sanitizer: terminal::StreamSanitizer,
+    command_stderr_sanitizer: terminal::StreamSanitizer,
+}
+
+impl CliRunObserver<'_> {
+    fn finish_command_output(&mut self) -> std::io::Result<()> {
+        if self.json {
+            self.command_stdout_sanitizer.finish(self.stderr)?;
+        } else {
+            self.command_stdout_sanitizer.finish(self.stdout)?;
+        }
+        self.command_stderr_sanitizer.finish(self.stderr)
+    }
 }
 
 struct CliReviewObserver<'a> {
@@ -830,6 +901,7 @@ struct CliDiffObserver<'a> {
 
 impl review::ReviewObserver for CliReviewObserver<'_> {
     fn stage(&mut self, message: &str) -> std::io::Result<()> {
+        let message = terminal::sanitize_external(message);
         writeln!(
             self.stderr,
             "[{:.1}s] {message}",
@@ -841,6 +913,7 @@ impl review::ReviewObserver for CliReviewObserver<'_> {
 
 impl diff::DiffObserver for CliDiffObserver<'_> {
     fn stage(&mut self, message: &str) -> std::io::Result<()> {
+        let message = terminal::sanitize_external(message);
         writeln!(
             self.stderr,
             "[{:.1}s] {message}",
@@ -852,6 +925,7 @@ impl diff::DiffObserver for CliDiffObserver<'_> {
 
 impl run::RunObserver for CliRunObserver<'_> {
     fn stage(&mut self, message: &str) -> std::io::Result<()> {
+        let message = terminal::sanitize_external(message);
         writeln!(
             self.stderr,
             "[{:.1}s] {message}",
@@ -862,16 +936,16 @@ impl run::RunObserver for CliRunObserver<'_> {
 
     fn command_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.json {
-            self.stderr.write_all(bytes)?;
+            self.command_stdout_sanitizer.write(self.stderr, bytes)?;
             self.stderr.flush()
         } else {
-            self.stdout.write_all(bytes)?;
+            self.command_stdout_sanitizer.write(self.stdout, bytes)?;
             self.stdout.flush()
         }
     }
 
     fn command_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.stderr.write_all(bytes)?;
+        self.command_stderr_sanitizer.write(self.stderr, bytes)?;
         self.stderr.flush()
     }
 }
@@ -887,7 +961,7 @@ fn print_run_help(stdout: &mut dyn Write) -> Result<()> {
 fn print_evaluate_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
-        "AgentLab evaluate\n\nInvoke one trusted host command against one or more integrity-checked run results.\n\nUsage:\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n\nThe evaluator receives absolute AgentLab artifact paths through environment variables and must emit one JSON object. Evaluators run with the invoking user's host permissions; AgentLab does not sandbox them."
+        "AgentLab evaluate\n\nInvoke one trusted host command against one or more integrity-checked run results.\n\nUsage:\n  agentlab evaluate [--name NAME] [--timeout SECONDS] [--json] RUN... -- COMMAND [ARG ...]\n\nOptions:\n  --name NAME               Stable evaluator name\n  --timeout SECONDS         Per-run evaluator limit (default: 1800)\n  --json                    Write complete evaluation receipts as JSON\n\nThe evaluator receives absolute AgentLab artifact paths through environment variables and must emit one JSON object. Evaluators run with the invoking user's host permissions; AgentLab does not sandbox them."
     )?;
     Ok(())
 }
@@ -1048,8 +1122,12 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
             stderr,
             json,
             started: Instant::now(),
+            command_stdout_sanitizer: terminal::StreamSanitizer::default(),
+            command_stderr_sanitizer: terminal::StreamSanitizer::default(),
         };
-        run::execute_with_observer(&parsed, &store, &mut observer)?
+        let result = run::execute_with_observer(&parsed, &store, &mut observer);
+        observer.finish_command_output()?;
+        result?
     };
     if json {
         serde_json::to_writer_pretty(&mut *stdout, &result)?;
@@ -1180,7 +1258,11 @@ fn display_names(names: &[String]) -> String {
     if names.is_empty() {
         "none".to_owned()
     } else {
-        names.join(", ")
+        names
+            .iter()
+            .map(|name| terminal::escape(name))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -1191,6 +1273,18 @@ fn shell_word(value: &str) -> String {
             .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.:".contains(&byte))
     {
         value.to_owned()
+    } else if terminal::escape(value) != value {
+        let mut escaped = String::from("$'");
+        for byte in value.as_bytes() {
+            match byte {
+                b'\\' => escaped.push_str("\\\\"),
+                b'\'' => escaped.push_str("\\'"),
+                0x20..=0x7e => escaped.push(char::from(*byte)),
+                _ => escaped.push_str(&format!("\\x{byte:02x}")),
+            }
+        }
+        escaped.push('\'');
+        escaped
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
@@ -1294,7 +1388,11 @@ fn snapshot_command(
         writeln!(stdout)?;
     } else {
         writeln!(stdout, "Snapshot: {}", result.manifest.digest)?;
-        writeln!(stdout, "Workspace: {}", result.workspace.display())?;
+        writeln!(
+            stdout,
+            "Workspace: {}",
+            terminal::escape(&result.workspace.display().to_string())
+        )?;
         writeln!(stdout, "Capture: {}", capture_mode.as_str())?;
         writeln!(stdout, "Included paths: {}", result.included_paths)?;
         writeln!(stdout, "Excluded paths: {}", result.excluded_paths)?;
@@ -1319,6 +1417,7 @@ fn snapshot_command(
 }
 
 fn write_cli_stage(stderr: &mut dyn Write, started: Instant, message: &str) -> Result<()> {
+    let message = terminal::sanitize_external(message);
     writeln!(
         stderr,
         "[{:.1}s] {message}",
@@ -1397,7 +1496,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                         presentation.structurally_collapsed_paths.len()
                     )?;
                     if let Some(source) = &presentation.presentation_ignore_source {
-                        writeln!(stdout, "Presentation-ignore source: {source}")?;
+                        writeln!(
+                            stdout,
+                            "Presentation-ignore source: {}",
+                            terminal::escape(source)
+                        )?;
                         writeln!(
                             stdout,
                             "Presentation-ignore rules: {}",
@@ -1406,7 +1509,11 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                     }
                 }
                 writeln!(stdout, "Raw selection: {}", presentation.raw)?;
-                writeln!(stdout, "Harness: {}", presentation.harness_name)?;
+                writeln!(
+                    stdout,
+                    "Harness: {}",
+                    terminal::escape(&presentation.harness_name)
+                )?;
                 writeln!(stdout, "Command: {}", display_names(&presentation.command))?;
                 writeln!(stdout, "Prompt: {}", presentation.prompt_version)?;
                 writeln!(stdout, "Started: {}", presentation.started_at)?;
@@ -1414,7 +1521,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 writeln!(stdout, "Exit code: {}", presentation.exit_code)?;
                 writeln!(stdout, "AgentLab applied changes: false")?;
                 for warning in &presentation.warnings {
-                    writeln!(stdout, "Warning: {warning}")?;
+                    writeln!(stdout, "Warning: {}", terminal::escape(warning))?;
                 }
                 if verbose {
                     for (label, artifact) in [
@@ -1468,12 +1575,16 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 writeln!(stdout, "Record: {}", attempt.digest)?;
                 writeln!(stdout, "Status: {}", attempt.status)?;
                 writeln!(stdout, "Run: {}", attempt.run_id)?;
-                writeln!(stdout, "Current workspace: {}", attempt.source_workspace)?;
+                writeln!(
+                    stdout,
+                    "Current workspace: {}",
+                    terminal::escape(&attempt.source_workspace)
+                )?;
                 writeln!(stdout, "Started: {}", attempt.started_at)?;
                 writeln!(stdout, "Completed: {}", attempt.completed_at)?;
                 writeln!(stdout, "Reviewer attempts: {}", attempt.invocations.len())?;
                 if let Some(failure) = &attempt.failure {
-                    writeln!(stdout, "Failure: {failure}")?;
+                    writeln!(stdout, "Failure: {}", terminal::escape(failure))?;
                 }
                 for invocation in &attempt.invocations {
                     writeln!(
@@ -1482,7 +1593,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                         invocation.attempt, invocation.status, invocation.exit_code
                     )?;
                     if let Some(error) = &invocation.validation_error {
-                        writeln!(stdout, "    Validation: {error}")?;
+                        writeln!(stdout, "    Validation: {}", terminal::escape(error))?;
                     }
                     if verbose {
                         writeln!(
@@ -1540,11 +1651,16 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             writeln!(stdout, "Decision: {}", record.decision)?;
             writeln!(stdout, "Accepted at: {}", record.accepted_at)?;
             writeln!(stdout, "Workspace: {}", record.workspace_snapshot_digest)?;
-            writeln!(stdout, "Workspace path: {}", record.workspace_guest_path)?;
+            writeln!(
+                stdout,
+                "Workspace path: {}",
+                terminal::escape(&record.workspace_guest_path)
+            )?;
             writeln!(
                 stdout,
                 "OCI image: {} ({})",
-                record.image.execution_reference, record.image.resolved_digest
+                terminal::escape(&record.image.execution_reference),
+                record.image.resolved_digest
             )?;
             writeln!(stdout, "Test run: {}", record.tested_by_run_id)?;
             writeln!(stdout, "Test result: {}", record.test_result_digest)?;
@@ -1558,7 +1674,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 writeln!(stdout, "Apply: {}", lineage.apply_id)?;
             }
             for warning in &record.warnings {
-                writeln!(stdout, "Warning: {warning}")?;
+                writeln!(stdout, "Warning: {}", terminal::escape(warning))?;
             }
             writeln!(
                 stdout,
@@ -1678,7 +1794,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             acceptance::list_for_run(&store, digest)?.len()
         )?;
         for warning in &result.warnings {
-            writeln!(stdout, "Warning: {warning}")?;
+            writeln!(stdout, "Warning: {}", terminal::escape(warning))?;
         }
         if verify {
             writeln!(stdout, "Integrity: verified")?;
@@ -1708,19 +1824,24 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             writeln!(
                 stdout,
                 "  repo  {} ({} metadata at {})",
-                repository.path, repository.metadata_kind, repository.metadata_path
+                terminal::escape(&repository.path),
+                terminal::escape(&repository.metadata_kind),
+                terminal::escape(&repository.metadata_path)
             )?;
         }
         for entry in &manifest.entries {
             let detail = match entry.kind.as_str() {
                 "file" => format!(" size={} digest={}", entry.size, entry.digest),
-                "symlink" => format!(" target={:?}", entry.link_target),
+                "symlink" => format!(" target={:?}", terminal::escape(&entry.link_target)),
                 _ => String::new(),
             };
             writeln!(
                 stdout,
                 "  {:<9} {:04o} {}{}",
-                entry.kind, entry.mode, entry.path, detail
+                terminal::escape(&entry.kind),
+                entry.mode,
+                terminal::escape(&entry.path),
+                detail
             )?;
         }
     }
@@ -1847,13 +1968,15 @@ fn diff_command(
             serde_json::to_writer_pretty(&mut *stdout, file)?;
             writeln!(stdout)?;
         } else {
-            write!(stdout, "{}", diff::render_complete(&bundle, Some(path))?)?;
+            let rendered = diff::render_complete(&bundle, Some(path))?;
+            write!(stdout, "{}", terminal::sanitize_external(&rendered))?;
         }
         return Ok(());
     }
 
     if raw {
-        write!(stdout, "{}", diff::render_complete(&bundle, None)?)?;
+        let rendered = diff::render_complete(&bundle, None)?;
+        write!(stdout, "{}", terminal::sanitize_external(&rendered))?;
         return Ok(());
     }
 
@@ -1863,7 +1986,8 @@ fn diff_command(
         &config.diff.ignore,
     )?;
     if view == DiffView::NoAgent {
-        write!(stdout, "{}", diff::render_selection(&selection)?)?;
+        let rendered = diff::render_selection(&selection)?;
+        write!(stdout, "{}", terminal::sanitize_external(&rendered))?;
         return Ok(());
     }
 
@@ -1879,7 +2003,8 @@ fn diff_command(
             stderr,
             "AgentLab: agent diff presentation requested, but no harness is configured; showing the deterministic presentation selection."
         )?;
-        write!(stdout, "{}", diff::render_selection(&selection)?)?;
+        let rendered = diff::render_selection(&selection)?;
+        write!(stdout, "{}", terminal::sanitize_external(&rendered))?;
         return Ok(());
     };
     let record = {
@@ -1903,14 +2028,19 @@ fn diff_command(
         return Ok(());
     }
     if record.status == "succeeded" {
-        let presentation = diff::presentation_output(&store, &record)?;
+        let presentation =
+            terminal::sanitize_external(&diff::presentation_output(&store, &record)?);
         writeln!(
             stdout,
             "Important changes from {} shown filesystem changes ({} captured)",
             selection.presented_change_count, selection.source_change_count
         )?;
         write_diff_selection_disclosure(stdout, &selection)?;
-        writeln!(stdout, "Reviewed by harness: {}", record.harness_name)?;
+        writeln!(
+            stdout,
+            "Reviewed by harness: {}",
+            terminal::escape(&record.harness_name)
+        )?;
         writeln!(stdout, "Presentation: {}\n", record.presentation_id)?;
         write!(stdout, "{presentation}")?;
         if !presentation.ends_with('\n') {
@@ -1922,12 +2052,14 @@ fn diff_command(
     writeln!(
         stderr,
         "AgentLab: diff harness {} returned {}; showing the deterministic presentation selection.",
-        record.harness_name, record.status
+        terminal::escape(&record.harness_name),
+        terminal::escape(&record.status)
     )?;
     for warning in &record.warnings {
-        writeln!(stderr, "AgentLab: {warning}")?;
+        writeln!(stderr, "AgentLab: {}", terminal::escape(warning))?;
     }
-    write!(stdout, "{}", diff::render_selection(&selection)?)?;
+    let rendered = diff::render_selection(&selection)?;
+    write!(stdout, "{}", terminal::sanitize_external(&rendered))?;
     Ok(())
 }
 
@@ -1964,7 +2096,7 @@ fn write_diff_selection_disclosure(
     if !selection.collapsed_paths.is_empty() {
         writeln!(
             stdout,
-            "{} implied directory {} collapsed.",
+            "{} implied mode-0755 directory {} collapsed.",
             selection.collapsed_paths.len(),
             if selection.collapsed_paths.len() == 1 {
                 "change"
@@ -1993,12 +2125,22 @@ fn render_diff_inventory(
     writeln!(stdout, "Result: {}", delta.result_filesystem_digest)?;
     writeln!(stdout, "Changes: {}", delta.changes.len())?;
     for change in &delta.changes {
-        writeln!(stdout, "  {:?} {}", change.change, change.path)?;
+        writeln!(
+            stdout,
+            "  {:?} {}",
+            change.change,
+            terminal::escape(&change.path)
+        )?;
     }
     if !raw {
         writeln!(stdout, "Ignored changes: {}", delta.ignored_changes.len())?;
         for change in &delta.ignored_changes {
-            writeln!(stdout, "  {:?} {}", change.change, change.path)?;
+            writeln!(
+                stdout,
+                "  {:?} {}",
+                change.change,
+                terminal::escape(&change.path)
+            )?;
         }
     }
     Ok(())
@@ -2008,7 +2150,7 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--agent | --no-agent | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes with optional agent curation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation ignores and a trusted host harness may be configured only in ~/.agentlab/config.toml; they never alter evidence, and --raw always shows every captured machine change without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--agent | --no-agent | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--timeout SECONDS] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] [--timeout SECONDS] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes with optional agent curation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation ignores and a trusted host harness may be configured only in ~/.agentlab/config.toml; they never alter evidence, and --raw always shows every captured machine change without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
     )?;
     Ok(())
 }
@@ -2024,6 +2166,7 @@ mod tests {
             shell_word("/tmp/Chris's workspace"),
             "'/tmp/Chris'\"'\"'s workspace'"
         );
+        assert_eq!(shell_word("/tmp/first\nsecond"), "$'/tmp/first\\x0asecond'");
     }
 
     #[test]

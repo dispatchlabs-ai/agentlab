@@ -4,7 +4,7 @@ mod materialize;
 pub use materialize::materialize;
 
 use std::collections::HashSet;
-use std::fs::{self, FileType, Metadata};
+use std::fs::{self, File, FileType, Metadata, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -106,6 +106,14 @@ pub(crate) struct Candidate {
     pub mode: u32,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    #[cfg(unix)]
+    pub device: u64,
+    #[cfg(unix)]
+    pub inode: u64,
+    #[cfg(unix)]
+    pub changed_seconds: i64,
+    #[cfg(unix)]
+    pub changed_nanoseconds: i64,
 }
 
 pub fn create(workspace: &Path, store: &Store) -> Result<SnapshotResult> {
@@ -191,12 +199,18 @@ pub fn create_with_mode(
         match candidate.kind {
             CandidateKind::File => {
                 entry.kind = "file".to_string();
+                let mut source = open_stable_candidate(candidate)?;
                 let stored = store
-                    .put_file(&candidate.absolute)
+                    .put_reader(&mut source)
                     .with_context(|| format!("capture file {:?}", candidate.path))?;
-                let after = fs::symlink_metadata(&candidate.absolute)
-                    .with_context(|| format!("reinspect file {:?}", candidate.path))?;
-                if !file_metadata_unchanged(candidate, &after) {
+                let opened_after = source
+                    .metadata()
+                    .with_context(|| format!("reinspect open file {:?}", candidate.path))?;
+                let path_after = fs::symlink_metadata(&candidate.absolute)
+                    .with_context(|| format!("reinspect file path {:?}", candidate.path))?;
+                if !file_metadata_unchanged(candidate, &opened_after)
+                    || !file_metadata_unchanged(candidate, &path_after)
+                {
                     bail!(
                         "workspace changed while snapshotting {:?}; retry from a stable source",
                         candidate.path
@@ -300,7 +314,7 @@ pub fn verify(store: &Store, manifest: &Manifest) -> Result<()> {
             continue;
         }
         let mut blob = store
-            .open_blob(&entry.digest)
+            .open_blob(&entry.digest, entry.size)
             .with_context(|| format!("open blob for {:?}", entry.path))?;
         let mut hasher = Sha256::new();
         let size = std::io::copy(&mut blob, &mut hasher)
@@ -359,6 +373,14 @@ fn scan_directory(root: &Path, directory: &Path, candidates: &mut Vec<Candidate>
             mode: portable_mode(&metadata),
             size: metadata.len(),
             modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: unix_device(&metadata),
+            #[cfg(unix)]
+            inode: unix_inode(&metadata),
+            #[cfg(unix)]
+            changed_seconds: unix_changed_seconds(&metadata),
+            #[cfg(unix)]
+            changed_nanoseconds: unix_changed_nanoseconds(&metadata),
         });
         if kind == CandidateKind::Directory {
             scan_directory(root, &absolute, candidates)?;
@@ -401,10 +423,72 @@ fn candidate_from_metadata(metadata: &Metadata) -> CandidateKind {
 }
 
 fn file_metadata_unchanged(candidate: &Candidate, after: &Metadata) -> bool {
-    candidate_from_metadata(after) == candidate.kind
+    let portable = candidate_from_metadata(after) == candidate.kind
         && portable_mode(after) == candidate.mode
         && after.len() == candidate.size
-        && after.modified().ok() == candidate.modified
+        && after.modified().ok() == candidate.modified;
+    #[cfg(unix)]
+    {
+        portable
+            && unix_device(after) == candidate.device
+            && unix_inode(after) == candidate.inode
+            && unix_changed_seconds(after) == candidate.changed_seconds
+            && unix_changed_nanoseconds(after) == candidate.changed_nanoseconds
+    }
+    #[cfg(not(unix))]
+    {
+        portable
+    }
+}
+
+fn open_stable_candidate(candidate: &Candidate) -> Result<File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(&candidate.absolute).with_context(|| {
+        format!(
+            "open workspace file {:?} without following symlinks",
+            candidate.path
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect open workspace file {:?}", candidate.path))?;
+    if !file_metadata_unchanged(candidate, &metadata) {
+        bail!(
+            "workspace changed before snapshotting {:?}; retry from a stable source",
+            candidate.path
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn unix_device(metadata: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.dev()
+}
+
+#[cfg(unix)]
+fn unix_inode(metadata: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ino()
+}
+
+#[cfg(unix)]
+fn unix_changed_seconds(metadata: &Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ctime()
+}
+
+#[cfg(unix)]
+fn unix_changed_nanoseconds(metadata: &Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ctime_nsec()
 }
 
 #[cfg(unix)]
@@ -514,9 +598,77 @@ mod tests {
             mode: portable_mode(&before),
             size: before.len(),
             modified: before.modified().ok(),
+            device: unix_device(&before),
+            inode: unix_inode(&before),
+            changed_seconds: unix_changed_seconds(&before),
+            changed_nanoseconds: unix_changed_nanoseconds(&before),
         };
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let after = fs::symlink_metadata(path).unwrap();
         assert!(!file_metadata_unchanged(&candidate, &after));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_size_and_restored_mtime_still_detects_content_substitution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        fs::write(&path, b"original").unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        let candidate = Candidate {
+            path: "file".to_owned(),
+            absolute: path.clone(),
+            kind: candidate_from_metadata(&before),
+            mode: portable_mode(&before),
+            size: before.len(),
+            modified: before.modified().ok(),
+            device: unix_device(&before),
+            inode: unix_inode(&before),
+            changed_seconds: unix_changed_seconds(&before),
+            changed_nanoseconds: unix_changed_nanoseconds(&before),
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&path, b"replaced").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        let after = fs::symlink_metadata(&path).unwrap();
+
+        assert_eq!(candidate.size, after.len());
+        assert_eq!(candidate.modified, after.modified().ok());
+        assert!(!file_metadata_unchanged(&candidate, &after));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_open_never_follows_a_replacement_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        let outside = temporary.path().join("outside");
+        fs::write(&path, b"inside").unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        let candidate = Candidate {
+            path: "file".to_owned(),
+            absolute: path.clone(),
+            kind: candidate_from_metadata(&before),
+            mode: portable_mode(&before),
+            size: before.len(),
+            modified: before.modified().ok(),
+            device: unix_device(&before),
+            inode: unix_inode(&before),
+            changed_seconds: unix_changed_seconds(&before),
+            changed_nanoseconds: unix_changed_nanoseconds(&before),
+        };
+
+        fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(open_stable_candidate(&candidate).is_err());
     }
 }

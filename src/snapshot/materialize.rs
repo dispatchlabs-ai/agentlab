@@ -36,7 +36,7 @@ pub fn materialize(store: &Store, manifest: &Manifest, destination: &Path) -> Re
             "symlink" => create_symlink(&entry.link_target, &target)
                 .with_context(|| format!("create symlink {:?}", entry.path))?,
             "file" => {
-                let mut blob = store.open_blob(&entry.digest)?;
+                let mut blob = store.open_blob(&entry.digest, entry.size)?;
                 let mut output: File = create_new_file(&target)?;
                 io::copy(&mut blob, &mut output)
                     .with_context(|| format!("materialize file {:?}", entry.path))?;

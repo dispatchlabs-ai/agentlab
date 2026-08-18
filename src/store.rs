@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -54,8 +54,12 @@ impl Store {
     }
 
     pub fn put_file(&self, path: &Path) -> Result<PutResult> {
-        let mut source =
-            File::open(path).with_context(|| format!("open source file {}", path.display()))?;
+        let mut source = open_file_nofollow(path).with_context(|| {
+            format!(
+                "open source file {} without following symlinks",
+                path.display()
+            )
+        })?;
         self.put_reader(&mut source)
             .with_context(|| format!("capture source file {}", path.display()))
     }
@@ -88,12 +92,15 @@ impl Store {
         let hex = normalize_digest(&digest)?;
         let destination = self.blob_path(&hex);
 
-        if self.contains_blob(&digest, size)? {
-            return Ok(PutResult {
-                digest,
-                size,
-                created: false,
-            });
+        match self.inspect_blob(&digest, size)? {
+            BlobState::Valid => {
+                return Ok(PutResult {
+                    digest,
+                    size,
+                    created: false,
+                });
+            }
+            BlobState::Missing | BlobState::Corrupt => {}
         }
 
         temporary
@@ -112,14 +119,27 @@ impl Store {
                 created: true,
             }),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::metadata(&destination).context("inspect concurrent blob")?;
-                if metadata.len() != size {
-                    bail!("content store collision for {digest}");
+                if self.inspect_blob(&digest, size)? == BlobState::Valid {
+                    return Ok(PutResult {
+                        digest,
+                        size,
+                        created: false,
+                    });
                 }
+                // The incoming temporary file was hashed while it was written,
+                // so it is the authoritative repair for a corrupt same-name
+                // object. `persist` replaces the directory entry atomically;
+                // readers with an already-open descriptor continue to see the
+                // prior inode and cannot observe a partial object.
+                error
+                    .file
+                    .persist(&destination)
+                    .map_err(|persist_error| persist_error.error)
+                    .context("replace corrupt content blob")?;
                 Ok(PutResult {
                     digest,
                     size,
-                    created: false,
+                    created: true,
                 })
             }
             Err(error) => Err(error.error).context("persist content blob"),
@@ -127,21 +147,25 @@ impl Store {
     }
 
     pub fn contains_blob(&self, digest: &str, expected_size: u64) -> Result<bool> {
-        let hex = normalize_digest(digest)?;
-        match fs::metadata(self.blob_path(&hex)) {
-            Ok(metadata) if metadata.len() == expected_size => Ok(true),
-            Ok(metadata) => bail!(
-                "content store collision for {digest}: stored size {}, expected {expected_size}",
-                metadata.len()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).context("inspect existing content blob"),
+        match self.inspect_blob(digest, expected_size)? {
+            BlobState::Missing => Ok(false),
+            BlobState::Valid => Ok(true),
+            BlobState::Corrupt => {
+                bail!("content blob integrity mismatch for {digest}")
+            }
         }
     }
 
-    pub fn open_blob(&self, digest: &str) -> Result<File> {
+    pub fn open_blob(&self, digest: &str, expected_size: u64) -> Result<File> {
         let hex = normalize_digest(digest)?;
-        File::open(self.blob_path(&hex)).with_context(|| format!("open content blob {digest}"))
+        let path = self.blob_path(&hex);
+        let mut file =
+            open_file_nofollow(&path).with_context(|| format!("open content blob {digest}"))?;
+        if !verify_open_file(&mut file, digest, expected_size)? {
+            bail!("content blob integrity mismatch for {digest}");
+        }
+        file.rewind().context("rewind verified content blob")?;
+        Ok(file)
     }
 
     pub fn write_snapshot(&self, digest: &str, data: &[u8]) -> Result<()> {
@@ -358,6 +382,61 @@ impl Store {
             .join(&hex[..2])
             .join(&hex[2..])
     }
+
+    fn inspect_blob(&self, digest: &str, expected_size: u64) -> Result<BlobState> {
+        let hex = normalize_digest(digest)?;
+        let path = self.blob_path(&hex);
+        let mut file = match open_file_nofollow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BlobState::Missing);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect content blob {digest}"));
+            }
+        };
+        if verify_open_file(&mut file, digest, expected_size)? {
+            Ok(BlobState::Valid)
+        } else {
+            Ok(BlobState::Corrupt)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobState {
+    Missing,
+    Valid,
+    Corrupt,
+}
+
+fn verify_open_file(file: &mut File, digest: &str, expected_size: u64) -> Result<bool> {
+    let metadata = file.metadata().context("inspect open content blob")?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_size {
+        return Ok(false);
+    }
+    let mut hasher = Sha256::new();
+    let actual_size = std::io::copy(file, &mut hasher).context("hash open content blob")?;
+    let actual = format!("sha256:{}", hex_digest(&hasher.finalize()));
+    Ok(actual_size == expected_size && actual == digest)
+}
+
+#[cfg(unix)]
+fn open_file_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_nofollow(path: &Path) -> std::io::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("content blob is a symlink"));
+    }
+    File::open(path)
 }
 
 fn validate_run_id(run_id: &str) -> Result<()> {
@@ -462,4 +541,53 @@ pub fn create_new_file(path: &Path) -> Result<File> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("create {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_length_blob_corruption_is_detected_and_repaired_from_known_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(temporary.path())).unwrap();
+        let original = store.put_bytes(b"correct").unwrap();
+        let path = store.blob_path(&normalize_digest(&original.digest).unwrap());
+        fs::write(&path, b"corrupt").unwrap();
+
+        assert!(
+            store
+                .contains_blob(&original.digest, original.size)
+                .is_err()
+        );
+        assert!(store.open_blob(&original.digest, original.size).is_err());
+
+        let repaired = store.put_bytes(b"correct").unwrap();
+        assert!(repaired.created);
+        let mut bytes = Vec::new();
+        store
+            .open_blob(&repaired.digest, repaired.size)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"correct");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_blob_symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(temporary.path())).unwrap();
+        let stored = store.put_bytes(b"expected").unwrap();
+        let path = store.blob_path(&normalize_digest(&stored.digest).unwrap());
+        let outside = temporary.path().join("outside");
+        fs::write(&outside, b"expected").unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(store.open_blob(&stored.digest, stored.size).is_err());
+        assert!(store.contains_blob(&stored.digest, stored.size).is_err());
+    }
 }

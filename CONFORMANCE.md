@@ -44,6 +44,8 @@ The test proves both default complete capture and explicit Git-ignore filtering:
 11. CLI JSON is machine-readable.
 12. Default inspection exposes metadata but not file contents.
 13. Direct `run` and `evaluate` help succeeds without a command separator, and run help declares `bridge` as the default network policy.
+14. Same-length blob corruption is detected, no blob symlink is followed, and a later verified write atomically heals a corrupt cache object.
+15. Snapshot capture pins the opened source descriptor and compares device, inode, change time, type, mode, size, and modification time before and after reading so a same-size/same-mtime substitution cannot be accepted.
 
 The hands-on checkpoint additionally runs the public CLI against a workspace chosen by the user, repeats the snapshot, inspects and verifies the digest, and independently confirms the source is unchanged.
 
@@ -76,10 +78,10 @@ Unit coverage plus the hands-on Wvains checkpoint prove:
 1. Every selected normalized change receives one path-ordered per-file record with exact before/after metadata.
 2. Text additions, modifications, and deletions render as unified patches; binary and metadata-only paths are never rendered as invented text.
 3. Missing historical content is explicit, while new runs preserve changed before-content for later review.
-4. Per-file bundles are content-addressed, tied to the selected raw or portable delta, retained beneath the run, and independently verified.
+4. Per-file bundles are content-addressed, tied to the selected raw or portable delta, retained beneath the run, and deterministically re-derived during verification; changing a summary and recomputing only the bundle digest is rejected.
 5. `--no-agent`, `--file`, `--inventory`, `--raw`, and deterministic JSON remain available without a model; `--complete` is unnecessary because per-file evidence is the baseline.
 6. Only trusted global configuration beneath the private AgentLab state directory selects a named command-argv harness or presentation-ignore patterns; workspace content cannot choose a host command or hide evidence.
-7. Git-compatible presentation ignores and implied added-directory collapsing produce a content-addressed selection while leaving raw and portable evidence identities unchanged.
+7. Git-compatible presentation ignores and implied added-directory collapsing produce a content-addressed selection while leaving raw and portable evidence identities unchanged. Directory-only patterns match directory records; only ordinary mode-`0755` directories with a visible descendant collapse, while unusual modes and directories with only hidden children remain visible.
 8. `--raw` and `--file` bypass presentation ignores, structural collapsing, and agent curation.
 9. The generic harness receives only selected per-file records and aggregate hidden/collapsed counts on stdin from a private temporary working directory; exact hidden patterns, paths, and contents remain local in the receipt.
 10. The presenter prompt marks all diff content as untrusted data and asks only for relevance-oriented display.
@@ -87,6 +89,9 @@ Unit coverage plus the hands-on Wvains checkpoint prove:
 12. Every version-two presentation records and verifies its run, delta, source per-file, and presented-selection identities; config source; pattern digest and ordered patterns; exact hidden and collapsed paths; source/presented counts; selection, request, stdout and stderr artifacts; harness argv; prompt version; timestamps; status; and receipt digest. Version-one receipts remain verifiable.
 13. `agentlab inspect --verify PRESENTATION_ID` verifies a presentation without rehashing multi-gigabyte rootfs exports; `agentlab inspect --verify RUN_ID` remains the explicit full-artifact audit.
 14. The original Wvains dogfood run reduced 19 complete filesystem changes through a no-tools, no-session Pi harness in 24.7 seconds while emitting immediate progress and 10-second heartbeats. The presentation-filter checkpoint retained the same 19-change source digest, selected 9 changes, hid 5 configured paths, collapsed 5 implied directories, excluded every hidden pattern and path from the model request, completed the Pi review in 24.1 seconds, and independently verified receipt `d90cabd4-0375-4708-b58d-70dd518e570a`.
+15. New version-two bundles omit only derived patch text beyond 2 MiB per file or 16 MiB per run, retain exact content-addressed metadata, and cap a presenter request at 32 MiB. Existing version-one bundles and selections re-derive with their historical rules and the Wvains receipt above still verifies.
+16. Presenter stdout/stderr are bounded to 16 MiB, configured timeouts kill the complete process group, and a direct child that leaves `sleep` running in the background cannot keep the invocation or its output pipes alive.
+17. Human paths, patch contents, presenter output, evaluator/reviewer text, live guest output, errors, and warnings neutralize newline injection where single-line, terminal controls, carriage-return rewriting, invalid bytes, and bidirectional overrides while stored artifacts retain original evidence.
 
 ## Milestone 3: isolation and repetition
 
@@ -145,6 +150,7 @@ The Docker-gated fixture creates one workspace snapshot without a skill director
 8. Reports explicitly disclaim universal judgment, deterministic behavior, aggregation, statistics, ranking, and causal inference.
 9. Each actual workspace/run-input identity occurs exactly twice, within-cell comparison reports comparable repetition, and cross-treatment comparison reports the workspace snapshot as the real controlled difference.
 10. The source workspace remains byte-identical after its deliberate skill addition and contains no run output.
+11. Evaluators default to a 30-minute timeout, cap each output stream at 16 MiB, and clean up background descendants; timeout and output-limit results are retained explicitly and never promoted to successful scores.
 
 Run the case explicitly:
 
@@ -173,6 +179,8 @@ The Docker-gated fixture runs from an immutable Git workspace, creates three can
 15. The canonical complete before-workspace manifest materializes as a usable recovery copy; intentional backup tampering is detected, and restored bytes verify again.
 16. A second apply using the same review receipt is rejected.
 17. Unit coverage additionally proves exact replacement/deletion while preserving unauthorized paths and successful rollback when a later path would require recursively deleting unreviewed directory content.
+18. Apply uses descriptor-relative no-follow traversal for every mutation; a forced race that renames a pinned parent and replaces its visible path with an outside symlink writes only through the original parent descriptor and never reaches the outside target.
+19. Reviewer attempts default to a 30-minute timeout, cap each stream at 16 MiB, terminate complete process groups, and retain timeout/output-limit failures as rejected attempts rather than proposals.
 
 Run the case explicitly:
 

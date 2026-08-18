@@ -9,6 +9,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
@@ -634,6 +634,27 @@ pub fn execute_with_observer(
     auth_cleanup?;
     secret_file_cleanup?;
     let exit_code = command_output.status.code().map(i64::from).unwrap_or(-1);
+    let mut command_output_warnings = Vec::new();
+    if command_output.stdout.truncated {
+        command_output_warnings.push(format!(
+            "guest stdout exceeded {} bytes ({} bytes received); live display and retained stdout are truncated",
+            crate::process::MAX_RUN_OUTPUT_BYTES,
+            command_output.stdout.total_bytes
+        ));
+    }
+    if command_output.stderr.truncated {
+        command_output_warnings.push(format!(
+            "guest stderr exceeded {} bytes ({} bytes received); live display and retained stderr are truncated",
+            crate::process::MAX_RUN_OUTPUT_BYTES,
+            command_output.stderr.total_bytes
+        ));
+    }
+    if !command_output_warnings.is_empty() {
+        report_stage(
+            observer,
+            "Guest output reached AgentLab's capture limit; filesystem capture is continuing",
+        )?;
+    }
     lifecycle.push(event("command_completed"));
     report_stage(
         observer,
@@ -643,13 +664,13 @@ pub fn execute_with_observer(
         store,
         &run_id,
         "artifacts/stdout.bin",
-        &command_output.stdout,
+        &command_output.stdout.bytes,
     )?;
     let stderr = write_artifact(
         store,
         &run_id,
         "artifacts/stderr.bin",
-        &command_output.stderr,
+        &command_output.stderr.bytes,
     )?;
 
     report_stage(observer, "Capturing complete result filesystem")?;
@@ -805,6 +826,7 @@ pub fn execute_with_observer(
     let result_export = artifact_for_file("artifacts/result-rootfs.tar", &result_export_path)?;
     let uncovered = uncovered_by_docker_diff(&all_changes, &docker_diff_bytes);
     let mut warnings = workspace_warnings;
+    warnings.extend(command_output_warnings);
     if !uncovered.is_empty() {
         warnings.push(format!(
             "{} normalized rootfs changes were not covered by a Docker diff path; see docker_diff_uncovered_changes",
@@ -998,8 +1020,35 @@ pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
 
 pub fn load_delta(store: &Store, run_id: &str, raw: bool) -> Result<DeltaManifest> {
     let name = if raw { "delta.raw.json" } else { "delta.json" };
-    serde_json::from_slice(&store.read_run_file(run_id, name)?)
-        .with_context(|| format!("decode {name}"))
+    let bytes = store.read_run_file(run_id, name)?;
+    let delta: DeltaManifest =
+        serde_json::from_slice(&bytes).with_context(|| format!("decode {name}"))?;
+    verify_delta(&delta)?;
+
+    let result = load_result(store, run_id)?;
+    verify_result_identity(store, &result)?;
+    let recorded_delta = if raw {
+        &result.raw_delta_digest
+    } else {
+        &result.portable_delta_digest
+    };
+    if &delta.digest != recorded_delta
+        || delta.base_filesystem_digest != result.base_filesystem_digest
+        || delta.result_filesystem_digest != result.result_filesystem_digest
+    {
+        bail!("{name} does not match run result {run_id:?}");
+    }
+    let expected_artifact = result
+        .integrity
+        .get(name)
+        .with_context(|| format!("run result does not authenticate {name}"))?;
+    let actual_artifact = sha256_bytes(&bytes);
+    if &actual_artifact != expected_artifact {
+        bail!(
+            "run artifact integrity mismatch for {name:?}: expected {expected_artifact}, got {actual_artifact}"
+        );
+    }
+    Ok(delta)
 }
 
 pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
@@ -1783,6 +1832,15 @@ fn resolve_change_ignore(
     store: &Store,
 ) -> Result<(IgnoreIdentity, Option<Vec<u8>>)> {
     let (source, bytes) = if let Some(path) = &options.change_ignore {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("inspect change-ignore rules {}", path.display()))?;
+        if metadata.len() > crate::process::MAX_IGNORE_RULE_BYTES as u64 {
+            bail!(
+                "change-ignore rules {} exceed the {} byte limit",
+                path.display(),
+                crate::process::MAX_IGNORE_RULE_BYTES
+            );
+        }
         (
             path.display().to_string(),
             fs::read(path)
@@ -1793,9 +1851,15 @@ fn resolve_change_ignore(
         .iter()
         .find(|entry| entry.path == ".agentlabignore" && entry.kind == "file")
     {
+        if entry.size > crate::process::MAX_IGNORE_RULE_BYTES as u64 {
+            bail!(
+                "snapshotted .agentlabignore exceeds the {} byte limit",
+                crate::process::MAX_IGNORE_RULE_BYTES
+            );
+        }
         let mut bytes = Vec::new();
         store
-            .open_blob(&entry.digest)?
+            .open_blob(&entry.digest, entry.size)?
             .read_to_end(&mut bytes)
             .context("read snapshotted .agentlabignore")?;
         ("workspace:.agentlabignore".to_owned(), bytes)
@@ -1821,6 +1885,21 @@ pub(crate) fn evaluate_change_ignore_bytes(
     rules: &[u8],
     changes: &[RootFsChange],
 ) -> Result<HashSet<String>> {
+    evaluate_change_ignore_bytes_version(rules, changes, true)
+}
+
+pub(crate) fn evaluate_change_ignore_bytes_legacy(
+    rules: &[u8],
+    changes: &[RootFsChange],
+) -> Result<HashSet<String>> {
+    evaluate_change_ignore_bytes_version(rules, changes, false)
+}
+
+fn evaluate_change_ignore_bytes_version(
+    rules: &[u8],
+    changes: &[RootFsChange],
+    mark_directories: bool,
+) -> Result<HashSet<String>> {
     let temporary = tempfile::tempdir()?;
     fs::write(temporary.path().join(".gitignore"), rules)?;
     let git_directory = temporary.path().join("ignore.git");
@@ -1842,27 +1921,66 @@ pub(crate) fn evaluate_change_ignore_bytes(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    {
-        let input = child.stdin.as_mut().context("open change-ignore input")?;
-        for change in changes {
-            input.write_all(change.path.trim_start_matches('/').as_bytes())?;
-            input.write_all(&[0])?;
+    crate::process::isolate_process_group(&mut command);
+    let mut input_bytes = Vec::new();
+    for change in changes {
+        input_bytes.extend_from_slice(change.path.trim_start_matches('/').as_bytes());
+        if mark_directories
+            && change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .is_some_and(|entry| entry.kind == "directory")
+        {
+            input_bytes.push(b'/');
+        }
+        input_bytes.push(0);
+        if input_bytes.len() > crate::process::MAX_COMMAND_METADATA_BYTES {
+            bail!(
+                "change-ignore path input exceeds the {} byte limit",
+                crate::process::MAX_COMMAND_METADATA_BYTES
+            );
         }
     }
-    let output = child.wait_with_output()?;
-    if !matches!(output.status.code(), Some(0 | 1)) {
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().context("open change-ignore input")?;
+    let stdout = child.stdout.take().context("open change-ignore stdout")?;
+    let stderr = child.stderr.take().context("open change-ignore stderr")?;
+    let input_writer = std::thread::spawn(move || stdin.write_all(&input_bytes));
+    let stdout_reader = std::thread::spawn(move || {
+        crate::process::read_bounded(stdout, crate::process::MAX_COMMAND_METADATA_BYTES)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        crate::process::read_bounded(stderr, crate::process::MAX_IGNORE_RULE_BYTES)
+    });
+    let status = child.wait()?;
+    let _ = crate::process::terminate_process_group(&mut child);
+    input_writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("change-ignore input writer panicked"))??;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("change-ignore stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("change-ignore stderr reader panicked"))??;
+    if stdout.truncated || stderr.truncated {
+        bail!("change-ignore evaluator output exceeded its safe capture limit");
+    }
+    if !matches!(status.code(), Some(0 | 1)) {
         bail!(
             "evaluate change-ignore rules: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            bounded_lossy_summary(&stderr.bytes, 4096)
         );
     }
     let mut ignored = HashSet::new();
-    for path in output.stdout.split(|byte| *byte == 0) {
+    for path in stdout.bytes.split(|byte| *byte == 0) {
         if !path.is_empty() {
             ignored.insert(format!(
                 "/{}",
-                std::str::from_utf8(path).context("Git returned non-UTF-8 ignored path")?
+                std::str::from_utf8(path)
+                    .context("Git returned non-UTF-8 ignored path")?
+                    .trim_end_matches('/')
             ));
         }
     }
@@ -1909,11 +2027,13 @@ fn git_status(command: &mut Command, context: &str) -> Result<()> {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_OPTIONAL_LOCKS", "0");
-    let output = command.output().with_context(|| context.to_string())?;
+    let output = crate::process::output_bounded(command, crate::process::MAX_IGNORE_RULE_BYTES)
+        .with_context(|| context.to_string())?;
+    reject_truncated_command_output(context, &output, crate::process::MAX_IGNORE_RULE_BYTES)?;
     if !output.status.success() {
         bail!(
             "{context}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            bounded_lossy_summary(&output.stderr.bytes, 4096)
         );
     }
     Ok(())
@@ -2038,11 +2158,17 @@ enum GuestOutputChunk {
     ReadError(String),
 }
 
+struct GuestCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: crate::process::BoundedCapture,
+    stderr: crate::process::BoundedCapture,
+}
+
 fn execute_guest_command(
     container: &str,
     command: &[String],
     observer: &mut dyn RunObserver,
-) -> Result<Output> {
+) -> Result<GuestCommandOutput> {
     let mut child = Command::new("docker")
         .args(["exec", container])
         .args(command)
@@ -2053,8 +2179,8 @@ fn execute_guest_command(
     let child_stdout = child.stdout.take().context("capture guest stdout")?;
     let child_stderr = child.stderr.take().context("capture guest stderr")?;
     let (sender, receiver) = mpsc::channel();
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+    let mut stdout = crate::process::BoundedCapture::default();
+    let mut stderr = crate::process::BoundedCapture::default();
     let mut observer_error = None;
 
     std::thread::scope(|scope| {
@@ -2067,17 +2193,17 @@ fn execute_guest_command(
         for chunk in receiver {
             match chunk {
                 GuestOutputChunk::Stdout(bytes) => {
-                    stdout.extend_from_slice(&bytes);
-                    if observer_error.is_none() {
-                        if let Err(error) = observer.command_stdout(&bytes) {
+                    let retained = stdout.push(&bytes, crate::process::MAX_RUN_OUTPUT_BYTES);
+                    if retained > 0 && observer_error.is_none() {
+                        if let Err(error) = observer.command_stdout(&bytes[..retained]) {
                             observer_error = Some(error);
                         }
                     }
                 }
                 GuestOutputChunk::Stderr(bytes) => {
-                    stderr.extend_from_slice(&bytes);
-                    if observer_error.is_none() {
-                        if let Err(error) = observer.command_stderr(&bytes) {
+                    let retained = stderr.push(&bytes, crate::process::MAX_RUN_OUTPUT_BYTES);
+                    if retained > 0 && observer_error.is_none() {
+                        if let Err(error) = observer.command_stderr(&bytes[..retained]) {
                             observer_error = Some(error);
                         }
                     }
@@ -2096,7 +2222,7 @@ fn execute_guest_command(
     if let Some(error) = observer_error {
         return Err(error).context("stream guest command output");
     }
-    Ok(Output {
+    Ok(GuestCommandOutput {
         status,
         stdout,
         stderr,
@@ -2165,14 +2291,18 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn docker_success(command: &mut Command, context: &str) -> Result<String> {
-    let output = command.output().with_context(|| context.to_string())?;
+    let output = crate::process::output_bounded(command, crate::process::MAX_IGNORE_RULE_BYTES)
+        .with_context(|| context.to_string())?;
+    reject_truncated_command_output(context, &output, crate::process::MAX_IGNORE_RULE_BYTES)?;
     if !output.status.success() {
         bail!(
             "{context}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            bounded_lossy_summary(&output.stderr.bytes, 4096)
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout.bytes)
+        .trim()
+        .to_string())
 }
 
 pub(crate) fn docker_status(command: &mut Command, context: &str) -> Result<()> {
@@ -2180,19 +2310,48 @@ pub(crate) fn docker_status(command: &mut Command, context: &str) -> Result<()> 
 }
 
 pub(crate) fn docker_output_bytes(command: &mut Command, context: &str) -> Result<Vec<u8>> {
-    let output: Output = command.output().with_context(|| context.to_string())?;
+    let output =
+        crate::process::output_bounded(command, crate::process::MAX_COMMAND_METADATA_BYTES)
+            .with_context(|| context.to_string())?;
+    reject_truncated_command_output(context, &output, crate::process::MAX_COMMAND_METADATA_BYTES)?;
     if !output.status.success() {
         bail!(
             "{context}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            bounded_lossy_summary(&output.stderr.bytes, 4096)
         );
     }
-    Ok(output.stdout)
+    Ok(output.stdout.bytes)
+}
+
+fn reject_truncated_command_output(
+    context: &str,
+    output: &crate::process::BoundedCommandOutput,
+    limit: usize,
+) -> Result<()> {
+    if output.stdout.truncated || output.stderr.truncated {
+        bail!(
+            "{context}: command output exceeded the {} byte per-stream metadata limit (stdout {} bytes, stderr {} bytes)",
+            limit,
+            output.stdout.total_bytes,
+            output.stderr.total_bytes
+        );
+    }
+    Ok(())
+}
+
+fn bounded_lossy_summary(bytes: &[u8], limit: usize) -> String {
+    let retained = &bytes[..bytes.len().min(limit)];
+    let mut summary = String::from_utf8_lossy(retained).trim().to_owned();
+    if bytes.len() > limit {
+        summary.push_str("… [truncated]");
+    }
+    summary
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rootfs::RootFsEntry;
 
     fn options(workspace: PathBuf, captures: Vec<CaptureSpec>) -> RunOptions {
         RunOptions {
@@ -2293,5 +2452,37 @@ mod tests {
 
         assert!(format!("{error:#}").contains("resolve workspace"));
         assert!(store.list_run_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn directory_only_git_ignore_patterns_match_directory_changes() {
+        let directory = RootFsChange {
+            path: "/secrets".to_owned(),
+            change: ChangeKind::Added,
+            before: None,
+            after: Some(RootFsEntry {
+                path: "secrets".to_owned(),
+                kind: "directory".to_owned(),
+                mode: 0o700,
+                size: 0,
+                digest: String::new(),
+                link_target: String::new(),
+            }),
+        };
+        let ordinary = RootFsChange {
+            path: "/visible".to_owned(),
+            change: ChangeKind::Added,
+            before: None,
+            after: Some(RootFsEntry {
+                path: "visible".to_owned(),
+                kind: "directory".to_owned(),
+                mode: 0o755,
+                size: 0,
+                digest: String::new(),
+                link_target: String::new(),
+            }),
+        };
+        let ignored = evaluate_change_ignore_bytes(b"/secrets/\n", &[directory, ordinary]).unwrap();
+        assert_eq!(ignored, ["/secrets".to_owned()].into_iter().collect());
     }
 }

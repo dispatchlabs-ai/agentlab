@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -93,6 +95,22 @@ pub fn evaluate(
     evaluator_name: &str,
     command: &[String],
 ) -> Result<EvaluationRecord> {
+    evaluate_with_timeout(
+        store,
+        run_id,
+        evaluator_name,
+        command,
+        crate::process::DEFAULT_EXTERNAL_TIMEOUT_SECONDS,
+    )
+}
+
+pub fn evaluate_with_timeout(
+    store: &Store,
+    run_id: &str,
+    evaluator_name: &str,
+    command: &[String],
+    timeout_seconds: u64,
+) -> Result<EvaluationRecord> {
     if evaluator_name.trim().is_empty() {
         bail!("evaluator name cannot be empty");
     }
@@ -108,7 +126,8 @@ pub fn evaluate(
     let prefix = format!("evaluations/{evaluation_id}");
 
     let started_at = Utc::now();
-    let output = Command::new(&command[0])
+    let mut evaluator = Command::new(&command[0]);
+    evaluator
         .args(&command[1..])
         .env("AGENTLAB_RUN_ID", run_id)
         .env("AGENTLAB_RUN_DIR", &run_directory)
@@ -118,8 +137,8 @@ pub fn evaluate(
         .env(
             "AGENTLAB_RAW_DELTA_PATH",
             run_directory.join("delta.raw.json"),
-        )
-        .output()
+        );
+    let output = execute_evaluator_command(&mut evaluator, timeout_seconds)
         .with_context(|| format!("execute evaluator command {:?}", command[0]))?;
     let completed_at = Utc::now();
     fs::create_dir_all(store.run_path(run_id, &format!("{prefix}/artifacts"))?)?;
@@ -138,7 +157,20 @@ pub fn evaluate(
     )?;
 
     let mut warnings = Vec::new();
-    let (status, payload) = if output.status.success() {
+    let (status, payload) = if output.timed_out {
+        warnings.push(format!(
+            "evaluator command timed out after {timeout_seconds} seconds"
+        ));
+        ("timed_out".to_owned(), None)
+    } else if output.stdout_truncated || output.stderr_truncated {
+        warnings.push(format!(
+            "evaluator output exceeded the {} byte per-stream limit (stdout {} bytes, stderr {} bytes); retained artifacts are truncated",
+            crate::process::MAX_EXTERNAL_OUTPUT_BYTES,
+            output.stdout_total_bytes,
+            output.stderr_total_bytes
+        ));
+        ("output_limit_exceeded".to_owned(), None)
+    } else if output.status.success() {
         match serde_json::from_slice::<EvaluatorPayload>(&output.stdout) {
             Ok(payload) => match validate_payload(&payload) {
                 Ok(()) => ("succeeded".to_owned(), Some(payload)),
@@ -213,6 +245,80 @@ pub fn evaluate(
         &run::pretty_json(&record)?,
     )?;
     Ok(record)
+}
+
+struct EvaluatorCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_total_bytes: u64,
+    stderr_total_bytes: u64,
+}
+
+fn execute_evaluator_command(
+    command: &mut Command,
+    timeout_seconds: u64,
+) -> Result<EvaluatorCommandOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::process::isolate_process_group(command);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture evaluator stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture evaluator stderr pipe")?;
+    let stdout_reader = thread::spawn(move || {
+        crate::process::read_bounded(stdout, crate::process::MAX_EXTERNAL_OUTPUT_BYTES)
+    });
+    let stderr_reader = thread::spawn(move || {
+        crate::process::read_bounded(stderr, crate::process::MAX_EXTERNAL_OUTPUT_BYTES)
+    });
+    let started = Instant::now();
+    let timeout = Duration::from_secs(timeout_seconds);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = crate::process::terminate_process_group(&mut child);
+                break status;
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = crate::process::terminate_process_group(&mut child);
+                break child
+                    .wait()
+                    .context("wait for timed-out evaluator command")?;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                let _ = crate::process::terminate_process_group(&mut child);
+                let _ = child.wait();
+                return Err(error).context("wait for evaluator command");
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("evaluator stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("evaluator stderr reader panicked"))??;
+    Ok(EvaluatorCommandOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        timed_out,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        stdout_total_bytes: stdout.total_bytes,
+        stderr_total_bytes: stderr.total_bytes,
+    })
 }
 
 pub fn list(store: &Store, run_id: &str) -> Result<Vec<EvaluationRecord>> {
@@ -460,5 +566,29 @@ fn render_value(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn evaluator_timeout_and_descendant_cleanup_are_bounded() {
+        let mut timed_out = Command::new("/bin/sh");
+        timed_out.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let timed_out = execute_evaluator_command(&mut timed_out, 1).unwrap();
+        assert!(timed_out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let mut descendant = Command::new("/bin/sh");
+        descendant.args(["-c", "sleep 30 & printf '{\"scores\":{}}\\n'"]);
+        let started = Instant::now();
+        let descendant = execute_evaluator_command(&mut descendant, 5).unwrap();
+        assert!(!descendant.timed_out);
+        assert_eq!(descendant.stdout, b"{\"scores\":{}}\n");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

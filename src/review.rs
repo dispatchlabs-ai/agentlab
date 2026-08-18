@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -30,6 +30,7 @@ pub struct ReviewOptions {
     pub run_id: String,
     pub workspace: PathBuf,
     pub reviewer_command: Vec<String>,
+    pub timeout_seconds: u64,
 }
 
 pub trait ReviewObserver {
@@ -358,6 +359,7 @@ pub fn review_with_observer(
             &machine_changes_directory,
             repair.as_ref(),
             attempt,
+            options.timeout_seconds,
             observer,
         )?;
         verify_reviewer_postconditions(
@@ -373,17 +375,42 @@ pub fn review_with_observer(
         )?;
 
         let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
-        if !output.status.success() {
-            let message = format!(
-                "reviewer command exited with status {exit_code}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        let execution_failure = if output.timed_out {
+            Some((
+                "timed_out",
+                format!(
+                    "reviewer command timed out after {} seconds",
+                    options.timeout_seconds
+                ),
+            ))
+        } else if output.stdout_truncated || output.stderr_truncated {
+            Some((
+                "output_limit_exceeded",
+                format!(
+                    "reviewer output exceeded the {} byte per-stream limit (stdout {} bytes, stderr {} bytes)",
+                    crate::process::MAX_EXTERNAL_OUTPUT_BYTES,
+                    output.stdout_total_bytes,
+                    output.stderr_total_bytes
+                ),
+            ))
+        } else if !output.status.success() {
+            Some((
+                "command_failed",
+                format!(
+                    "reviewer command exited with status {exit_code}: {}",
+                    bounded_lossy_summary(&output.stderr, 4096)
+                ),
+            ))
+        } else {
+            None
+        };
+        if let Some((status, message)) = execution_failure {
             captures.push(InvocationCapture {
                 attempt,
                 started_at: output.started_at,
                 completed_at: output.completed_at,
                 exit_code,
-                status: "command_failed".to_owned(),
+                status: status.to_owned(),
                 validation_error: Some(message.clone()),
                 stdout: output.stdout,
                 stderr: output.stderr,
@@ -579,6 +606,11 @@ struct ReviewerOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_total_bytes: u64,
+    stderr_total_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -611,6 +643,7 @@ fn execute_reviewer(
     machine_changes_directory: &Path,
     repair: Option<&RepairInput>,
     attempt: usize,
+    timeout_seconds: u64,
     observer: &mut dyn ReviewObserver,
 ) -> Result<ReviewerOutput> {
     report_stage(observer, &format!("Reviewer attempt {attempt} started"))?;
@@ -686,6 +719,7 @@ fn execute_reviewer(
                 &repair.validation_error_path,
             );
     }
+    crate::process::isolate_process_group(&mut command);
 
     let mut child = command
         .spawn()
@@ -698,20 +732,42 @@ fn execute_reviewer(
         .stderr
         .take()
         .context("capture reviewer stderr pipe")?;
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+    let stdout_reader = thread::spawn(move || {
+        crate::process::read_bounded(stdout, crate::process::MAX_EXTERNAL_OUTPUT_BYTES)
+    });
+    let stderr_reader = thread::spawn(move || {
+        crate::process::read_bounded(stderr, crate::process::MAX_EXTERNAL_OUTPUT_BYTES)
+    });
     let wait_started = Instant::now();
     let mut next_heartbeat = REVIEWER_HEARTBEAT_INTERVAL;
+    let timeout = Duration::from_secs(timeout_seconds);
+    let mut timed_out = false;
     let status = loop {
-        if let Some(status) = child.try_wait().context("wait for reviewer command")? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = crate::process::terminate_process_group(&mut child);
+                break status;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = crate::process::terminate_process_group(&mut child);
+                let _ = child.wait();
+                return Err(error).context("wait for reviewer command");
+            }
+        }
+        if wait_started.elapsed() >= timeout {
+            timed_out = true;
+            let _ = crate::process::terminate_process_group(&mut child);
+            break child
+                .wait()
+                .context("wait for timed-out reviewer command")?;
         }
         if wait_started.elapsed() >= next_heartbeat {
             if let Err(error) = observer.stage(&format!(
                 "Reviewer attempt {attempt} still running ({:.0}s)",
                 wait_started.elapsed().as_secs_f64()
             )) {
-                let _ = child.kill();
+                let _ = crate::process::terminate_process_group(&mut child);
                 let _ = child.wait();
                 return Err(error).context("report review progress");
             }
@@ -737,15 +793,23 @@ fn execute_reviewer(
         started_at,
         completed_at,
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        timed_out,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        stdout_total_bytes: stdout.total_bytes,
+        stderr_total_bytes: stderr.total_bytes,
     })
 }
 
-fn read_pipe(mut source: impl Read) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    source.read_to_end(&mut bytes)?;
-    Ok(bytes)
+fn bounded_lossy_summary(bytes: &[u8], limit: usize) -> String {
+    let retained = &bytes[..bytes.len().min(limit)];
+    let mut summary = String::from_utf8_lossy(retained).trim().to_owned();
+    if bytes.len() > limit {
+        summary.push_str("… [truncated]");
+    }
+    summary
 }
 
 fn report_stage(observer: &mut dyn ReviewObserver, message: &str) -> Result<()> {
@@ -1075,7 +1139,11 @@ pub fn verify_attempt(store: &Store, record: &ReviewAttemptRecord) -> Result<()>
         }
         if !matches!(
             invocation.status.as_str(),
-            "accepted" | "invalid_proposal" | "command_failed"
+            "accepted"
+                | "invalid_proposal"
+                | "command_failed"
+                | "timed_out"
+                | "output_limit_exceeded"
         ) {
             bail!("invalid reviewer invocation status {:?}", invocation.status);
         }
@@ -1597,7 +1665,7 @@ fn materialize_candidate_workspace(
         match entry.kind.as_str() {
             "directory" => {}
             "file" => {
-                let mut source = store.open_blob(&entry.digest)?;
+                let mut source = store.open_blob(&entry.digest, entry.size)?;
                 let mut output: File = create_new_file(&target)?;
                 io::copy(&mut source, &mut output)?;
                 output.sync_all()?;
@@ -1658,7 +1726,7 @@ fn materialize_machine_changes(
                 directory_modes.push((target.clone(), entry.mode));
             }
             "file" => {
-                let mut source = store.open_blob(&entry.digest)?;
+                let mut source = store.open_blob(&entry.digest, entry.size)?;
                 let mut output: File = create_new_file(&target)?;
                 io::copy(&mut source, &mut output)?;
                 output.sync_all()?;
@@ -1828,6 +1896,55 @@ mod tests {
                 .contains("reviewer JSON did not match agentlab.review-proposal/v1")
         );
         assert!(format!("{error:#}").contains("dispositions"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewer_timeout_and_descendant_cleanup_are_bounded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let mut observer = SilentReviewObserver;
+
+        let timed_out = execute_reviewer(
+            &["/bin/sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            "fixture-run",
+            "fixture-review",
+            root,
+            root,
+            root,
+            root,
+            root,
+            None,
+            1,
+            1,
+            &mut observer,
+        )
+        .unwrap();
+        assert!(timed_out.timed_out);
+
+        let started = Instant::now();
+        let descendant = execute_reviewer(
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 30 & printf '{\"schema_version\":\"fixture\"}\\n'".to_owned(),
+            ],
+            "fixture-run",
+            "fixture-review",
+            root,
+            root,
+            root,
+            root,
+            root,
+            None,
+            1,
+            5,
+            &mut observer,
+        )
+        .unwrap();
+        assert!(!descendant.timed_out);
+        assert_eq!(descendant.stdout, b"{\"schema_version\":\"fixture\"}\n");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

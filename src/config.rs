@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -103,16 +104,27 @@ impl DiffConfig {
 impl AgentLabConfig {
     pub fn load(store: &Store) -> Result<Self> {
         let path = config_path(store);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("read AgentLab config {}", path.display()));
+                    .with_context(|| format!("open AgentLab config {}", path.display()));
             }
         };
+        let mut bytes = Vec::new();
+        file.take(crate::process::MAX_IGNORE_RULE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read AgentLab config {}", path.display()))?;
+        if bytes.len() > crate::process::MAX_IGNORE_RULE_BYTES {
+            bail!(
+                "AgentLab config {} exceeds the {} byte limit",
+                path.display(),
+                crate::process::MAX_IGNORE_RULE_BYTES
+            );
+        }
         let text = std::str::from_utf8(&bytes)
             .with_context(|| format!("AgentLab config {} is not UTF-8", path.display()))?;
         let config: Self = toml::from_str(text)

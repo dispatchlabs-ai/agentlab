@@ -432,7 +432,7 @@ mod tests {
             .unwrap();
         let mut linked_content = String::new();
         store
-            .open_blob(&hard_link.digest)
+            .open_blob(&hard_link.digest, hard_link.size)
             .unwrap()
             .read_to_string(&mut linked_content)
             .unwrap();

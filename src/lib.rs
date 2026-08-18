@@ -5,11 +5,13 @@ pub mod config;
 pub mod diff;
 pub mod evaluation;
 pub mod lifecycle;
+pub mod process;
 pub mod review;
 pub mod rootfs;
 pub mod run;
 pub mod snapshot;
 pub mod store;
+pub mod terminal;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD_ID: Option<&str> = option_env!("AGENTLAB_BUILD_ID");

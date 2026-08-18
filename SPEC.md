@@ -5,8 +5,8 @@ Snapshot schema: `agentlab.snapshot/v1`
 Run schema: `agentlab.run/v3` (`agentlab.run/v1` and `agentlab.run/v2` read compatibility)
 Run-input schema: `agentlab.run-input/v1`
 Delta schema: `agentlab.delta/v1`
-Per-file diff schema: `agentlab.file-diffs/v1`
-Diff-selection schema: `agentlab.diff-selection/v1`
+Per-file diff schema: `agentlab.file-diffs/v2` (`agentlab.file-diffs/v1` read compatibility)
+Diff-selection schema: `agentlab.diff-selection/v2` (`agentlab.diff-selection/v1` read compatibility)
 Diff-presenter-input schema: `agentlab.diff-presenter-input/v1`
 Diff-presentation schema: `agentlab.diff-presentation/v2`
 Result schema: `agentlab.result/v1`
@@ -52,7 +52,7 @@ Given a selected directory, the snapshotter MUST:
 
 If discovered Git metadata is broken or unavailable, AgentLab conservatively includes every path beneath that repository and emits a warning. It does not risk suppressing a possibly tracked path.
 
-Concurrent source mutation is not part of the Milestone 1 consistency guarantee. AgentLab detects a regular file whose size, type, mode, or modification time changes while it is captured and fails rather than claiming a stable snapshot.
+Concurrent source mutation is not part of the Milestone 1 consistency guarantee. AgentLab opens regular files without following symlinks, compares the opened descriptor and current path against the scanned type, mode, size, modification time, device, inode, and change time, and fails rather than claiming a stable snapshot when they differ. Content is read from the same pinned descriptor that is rechecked after storage.
 
 ## 3. Snapshot identity
 
@@ -113,6 +113,8 @@ Regular-file bodies are stored separately from manifests by their SHA-256 digest
 - blobs are immutable;
 - equal content reuses one blob;
 - manifests reference blobs by algorithm-qualified digest;
+- blob reads reject symlinks and re-hash the exact open descriptor before returning it to a consumer;
+- a pre-existing object whose bytes do not match its digest and size is rejected, and a later verified write may atomically heal it;
 - manifest verification recalculates snapshot identity and every referenced blob's digest and size;
 - state directories and files are private to the current user by default; and
 - the source workspace does not contain generated state unless it was independently selected as the state directory by an explicit user override.
@@ -136,7 +138,7 @@ The default network policy is Docker `bridge`, making ordinary model-backed harn
 1. Reconstruct the workspace from its snapshot in private storage at `/workspace` by default, never through a writable source mount.
 2. Establish and export a prepared base root filesystem after materialization and before command execution.
 3. start a minimal stable container supervisor and execute the command exactly once through Docker exec;
-4. preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events;
+4. preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events; stdout and stderr are each retained and displayed up to 64 MiB, after which the stream is drained but omitted bytes are disclosed explicitly in result warnings;
 5. reject image-declared volumes and any container mount outside the exported root filesystem, except AgentLab's exact runtime-secret tmpfs;
 6. retain the running supervisor container for direct inspection and later filesystem continuation; and
 7. state explicitly that pseudo-filesystems and live process memory are not portable persistent state.
@@ -177,14 +179,20 @@ The delta identity is SHA-256 over compact JSON containing every semantic field 
 
 ### 9.1 Per-file diff and presentation contract
 
-`agentlab.file-diffs/v1` is a deterministic derivative of one selected raw or
+`agentlab.file-diffs/v2` is a deterministic derivative of one selected raw or
 portable delta. It records the run and delta identities, selection mode,
 ignored changes, and one path-ordered record for every selected change. Every
 record preserves before/after rootfs metadata and classifies content as text,
-binary, metadata-only, or unavailable. Text additions, modifications, and
+binary, oversized, presentation-omitted, metadata-only, or unavailable. Text additions, modifications, and
 deletions contain ordinary unified patches. Binary and metadata changes MUST
 not be rendered as invented text. Missing content from a legacy run is explicit
 and does not weaken the authoritative path and rootfs metadata.
+
+Version two limits text input to 2 MiB per file and retained patch text to 16
+MiB per run. When either budget is reached, the path, exact before/after
+metadata, content digest, and an explicit warning remain; only derived patch
+text is omitted. Version-one bundles use their historical derivation rules so
+existing receipts remain verifiable.
 
 New runs preserve content-addressed before-content for every changed regular
 file in addition to required result and workspace content. A per-file bundle
@@ -204,7 +212,11 @@ ordered array of Git-compatible presentation-ignore patterns. These patterns
 MUST affect neither raw nor portable delta identity and MUST be applied before
 any selected content is sent to a harness. AgentLab MUST also deterministically
 collapse an added directory record when an added descendant already accounts
-for it in normal presentation. `--raw` and `--file` bypass both behaviors.
+for it in normal presentation. Version-two selection collapses only an added
+mode-`0755` directory with at least one non-hidden descendant. A directory with
+an unusual mode or with only hidden descendants remains visible. Directory-only
+Git patterns are evaluated with directory semantics. `--raw` and `--file`
+bypass both behaviors.
 `.agentlabignore` remains the separate portable-evidence selection mechanism.
 A harness receives a filtered `agentlab.diff-presenter-input/v1` request on
 standard input, starts in a private temporary directory, and returns
@@ -217,14 +229,15 @@ process still runs with the invoking host user's authority and normal
 environment; command configuration is therefore a trust decision, not a
 sandbox boundary.
 
-`agentlab.diff-selection/v1` is a deterministic projection of one source
-`agentlab.file-diffs/v1` bundle. Its identity includes the source run, delta,
+`agentlab.diff-selection/v2` is a deterministic projection of one source
+per-file bundle. Its identity includes the source run, delta,
 and per-file digests; raw/portable mode; ordered ignore patterns and their
 digest; stable config-source label; exact presentation-hidden paths; exact
 structurally collapsed paths; source/presented counts; presented per-file
 records; and evidence-level ignored-change records. AgentLab reports hidden and
 collapsed counts in normal human output. No universal presentation-ignore list
-is built in.
+is built in. Version-one selections retain their historical ignore and collapse
+rules solely so already-issued receipts can be verified.
 
 The presentation prompt identifies every diff body as untrusted evidence and
 limits the requested task to relevance-oriented display. AgentLab verifies the
@@ -242,6 +255,18 @@ Version-one receipts remain verifiable. Command failure, timeout, empty output,
 or non-UTF-8 output is recorded and the human command falls back to the
 deterministic filtered selection. The presentation is an observation and never
 changes, deletes, or supersedes its underlying evidence.
+
+The presenter request MUST NOT exceed 32 MiB, and presenter stdout and stderr
+MUST NOT exceed 16 MiB each. The configured timeout applies to the complete
+process group. AgentLab starts the harness in its own process group and kills
+remaining descendants after timeout or direct-child exit so background
+processes cannot outlive the recorded invocation or keep its pipes open.
+
+Human terminal rendering is not evidence storage. AgentLab preserves original
+UTF-8 and byte artifacts in receipts, but human-facing paths, diff text,
+reviewer/evaluator fields, presenter output, live command streams, errors, and
+warnings MUST neutralize control characters, carriage-return rewriting, and
+bidirectional display overrides before reaching a terminal.
 
 Because a tested command can deliberately copy an injected secret into
 persistent storage, per-file evidence may be sensitive. Enabling an external
@@ -303,7 +328,7 @@ Lifecycle-capable OCI images currently MUST provide `/bin/sh`, `sleep`, and `/bi
 
 ## 13. External evaluation
 
-`agentlab evaluate [--name NAME] RUN... -- COMMAND` executes the selected host command once per run. Before and after execution AgentLab verifies the immutable initial result, lifecycle/fork/continuation records, prior evaluation records, and their referenced artifacts. Mutation of those inputs is an explicit failure.
+`agentlab evaluate [--name NAME] [--timeout SECONDS] RUN... -- COMMAND` executes the selected host command once per run. Before and after execution AgentLab verifies the immutable initial result, lifecycle/fork/continuation records, prior evaluation records, and their referenced artifacts. Mutation of those inputs is an explicit failure.
 
 The evaluator inherits the caller's working directory and host environment. AgentLab supplies absolute paths in `AGENTLAB_RUN_DIR`, `AGENTLAB_RESULT_PATH`, `AGENTLAB_SPEC_PATH`, `AGENTLAB_DELTA_PATH`, and `AGENTLAB_RAW_DELTA_PATH`, plus `AGENTLAB_RUN_ID`. AgentLab does not prescribe the evaluator language or interpret its domain.
 
@@ -314,7 +339,7 @@ Successful stdout MUST be one JSON object with optional fields:
 - `summary`, a string; and
 - arbitrary extension fields, preserved unchanged.
 
-`agentlab.evaluation/v1` records the evaluation ID, anchored result digest, evaluator name, exact command argv, timestamps, actual exit code, status, parsed output when valid, stdout/stderr artifacts, warnings, and integrity hashes. Status is `succeeded`, `command_failed`, or `invalid_output`. A failed command or invalid envelope remains inspectable evidence but is not eligible as a successful score source.
+`agentlab.evaluation/v1` records the evaluation ID, anchored result digest, evaluator name, exact command argv, timestamps, actual exit code, status, parsed output when valid, stdout/stderr artifacts, warnings, and integrity hashes. Status is `succeeded`, `command_failed`, `invalid_output`, `timed_out`, or `output_limit_exceeded`. A failed command or invalid envelope remains inspectable evidence but is not eligible as a successful score source. The default timeout is 1800 seconds, stdout and stderr are each bounded to 16 MiB, and the evaluator runs in a private process group whose remaining descendants are terminated after timeout or direct-child exit.
 
 Evaluation records are immutable additions beneath the run and do not alter `agentlab.result/v1`. `agentlab inspect --verify RUN` verifies them along with the run lifecycle. Evaluator stdout, stderr, summaries, and observations may themselves be sensitive.
 
@@ -326,7 +351,7 @@ External evaluators run directly on the host with the invoking user's authority.
 
 ## 14. Review proposals
 
-`agentlab review RUN --workspace CURRENT -- COMMAND` integrity-verifies the selected immutable run, its lifecycle, evaluations, and prior reviews; loads the exact base workspace snapshot and initial result; freshly snapshots the complete current workspace; materializes private base, candidate, and current workspace trees; and invokes one trusted host reviewer command from the current copy. Review currently selects the immutable initial run result, not mutable retained-container state or a continuation. A relative reviewer executable is resolved from AgentLab's invocation directory before the reviewer starts from the private current-workspace copy.
+`agentlab review [--timeout SECONDS] RUN --workspace CURRENT -- COMMAND` integrity-verifies the selected immutable run, its lifecycle, evaluations, and prior reviews; loads the exact base workspace snapshot and initial result; freshly snapshots the complete current workspace; materializes private base, candidate, and current workspace trees; and invokes one trusted host reviewer command from the current copy. Review currently selects the immutable initial run result, not mutable retained-container state or a continuation. A relative reviewer executable is resolved from AgentLab's invocation directory before the reviewer starts from the private current-workspace copy.
 
 The reviewer receives absolute environment paths for the versioned request; run specification and result; base and candidate root-filesystem manifests; base, candidate, and current workspace manifests; portable and raw deltas; materialized workspace trees; and a changed-machine tree containing after-content for every raw-delta entry that still exists. A deleted path is represented by the raw delta and has no after-content. AgentLab rechecks every manifest/delta bundle file after the command. Workspace-tree writes are disposable reviewer behavior and do not change the anchored snapshots.
 
@@ -337,6 +362,13 @@ Successful reviewer stdout MUST be exactly one `agentlab.review-proposal/v1` JSO
 After the reviewer exits, AgentLab re-verifies immutable run and review inputs and freshly snapshots CURRENT again. It accepts a receipt only if the source workspace identity is unchanged. `agentlab.review/v1` stores the canonical absolute source-workspace path, request and validated proposal, reviewer timing and exit status, exact stdout/stderr and canonical request/proposal artifacts, source-unchanged and `agentlab_applied_changes: false` declarations, warnings, and integrity hashes. `agentlab inspect --verify RUN` verifies every accepted review.
 
 The reviewer is a trusted host process with the invoking user's full authority and may see sensitive captured material. Review-only means AgentLab does not apply the proposal; it cannot prevent the reviewer from affecting other host resources. The supplied Pi wrapper deliberately disables sessions, extensions, skills, prompt templates, and mutating built-in tools, but that wrapper is convenience rather than a security boundary.
+
+Each reviewer attempt defaults to 1800 seconds and at most 16 MiB per stdout
+and stderr stream. AgentLab isolates the reviewer process group and terminates
+remaining descendants after timeout or direct-child exit. Timeout,
+output-limit, and command failures produce a rejected, inspectable
+`agentlab.review-attempt/v1`; only successful, complete, validated JSON can
+become an actionable review receipt.
 
 ## 15. Receipt-bound application
 
@@ -353,7 +385,7 @@ Before changing the source, apply MUST:
 7. Snapshot CURRENT again immediately before the first write and reject any intervening source change.
 8. Retain the canonical complete before-workspace manifest and all of its content-addressed blobs as recovery evidence.
 
-Apply performs only exact relative `replace` and `delete` operations authorized by the receipt. It MUST reject traversal and parent-symlink escape, MUST NOT recursively remove directory content absent corresponding reviewed operations, and MUST NOT copy environment paths. Directory creation and mode restoration may support exact authorized child operations, but missing unreviewed parents are not synthesized. If a path-scoped write fails or the resulting snapshot differs from the privately staged identity, AgentLab attempts to restore every authorized path from the before snapshot and reports whether rollback succeeded. A process interruption may require recovery from the retained before snapshot; it must not be silently retried.
+Apply performs only exact relative `replace` and `delete` operations authorized by the receipt. It MUST reject traversal and parent-symlink escape, MUST NOT recursively remove directory content absent corresponding reviewed operations, and MUST NOT copy environment paths. On Unix hosts it opens the workspace root once, walks every parent with no-follow descriptor-relative operations, and creates, deletes, links, and changes modes through the pinned directory descriptors rather than re-resolving ambient paths. Directory creation and mode restoration may support exact authorized child operations, but missing unreviewed parents are not synthesized. If a path-scoped write fails or the resulting snapshot differs from the privately staged identity, AgentLab attempts to restore every authorized path from the before snapshot and reports whether rollback succeeded. A process interruption may require recovery from the retained before snapshot; it must not be silently retried.
 
 `agentlab.apply/v1` records a unique apply ID; exact review, run, and result identities; absolute selected workspace path; timestamps; explicit conflict/unresolved acknowledgements; reconciled proposed/rejected/conflicted/unresolved/applied counts; exact authorized operations; before, privately intended, and actual after snapshot identities; the canonical backup-manifest artifact; required source-match and result-verification declarations; warnings; and integrity hashes. Intended and actual after identities MUST match. `agentlab inspect --verify RUN` verifies all accepted apply records, referenced review receipts, snapshots, and backup bytes. A second apply for the same review is rejected.
 

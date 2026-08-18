@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::review::{self, DispositionCounts, ReviewRecord, WorkspaceOperation};
 use crate::run::{self, Artifact};
 use crate::snapshot::{self, Manifest};
-use crate::store::{Store, create_new_file};
+use crate::store::Store;
 
 pub const APPLY_SCHEMA_VERSION: &str = "agentlab.apply/v1";
 
@@ -576,17 +576,37 @@ fn apply_manifest_state(
     workspace: &Path,
     paths: Vec<String>,
 ) -> Result<()> {
+    #[cfg(unix)]
+    {
+        apply_manifest_state_unix(store, desired, workspace, paths)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (store, desired, workspace, paths);
+        bail!("safe workspace apply currently requires a Unix host");
+    }
+}
+
+#[cfg(unix)]
+fn apply_manifest_state_unix(
+    store: &Store,
+    desired: &Manifest,
+    workspace: &Path,
+    paths: Vec<String>,
+) -> Result<()> {
     let desired_entries: BTreeMap<_, _> = desired
         .entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect();
+    let workspace = WorkspaceRoot::open(workspace)?;
     let mut paths = paths;
     paths.sort();
     paths.dedup();
     for path in &paths {
         snapshot::validate_relative_path(path)?;
-        make_exact_directory_writable(workspace, path)?;
+        workspace.make_exact_directory_writable(path)?;
     }
 
     let mut clear_paths: Vec<_> = paths
@@ -599,7 +619,7 @@ fn apply_manifest_state(
         .collect();
     clear_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
     for path in clear_paths {
-        remove_target(workspace, path)?;
+        workspace.remove_target(path)?;
     }
 
     let mut directories: Vec<_> = paths
@@ -612,21 +632,7 @@ fn apply_manifest_state(
         .collect();
     directories.sort_by_key(|entry| entry.path.matches('/').count());
     for entry in &directories {
-        let target = checked_target(workspace, &entry.path, false)?;
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => {
-                fs::remove_file(&target)
-                    .with_context(|| format!("replace {:?} with a directory", entry.path))?;
-                fs::create_dir(&target)
-                    .with_context(|| format!("create directory {:?}", entry.path))?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&target)
-                    .with_context(|| format!("create directory {:?}", entry.path))?;
-            }
-            Err(error) => return Err(error).with_context(|| format!("inspect {:?}", entry.path)),
-        }
+        workspace.ensure_directory(&entry.path, entry.mode)?;
     }
 
     for path in &paths {
@@ -636,87 +642,249 @@ fn apply_manifest_state(
         if entry.kind == "directory" {
             continue;
         }
-        let target = checked_target(workspace, path, false)?;
         match entry.kind.as_str() {
             "file" => {
-                let mut source = store.open_blob(&entry.digest)?;
-                let mut destination: File = create_new_file(&target)?;
+                let mut source = store.open_blob(&entry.digest, entry.size)?;
+                let destination = workspace.create_file(path, entry.mode)?;
+                let mut destination = File::from(destination);
                 io::copy(&mut source, &mut destination)
                     .with_context(|| format!("write reviewed file {path:?}"))?;
                 destination.sync_all()?;
-                set_mode(&target, entry.mode)?;
+                rustix::fs::fchmod(&destination, unix_mode(entry.mode))
+                    .with_context(|| format!("set reviewed file mode for {path:?}"))?;
             }
-            "symlink" => create_symlink(&entry.link_target, &target)
-                .with_context(|| format!("create reviewed symlink {path:?}"))?,
+            "symlink" => workspace.create_symlink(path, &entry.link_target)?,
             value => bail!("unsupported desired workspace entry type {value:?}"),
         }
     }
 
     directories.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
     for entry in directories {
-        set_mode(&snapshot::safe_join(workspace, &entry.path)?, entry.mode)?;
+        workspace.set_directory_mode(&entry.path, entry.mode)?;
     }
     Ok(())
 }
 
-fn checked_target(workspace: &Path, relative: &str, allow_missing_parent: bool) -> Result<PathBuf> {
-    let target = snapshot::safe_join(workspace, relative)?;
-    let mut ancestor = workspace.to_path_buf();
-    let components: Vec<_> = relative.split('/').collect();
-    for component in &components[..components.len() - 1] {
-        ancestor.push(component);
-        match fs::symlink_metadata(&ancestor) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => bail!(
-                "workspace path {:?} has a non-directory ancestor {}",
-                relative,
-                ancestor.display()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound && allow_missing_parent => {
-                return Ok(target);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                "workspace parent {} for {:?} does not exist or was not authorized by the review",
-                ancestor.display(),
-                relative
-            ),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect workspace ancestor {}", ancestor.display()));
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetType {
+    Directory,
+    Other,
+}
+
+#[cfg(unix)]
+struct WorkspaceRoot {
+    root: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl WorkspaceRoot {
+    fn open(workspace: &Path) -> Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+
+        let root = rustix::fs::open(
+            workspace,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| {
+            format!(
+                "open workspace root {} without following symlinks",
+                workspace.display()
+            )
+        })?;
+        Ok(Self { root })
+    }
+
+    fn open_parent(
+        &self,
+        relative: &str,
+        allow_missing: bool,
+    ) -> Result<Option<(std::os::fd::OwnedFd, String)>> {
+        use rustix::fs::{Mode, OFlags};
+
+        snapshot::validate_relative_path(relative)?;
+        let mut components: Vec<_> = relative.split('/').collect();
+        let name = components
+            .pop()
+            .context("validated workspace path has no final component")?
+            .to_owned();
+        let mut directory =
+            rustix::io::dup(&self.root).context("duplicate workspace root handle")?;
+        for component in components {
+            match rustix::fs::openat(
+                &directory,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(next) => directory = next,
+                Err(error) if error == rustix::io::Errno::NOENT && allow_missing => {
+                    return Ok(None);
+                }
+                Err(error) if error == rustix::io::Errno::NOENT => {
+                    bail!(
+                        "workspace parent for {:?} does not exist or was not authorized by the review",
+                        relative
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "open workspace ancestor {:?} for {:?} without following symlinks",
+                            component, relative
+                        )
+                    });
+                }
             }
         }
+        Ok(Some((directory, name)))
     }
-    Ok(target)
+
+    fn target_type(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &str,
+        relative: &str,
+    ) -> Result<Option<TargetType>> {
+        use rustix::fs::{AtFlags, FileType};
+
+        match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(
+                if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+                    TargetType::Directory
+                } else {
+                    TargetType::Other
+                },
+            )),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("inspect reviewed path {relative:?}")),
+        }
+    }
+
+    fn remove_target(&self, relative: &str) -> Result<()> {
+        use rustix::fs::AtFlags;
+
+        let Some((parent, name)) = self.open_parent(relative, true)? else {
+            return Ok(());
+        };
+        match self.target_type(&parent, &name, relative)? {
+            Some(TargetType::Directory) => {
+                rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).with_context(|| {
+                    format!(
+                        "remove reviewed directory {:?}; it contains content not authorized for removal",
+                        relative
+                    )
+                })?;
+            }
+            Some(TargetType::Other) => {
+                rustix::fs::unlinkat(&parent, &name, AtFlags::empty())
+                    .with_context(|| format!("remove reviewed path {relative:?}"))?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn make_exact_directory_writable(&self, relative: &str) -> Result<()> {
+        use rustix::fs::{Mode, OFlags};
+
+        let Some((parent, name)) = self.open_parent(relative, true)? else {
+            return Ok(());
+        };
+        if self.target_type(&parent, &name, relative)? != Some(TargetType::Directory) {
+            return Ok(());
+        }
+        let directory = rustix::fs::openat(
+            &parent,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("open reviewed directory {relative:?}"))?;
+        let stat = rustix::fs::fstat(&directory)
+            .with_context(|| format!("inspect reviewed directory {relative:?}"))?;
+        rustix::fs::fchmod(&directory, Mode::from_raw_mode(stat.st_mode) | Mode::RWXU)
+            .with_context(|| format!("make reviewed directory {relative:?} writable"))?;
+        Ok(())
+    }
+
+    fn ensure_directory(&self, relative: &str, mode: u32) -> Result<()> {
+        use rustix::fs::AtFlags;
+
+        let (parent, name) = self
+            .open_parent(relative, false)?
+            .context("required workspace parent unexpectedly missing")?;
+        match self.target_type(&parent, &name, relative)? {
+            Some(TargetType::Directory) => {}
+            Some(TargetType::Other) => {
+                rustix::fs::unlinkat(&parent, &name, AtFlags::empty())
+                    .with_context(|| format!("replace {relative:?} with a directory"))?;
+                rustix::fs::mkdirat(&parent, &name, unix_mode(mode))
+                    .with_context(|| format!("create directory {relative:?}"))?;
+            }
+            None => {
+                rustix::fs::mkdirat(&parent, &name, unix_mode(mode))
+                    .with_context(|| format!("create directory {relative:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_file(&self, relative: &str, mode: u32) -> Result<std::os::fd::OwnedFd> {
+        let (parent, name) = self
+            .open_parent(relative, false)?
+            .context("required workspace parent unexpectedly missing")?;
+        create_file_in_parent(&parent, &name, mode, relative)
+    }
+
+    fn create_symlink(&self, relative: &str, target: &str) -> Result<()> {
+        let (parent, name) = self
+            .open_parent(relative, false)?
+            .context("required workspace parent unexpectedly missing")?;
+        rustix::fs::symlinkat(target, &parent, &name)
+            .with_context(|| format!("create reviewed symlink {relative:?}"))
+    }
+
+    fn set_directory_mode(&self, relative: &str, mode: u32) -> Result<()> {
+        use rustix::fs::{Mode, OFlags};
+
+        let (parent, name) = self
+            .open_parent(relative, false)?
+            .context("required workspace parent unexpectedly missing")?;
+        let directory = rustix::fs::openat(
+            &parent,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("open reviewed directory {relative:?}"))?;
+        rustix::fs::fchmod(&directory, unix_mode(mode))
+            .with_context(|| format!("set reviewed directory mode for {relative:?}"))
+    }
 }
 
-fn remove_target(workspace: &Path, relative: &str) -> Result<()> {
-    let target = checked_target(workspace, relative, true)?;
-    match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir(&target).with_context(|| {
-            format!(
-                "remove reviewed directory {:?}; it contains content not authorized for removal",
-                relative
-            )
-        })?,
-        Ok(_) => fs::remove_file(&target)
-            .with_context(|| format!("remove reviewed path {relative:?}"))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("inspect reviewed path {relative:?}")),
-    }
-    Ok(())
+#[cfg(unix)]
+fn unix_mode(mode: u32) -> rustix::fs::Mode {
+    rustix::fs::Mode::from_raw_mode(mode as _)
 }
 
-fn make_exact_directory_writable(workspace: &Path, relative: &str) -> Result<()> {
-    let target = checked_target(workspace, relative, true)?;
-    let metadata = match fs::symlink_metadata(&target) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("inspect {relative:?}")),
-    };
-    if metadata.file_type().is_dir() {
-        make_writable(&target, &metadata)?;
-    }
-    Ok(())
+#[cfg(unix)]
+fn create_file_in_parent(
+    parent: &std::os::fd::OwnedFd,
+    name: &str,
+    mode: u32,
+    relative: &str,
+) -> Result<std::os::fd::OwnedFd> {
+    use rustix::fs::OFlags;
+
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        unix_mode(mode),
+    )
+    .with_context(|| format!("create reviewed file {relative:?}"))
 }
 
 fn rollback_error<T>(
@@ -759,44 +927,6 @@ fn write_artifact(store: &Store, run_id: &str, relative: &str, bytes: &[u8]) -> 
         digest: run::sha256_bytes(bytes),
         size: bytes.len() as u64,
     })
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &str, path: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, path)
-}
-
-#[cfg(windows)]
-fn create_symlink(target: &str, path: &Path) -> io::Result<()> {
-    std::os::windows::fs::symlink_file(target, path)
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn make_writable(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = metadata.permissions().mode() | 0o700;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_writable(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    let mut permissions = metadata.permissions();
-    permissions.set_readonly(false);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -899,6 +1029,40 @@ mod tests {
                 .manifest
                 .digest,
             before.digest
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_parent_handle_does_not_follow_a_racing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let outside = temporary.path().join("outside");
+        let original_parent = workspace.join("original-parent");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(workspace.join("parent")).unwrap();
+
+        let root = WorkspaceRoot::open(&workspace).unwrap();
+        let (parent, name) = root
+            .open_parent("parent/result.txt", false)
+            .unwrap()
+            .unwrap();
+
+        fs::rename(workspace.join("parent"), &original_parent).unwrap();
+        symlink(&outside, workspace.join("parent")).unwrap();
+
+        let mut output =
+            File::from(create_file_in_parent(&parent, &name, 0o644, "parent/result.txt").unwrap());
+        output.write_all(b"reviewed\n").unwrap();
+        output.sync_all().unwrap();
+
+        assert!(!outside.join("result.txt").exists());
+        assert_eq!(
+            fs::read_to_string(original_parent.join("result.txt")).unwrap(),
+            "reviewed\n"
         );
     }
 }
