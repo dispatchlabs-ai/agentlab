@@ -186,7 +186,20 @@ pub fn scan_export(export: &Path) -> Result<RootFsManifest> {
         hard_links = unresolved;
     }
 
-    let entries: Vec<_> = entries.into_values().collect();
+    manifest_from_entries(entries.into_values().collect())
+}
+
+/// Build the canonical AgentLab root-filesystem identity from a provider's
+/// complete, already-normalized filesystem inventory.
+pub fn manifest_from_entries(entries: Vec<RootFsEntry>) -> Result<RootFsManifest> {
+    let mut by_path = BTreeMap::new();
+    for entry in entries {
+        validate_manifest_entry(&entry)?;
+        if by_path.insert(entry.path.clone(), entry).is_some() {
+            bail!("duplicate path in root filesystem manifest");
+        }
+    }
+    let entries: Vec<_> = by_path.into_values().collect();
     let identity = RootFsIdentity {
         schema_version: ROOTFS_SCHEMA_VERSION,
         entries: &entries,
@@ -197,6 +210,43 @@ pub fn scan_export(export: &Path) -> Result<RootFsManifest> {
         digest: format!("sha256:{}", hex_digest(&Sha256::digest(bytes))),
         entries,
     })
+}
+
+fn validate_manifest_entry(entry: &RootFsEntry) -> Result<()> {
+    if entry.path.is_empty()
+        || entry.path.starts_with('/')
+        || entry.path.contains('\0')
+        || entry
+            .path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("unsafe root filesystem manifest path {:?}", entry.path);
+    }
+    if entry.mode > 0o7777 {
+        bail!("invalid mode for root filesystem path /{}", entry.path);
+    }
+    let valid_file_digest = entry.digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    match entry.kind.as_str() {
+        "file" if valid_file_digest && entry.link_target.is_empty() => {}
+        "directory"
+            if entry.size == 0 && entry.digest.is_empty() && entry.link_target.is_empty() => {}
+        "symlink"
+            if entry.size == 0 && entry.digest.is_empty() && !entry.link_target.contains('\0') => {}
+        "file" => bail!("invalid file metadata for /{}", entry.path),
+        "directory" => bail!("invalid directory metadata for /{}", entry.path),
+        "symlink" => bail!("invalid symlink metadata for /{}", entry.path),
+        kind => bail!(
+            "unsupported root filesystem entry type {kind:?} at /{}",
+            entry.path
+        ),
+    }
+    Ok(())
 }
 
 pub fn store_required_file_blobs(
@@ -448,6 +498,36 @@ mod tests {
                 .contains_blob(&unneeded.digest, unneeded.size)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn provider_inventories_are_canonicalized_and_strictly_validated() {
+        let directory = RootFsEntry {
+            path: "workspace".to_owned(),
+            kind: "directory".to_owned(),
+            mode: 0o755,
+            size: 0,
+            digest: String::new(),
+            link_target: String::new(),
+        };
+        let file = RootFsEntry {
+            path: "workspace/proof.txt".to_owned(),
+            kind: "file".to_owned(),
+            mode: 0o644,
+            size: 5,
+            digest: format!("sha256:{}", "a".repeat(64)),
+            link_target: String::new(),
+        };
+        let manifest = manifest_from_entries(vec![file.clone(), directory.clone()]).unwrap();
+        assert_eq!(manifest.entries, vec![directory.clone(), file.clone()]);
+
+        assert!(manifest_from_entries(vec![directory.clone(), directory]).is_err());
+        let mut unsafe_file = file.clone();
+        unsafe_file.path = "../outside".to_owned();
+        assert!(manifest_from_entries(vec![unsafe_file]).is_err());
+        let mut bad_digest = file;
+        bad_digest.digest = "sha256:not-a-digest".to_owned();
+        assert!(manifest_from_entries(vec![bad_digest]).is_err());
     }
 
     fn append_file(builder: &mut Builder<File>, path: &str, contents: &[u8]) {

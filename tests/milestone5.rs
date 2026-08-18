@@ -82,6 +82,7 @@ fn external_evaluator_reports_real_input_identities_and_scores() -> Result<()> {
         let store = store.clone();
         threads.push(std::thread::spawn(move || {
             let options = RunOptions {
+                backend: None,
                 workspace: WorkspaceSource::Snapshot(workspace_snapshot),
                 workspace_capture_mode: snapshot::CaptureMode::All,
                 image: "alpine:3.21".to_owned(),

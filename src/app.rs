@@ -352,9 +352,16 @@ fn apply_command(
     )?;
     writeln!(stdout, "Result workspace verified: true")?;
     let image_reference = run::immutable_image_reference(&store, &record.run_id)?;
+    let source_spec = run::load_spec(&store, &record.run_id)?;
+    let backend_argument = source_spec
+        .backend_profile
+        .as_deref()
+        .map(|name| format!(" --backend {}", shell_word(name)))
+        .unwrap_or_default();
     writeln!(
         stdout,
-        "Retest exact applied input: agentlab run --snapshot {} --image {} -- COMMAND",
+        "Retest exact applied input: agentlab run{} --snapshot {} --image {} -- COMMAND",
+        backend_argument,
         record.after_workspace_snapshot_digest,
         shell_word(&image_reference)
     )?;
@@ -405,7 +412,7 @@ fn accept_command(
         tested_by_run_id.ok_or_else(|| anyhow::anyhow!("accept requires RUN"))?;
     writeln!(
         stderr,
-        "AgentLab: recording an explicit acceptance of the exact workspace and OCI image input tested by run {tested_by_run_id}; test output and session changes are not promoted."
+        "AgentLab: recording an explicit acceptance of the exact workspace and environment input tested by run {tested_by_run_id}; test output and session changes are not promoted."
     )?;
     stderr.flush()?;
     let store = Store::open(None)?;
@@ -428,8 +435,9 @@ fn accept_command(
     writeln!(stdout, "Workspace: {}", record.workspace_snapshot_digest)?;
     writeln!(
         stdout,
-        "OCI image: {} ({})",
-        record.image.execution_reference, record.image.resolved_digest
+        "Environment: {} ({})",
+        terminal::escape(&record.image.execution_reference),
+        record.image.resolved_digest
     )?;
     writeln!(stdout, "Test run: {}", record.tested_by_run_id)?;
     writeln!(stdout, "Test exit code: {}", record.test_exit_code)?;
@@ -455,7 +463,7 @@ fn accept_command(
 fn print_accept_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
-        "AgentLab accept\n\nExplicitly accept the exact workspace and OCI image input tested by a completed run. This records lineage; it does not promote the run's output filesystem.\n\nUsage:\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n\nArguments:\n  RUN                       Completed run that tested the input being accepted\n  --from-apply APPLY_ID     Require the test input to equal this reviewed apply result\n  --json                    Write the immutable acceptance record as JSON\n\nExamples:\n  agentlab accept INITIAL_TEST_RUN\n  agentlab accept RETEST_RUN --from-apply APPLY_ID\n\nWithout --from-apply, this creates or extends a tested-input lineage. With --from-apply, AgentLab requires an independent retest whose workspace is the exact after snapshot and whose OCI image and workspace path match the candidate run. Exit status is recorded but never interpreted as universal correctness. Each test run receives at most one acceptance decision."
+        "AgentLab accept\n\nExplicitly accept the exact workspace and environment input tested by a completed run. This records lineage; it does not promote the run's output filesystem.\n\nUsage:\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n\nArguments:\n  RUN                       Completed run that tested the input being accepted\n  --from-apply APPLY_ID     Require the test input to equal this reviewed apply result\n  --json                    Write the immutable acceptance record as JSON\n\nExamples:\n  agentlab accept INITIAL_TEST_RUN\n  agentlab accept RETEST_RUN --from-apply APPLY_ID\n\nWithout --from-apply, this creates or extends a tested-input lineage. With --from-apply, AgentLab requires an independent retest whose workspace is the exact after snapshot and whose environment and workspace path match the candidate run. Exit status is recorded but never interpreted as universal correctness. Each test run receives at most one acceptance decision."
     )?;
     Ok(())
 }
@@ -627,7 +635,7 @@ fn list_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         [argument] if argument == "--help" || argument == "-h" => {
             writeln!(
                 stdout,
-                "AgentLab list\n\nList retained runs and their current Docker container state.\n\nUsage:\n  agentlab list [--json]\n\nOptions:\n  --json                    Write machine-readable run records"
+                "AgentLab list\n\nList retained runs and their current backend resource state.\n\nUsage:\n  agentlab list [--json]\n\nOptions:\n  --json                    Write machine-readable run records"
             )?;
             return Ok(());
         }
@@ -646,22 +654,27 @@ fn list_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     }
     writeln!(
         stdout,
-        "RUN ID                                KIND  STATE    CONTINUATIONS  CONTAINER"
+        "RUN ID                                KIND  BACKEND           STATE     CONTINUATIONS  RESOURCE"
     )?;
     for run in runs {
+        let backend = format!("{}/{}", run.backend_driver, run.backend_profile);
+        let suffix = if run.backend_driver == "docker" && !run.lifecycle_capable {
+            " (legacy)"
+        } else if run.backend_driver == "e2b" {
+            " (immutable)"
+        } else {
+            ""
+        };
         writeln!(
             stdout,
-            "{:<36}  {:<4}  {:<7}  {:<13}  {}{}",
+            "{:<36}  {:<4}  {:<17} {:<9} {:<13}  {}{}",
             run.run_id,
             run.kind,
-            run.container_state,
+            terminal::escape(&backend),
+            terminal::escape(&run.resource_state),
             run.continuation_count,
-            run.container_name,
-            if run.lifecycle_capable {
-                ""
-            } else {
-                " (legacy)"
-            }
+            terminal::escape(&run.resource_name),
+            suffix,
         )?;
     }
     Ok(())
@@ -674,7 +687,7 @@ fn stop_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     {
         writeln!(
             stdout,
-            "AgentLab stop\n\nStop a retained run while preserving its container filesystem. Process memory is not preserved.\n\nUsage:\n  agentlab stop [--json] RUN"
+            "AgentLab stop\n\nStop a retained Docker run while preserving its container filesystem. Process memory is not preserved.\n\nUsage:\n  agentlab stop [--json] RUN\n\nE2B runs retain immutable snapshots and do not have a live resource to stop."
         )?;
         return Ok(());
     }
@@ -701,7 +714,7 @@ fn resume_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     {
         writeln!(
             stdout,
-            "AgentLab resume\n\nRestart a retained container and optionally run a continuation command in its existing filesystem. Process memory is not restored.\n\nUsage:\n  agentlab resume [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN -- COMMAND [ARG ...]\n\nOptions:\n  --pi-auth                 Inject ~/.pi/agent/auth.json only for the continuation command\n  --secret-file NAME=PATH   Inject a host file at /run/agentlab-secrets/NAME only for the command\n  --json                    Write the lifecycle or continuation record as JSON\n\nContinuation output is retained up to 64 MiB per stream and commands have a 24-hour fail-safe deadline. AgentLab stops the container for one immutable result capture, terminating background processes, then restarts only the inert supervisor. Ctrl-C revokes runtime credentials and exits 130; stale leases from a hard crash recover automatically on the next lifecycle or credentialed operation."
+            "AgentLab resume\n\nRestart a retained Docker container and optionally run a continuation command in its existing filesystem. Process memory is not restored.\n\nUsage:\n  agentlab resume [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN -- COMMAND [ARG ...]\n\nOptions:\n  --pi-auth                 Inject ~/.pi/agent/auth.json only for the continuation command\n  --secret-file NAME=PATH   Inject a host file at /run/agentlab-secrets/NAME only for the command\n  --json                    Write the lifecycle or continuation record as JSON\n\nContinuation output is retained up to 64 MiB per stream and commands have a 24-hour fail-safe deadline. AgentLab stops the container for one immutable result capture, terminating background processes, then restarts only the inert supervisor. Ctrl-C revokes runtime credentials and exits 130; stale leases from a hard crash recover automatically on the next lifecycle or credentialed operation. E2B filesystem continuation is not implemented in this release."
         )?;
         return Ok(());
     }
@@ -783,7 +796,7 @@ fn fork_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     {
         writeln!(
             stdout,
-            "AgentLab fork\n\nCreate an independent retained run from another run's current filesystem. Process memory is not copied.\n\nUsage:\n  agentlab fork [--json] RUN"
+            "AgentLab fork\n\nCreate an independent retained Docker run from another Docker run's current filesystem. Process memory is not copied.\n\nUsage:\n  agentlab fork [--json] RUN\n\nE2B filesystem forks are not implemented in this release."
         )?;
         return Ok(());
     }
@@ -812,7 +825,7 @@ fn remove_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     {
         writeln!(
             stdout,
-            "AgentLab rm\n\nDelete exactly one unreferenced run's owned container, prepared image tag, and local run artifacts. Runs preserved by accepted lineage are refused.\n\nUsage:\n  agentlab rm [--json] RUN"
+            "AgentLab rm\n\nDelete exactly one unreferenced run's retained backend resources and local run artifacts. Runs preserved by accepted lineage are refused.\n\nUsage:\n  agentlab rm [--json] RUN"
         )?;
         return Ok(());
     }
@@ -824,8 +837,16 @@ fn remove_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         writeln!(stdout)?;
     } else {
         writeln!(stdout, "Removed run: {}", removed.run_id)?;
-        writeln!(stdout, "Removed container: {}", removed.container_name)?;
-        writeln!(stdout, "Removed image tag: {}", removed.image_tag)?;
+        writeln!(stdout, "Backend: {}", removed.backend_driver)?;
+        writeln!(
+            stdout,
+            "Removed {}: {}",
+            removed.resource_kind,
+            terminal::escape(&removed.resource_name)
+        )?;
+        if removed.backend_driver == "docker" {
+            writeln!(stdout, "Removed image tag: {}", removed.image_tag)?;
+        }
         writeln!(stdout, "Removed local run artifacts: true")?;
     }
     Ok(())
@@ -953,7 +974,7 @@ impl run::RunObserver for CliRunObserver<'_> {
 fn print_run_help(stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
-        "AgentLab run\n\nRun one opaque command in a private Docker filesystem reconstructed from a complete workspace, exact stored snapshot, or explicitly accepted input.\n\nUsage:\n  agentlab run --workspace PATH --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --snapshot DIGEST --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n\nWorkspace input:\n  --workspace PATH          Capture every supported path, then run that exact snapshot\n  --snapshot DIGEST         Reuse and verify an existing immutable snapshot\n  --accepted ACCEPTANCE_ID  Reuse an accepted workspace, OCI image, and guest path\n  --respect-gitignore       Deliberately omit paths selected by workspace .gitignore files\n  --workspace-path PATH     Guest path for the private workspace (default: /workspace)\n\nRuntime:\n  --image IMAGE             OCI image tag or digest (required except with --accepted)\n  --network none|bridge     Network policy (default: bridge)\n  --memory LIMIT            Docker memory limit\n  --cpus COUNT              Docker CPU limit\n  --pi-auth                 Inject ~/.pi/agent/auth.json only while the command runs\n  --secret-file NAME=PATH   Inject a host file at /run/agentlab-secrets/NAME only for the command\n\nObservation:\n  --change-ignore PATH      Git-compatible rules for portable result changes\n  --capture PATH=NAME       Export an additional guest path as a retained tar artifact\n  --json                    Write only the final JSON summary to stdout; progress stays on stderr\n\nExamples:\n  agentlab run --workspace ./project --image alpine:3.21 -- /bin/sh -c 'printf \"private\\n\" > /workspace/proof.txt'\n  agentlab run --accepted ACCEPTANCE_ID -- HARNESS TASK\n\nThe source workspace is never mounted into the container. An accepted reference supplies and verifies the exact snapshot, immutable OCI image, and workspace path; command and runtime settings remain explicit experiment inputs. Network access uses Docker bridge mode by default; pass --network none for an offline run. Runtime credentials use private memory and are removed before filesystem capture. A generic secret named NAME is available only at /run/agentlab-secrets/NAME; records retain the name but never its host path, bytes, or digest. The guest command can still reveal or copy any credential it receives. Command output is retained up to 64 MiB per stream and every guest command has a 24-hour fail-safe deadline. AgentLab stops the container to capture one immutable result state, terminating background processes, then restarts only the inert supervisor. Ctrl-C revokes runtime credentials and exits 130."
+        "AgentLab run\n\nRun one opaque command in a private isolated filesystem reconstructed from a complete workspace, exact stored snapshot, or explicitly accepted input.\n\nUsage:\n  agentlab run --workspace PATH --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --snapshot DIGEST --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n\nWorkspace input:\n  --workspace PATH          Capture every supported path, then run that exact snapshot\n  --snapshot DIGEST         Reuse and verify an existing immutable snapshot\n  --accepted ACCEPTANCE_ID  Reuse an accepted workspace, environment, and guest path\n  --respect-gitignore       Deliberately omit paths selected by workspace .gitignore files\n  --workspace-path PATH     Guest path for the private workspace (default: /workspace)\n\nRuntime:\n  --backend NAME            Use a configured backend profile (default_backend, else local Docker)\n  --image IMAGE             Environment image name (required except with --accepted)\n  --network none|bridge     Network policy (default: bridge)\n  --memory LIMIT            Backend memory limit when supported\n  --cpus COUNT              Backend CPU limit when supported\n  --pi-auth                 Inject ~/.pi/agent/auth.json only while the command runs\n  --secret-file NAME=PATH   Inject a host file at /run/agentlab-secrets/NAME only for the command\n\nObservation:\n  --change-ignore PATH      Git-compatible rules for portable result changes\n  --capture PATH=NAME       Export an additional guest path as a retained tar artifact\n  --json                    Write only the final JSON summary to stdout; progress stays on stderr\n\nExamples:\n  agentlab run --workspace ./project --image alpine:3.21 -- /bin/sh -c 'printf \"private\\n\" > /workspace/proof.txt'\n  agentlab run --backend e2b-dell --workspace ./project --image project:dev -- COMMAND\n  agentlab run --accepted ACCEPTANCE_ID -- HARNESS TASK\n\nThe source workspace is never mounted into the isolated environment. An accepted reference supplies and verifies the exact snapshot, immutable environment, and workspace path; when --backend is omitted, it reuses the protected test run's backend profile. Command and runtime settings remain explicit experiment inputs. Other runs that omit --backend use default_backend from ~/.agentlab/config.toml, or local Docker when it is unset. A backend name selects an explicit driver; names never imply Docker or E2B behavior. Network access uses bridge/egress mode by default; pass --network none for an offline run. Runtime credentials use private runtime memory and are removed before filesystem capture. A generic secret named NAME is available only at /run/agentlab-secrets/NAME; records retain the name but never its host path, bytes, or digest. The guest command can still reveal or copy any credential it receives. Command output is retained up to 64 MiB per stream. Docker commands have a 24-hour fail-safe deadline; the current one-hour E2B service limit leaves 58 minutes for the guest command and reserves the remainder for cleanup and snapshot capture. Ctrl-C revokes runtime credentials and exits 130."
     )?;
     Ok(())
 }
@@ -992,7 +1013,9 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
     let mut snapshot = None;
     let mut accepted = None;
     let mut workspace_path_set = false;
+    let mut backend_name = None;
     let mut parsed = RunOptions {
+        backend: None,
         workspace: WorkspaceSource::Directory(PathBuf::from(".")),
         workspace_capture_mode: CaptureMode::All,
         image: String::new(),
@@ -1034,6 +1057,12 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
                 accepted = Some(required_value(options, &mut index, "--accepted")?.to_owned());
             }
             "--image" => parsed.image = required_value(options, &mut index, "--image")?.to_owned(),
+            "--backend" => {
+                if backend_name.is_some() {
+                    bail!("--backend may be specified only once");
+                }
+                backend_name = Some(required_value(options, &mut index, "--backend")?.to_owned());
+            }
             "--workspace-path" => {
                 workspace_path_set = true;
                 parsed.workspace_guest_path =
@@ -1086,10 +1115,9 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         }
         index += 1;
     }
-    let store = Store::open(None)?;
-    if let Some(acceptance_id) = accepted {
+    if accepted.is_some() {
         if !parsed.image.is_empty() {
-            bail!("--accepted supplies the OCI image and cannot be combined with --image");
+            bail!("--accepted supplies the environment and cannot be combined with --image");
         }
         if workspace_path_set {
             bail!(
@@ -1101,8 +1129,31 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
                 "--accepted supplies an exact snapshot and cannot be combined with --respect-gitignore"
             );
         }
-        let record = acceptance::find(&store, &acceptance_id)?;
-        acceptance::verify(&store, &record)?;
+    }
+    let store = Store::open(None)?;
+    let config = AgentLabConfig::load(&store)?;
+    let accepted_record = match accepted.as_deref() {
+        Some(acceptance_id) => {
+            let record = acceptance::find(&store, acceptance_id)?;
+            acceptance::verify(&store, &record)?;
+            Some(record)
+        }
+        None => None,
+    };
+    let accepted_backend = match (&backend_name, &accepted_record) {
+        (None, Some(record)) => {
+            let test_spec = run::load_spec(&store, &record.tested_by_run_id)?;
+            Some(
+                test_spec
+                    .backend_profile
+                    .unwrap_or_else(|| "local".to_owned()),
+            )
+        }
+        _ => None,
+    };
+    parsed.backend =
+        Some(config.selected_backend(backend_name.as_deref().or(accepted_backend.as_deref()))?);
+    if let Some(record) = accepted_record {
         parsed.workspace = WorkspaceSource::Snapshot(record.workspace_snapshot_digest.clone());
         parsed.workspace_guest_path = record.workspace_guest_path.clone();
         parsed.image = record.image.execution_reference.clone();
@@ -1155,8 +1206,14 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         )?;
         writeln!(
             stdout,
-            "Retained container: {}",
-            result.retained_container_name
+            "Backend: {}/{}",
+            result.backend_driver, result.backend_profile
+        )?;
+        writeln!(
+            stdout,
+            "Retained {}: {}",
+            result.retained_resource_kind,
+            terminal::escape(&result.retained_resource_name)
         )?;
         writeln!(
             stdout,
@@ -1165,13 +1222,15 @@ fn run_command(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         )?;
         writeln!(stdout, "Changes:  agentlab diff {}", result.run_id)?;
         writeln!(stdout, "Raw:      agentlab diff --raw {}", result.run_id)?;
-        writeln!(stdout, "Stop:     agentlab stop {}", result.run_id)?;
-        writeln!(
-            stdout,
-            "Continue: agentlab resume {} -- COMMAND",
-            result.run_id
-        )?;
-        writeln!(stdout, "Fork:     agentlab fork {}", result.run_id)?;
+        if result.backend_driver == "docker" {
+            writeln!(stdout, "Stop:     agentlab stop {}", result.run_id)?;
+            writeln!(
+                stdout,
+                "Continue: agentlab resume {} -- COMMAND",
+                result.run_id
+            )?;
+            writeln!(stdout, "Fork:     agentlab fork {}", result.run_id)?;
+        }
         writeln!(stdout, "Remove:   agentlab rm {}", result.run_id)?;
     }
     Ok(())
@@ -1233,7 +1292,7 @@ fn compare_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
     )?;
     writeln!(
         stdout,
-        "Distinct private containers: {}",
+        "Distinct private resources: {}",
         comparison.distinct_private_containers
     )?;
     writeln!(
@@ -1658,7 +1717,7 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
             )?;
             writeln!(
                 stdout,
-                "OCI image: {} ({})",
+                "Environment: {} ({})",
                 terminal::escape(&record.image.execution_reference),
                 record.image.resolved_digest
             )?;
@@ -1762,11 +1821,25 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
         let managed = lifecycle::inspect(&store, digest, false)?;
         writeln!(
             stdout,
-            "Retained container: {} ({})",
-            managed.container_name, managed.container_state
+            "Backend: {}/{}",
+            terminal::escape(&managed.backend_driver),
+            terminal::escape(&managed.backend_profile)
         )?;
-        writeln!(stdout, "Lifecycle capable: {}", managed.lifecycle_capable)?;
-        writeln!(stdout, "Continuations: {}", managed.continuation_count)?;
+        writeln!(
+            stdout,
+            "Retained {}: {} ({})",
+            terminal::escape(&managed.resource_kind),
+            terminal::escape(&managed.resource_name),
+            terminal::escape(&managed.resource_state)
+        )?;
+        if let Some(e2b) = &result.e2b {
+            writeln!(stdout, "Build: {}", e2b.result_snapshot.build_id)?;
+            writeln!(stdout, "Isolation: {}", e2b.isolation)?;
+            writeln!(stdout, "Lifecycle: immutable provider snapshot")?;
+        } else {
+            writeln!(stdout, "Lifecycle capable: {}", managed.lifecycle_capable)?;
+            writeln!(stdout, "Continuations: {}", managed.continuation_count)?;
+        }
         writeln!(
             stdout,
             "Evaluations: {}",
@@ -2150,7 +2223,7 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--agent | --no-agent | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--timeout SECONDS] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] [--timeout SECONDS] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes with optional agent curation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation ignores and a trusted host harness may be configured only in ~/.agentlab/config.toml; they never alter evidence, and --raw always shows every captured machine change without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--agent | --no-agent | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--timeout SECONDS] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] [--timeout SECONDS] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and retained backend resource state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes with optional agent curation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and environment input tested by a run\n  stop        stop a retained Docker container\n  resume      restart a Docker container and optionally execute a credentialed continuation\n  fork        create a private Docker filesystem-level fork\n  rm          delete one unreferenced run's backend resources and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation ignores and a trusted host harness may be configured only in ~/.agentlab/config.toml; they never alter evidence, and --raw always shows every captured machine change without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Docker filesystem state survives stop/resume, but process trees and live memory do not; E2B runs retain immutable base/result snapshots and support the normal list, inspect, diff, compare, evaluate, review, apply, accept, and rm workflow while stop/resume/fork remain Docker-only. Evaluator scores and exit status are observations, not universal judgments."
     )?;
     Ok(())
 }

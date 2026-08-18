@@ -76,6 +76,24 @@ fn accepted_input_to_reviewed_improvement_preserves_complete_lineage() -> Result
     initialize_repository(&workspace)?;
 
     let store = Store::open(Some(&state))?;
+    fs::write(
+        state.join("config.toml"),
+        r#"
+version = 1
+default_backend = "remote-default"
+
+[backends.remote-default]
+driver = "e2b"
+transport = "ssh"
+ssh_alias = "unreachable-fixture"
+sdk_directory = "/tmp/e2b-sdk"
+orchestrator_directory = "/tmp/e2b-orchestrator"
+remote_root = "/tmp/agentlab-e2b"
+expected_isolation = "firecracker"
+templates = { "fixture:dev" = "fixture:immutable" }
+template_builds = { "fixture:dev" = "00000000-0000-4000-8000-000000000001" }
+"#,
+    )?;
     let initial_snapshot = snapshot::create(&workspace, &store)?.manifest.digest;
     let mut cleanup = Cleanup {
         store: store.clone(),
@@ -84,6 +102,7 @@ fn accepted_input_to_reviewed_improvement_preserves_complete_lineage() -> Result
 
     let seed = cleanup.retain(run::execute(
         &RunOptions {
+            backend: None,
             workspace: WorkspaceSource::Snapshot(initial_snapshot),
             workspace_capture_mode: snapshot::CaptureMode::All,
             image: "alpine:3.21".to_owned(),
@@ -129,6 +148,8 @@ fn accepted_input_to_reviewed_improvement_preserves_complete_lineage() -> Result
         &initial_acceptance.acceptance_id,
         candidate_script,
     )?);
+    ensure!(candidate_a.backend_profile == "local");
+    ensure!(candidate_b.backend_profile == "local");
     let comparison = run::compare_runs(&store, &candidate_a.run_id, &candidate_b.run_id)?;
     ensure!(comparison.comparable_repetition);
     ensure!(comparison.distinct_private_containers);
@@ -173,7 +194,9 @@ fn accepted_input_to_reviewed_improvement_preserves_complete_lineage() -> Result
     ensure_success(&apply_output, "apply reviewed candidate")?;
     let apply_text = String::from_utf8(apply_output.stdout)?;
     let applied_id = output_value(&apply_text, "Apply: ")?;
-    ensure!(apply_text.contains("Retest exact applied input: agentlab run --snapshot "));
+    ensure!(
+        apply_text.contains("Retest exact applied input: agentlab run --backend local --snapshot ")
+    );
     ensure!(apply_text.contains(&format!(
         "Accept after retest: agentlab accept RETEST_RUN --from-apply {applied_id}"
     )));
@@ -300,6 +323,8 @@ fn run_snapshot(state: &std::path::Path, digest: &str, script: &str) -> Result<R
         &[
             "run",
             "--json",
+            "--backend",
+            "local",
             "--snapshot",
             digest,
             "--image",

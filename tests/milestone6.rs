@@ -63,6 +63,7 @@ fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<
     let store = Store::open(Some(&state))?;
     let summary = run::execute(
         &RunOptions {
+            backend: None,
             workspace: WorkspaceSource::Directory(workspace.clone()),
             workspace_capture_mode: snapshot::CaptureMode::All,
             image: "alpine:3.21".to_owned(),

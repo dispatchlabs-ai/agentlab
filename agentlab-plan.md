@@ -222,7 +222,7 @@ The primitive preparation workflow is:
 4. Launch every B repetition from the B digest.
 5. Let comparison derive whether inputs are identical and which recorded fields differ.
 
-A model, reasoning level, harness, or task belongs in the opaque command or in snapshotted harness configuration. A workspace skill is an ordinary directory and files: A's snapshot omits it and B's snapshot contains it. A tool or system package outside the workspace belongs in the OCI image. With Docker today, a user may enter a disposable container, make the change, commit a new layer, and give AgentLab that image; a VM backend may later accept an equivalent VM snapshot.
+A model, reasoning level, harness, or task belongs in the opaque command or in snapshotted harness configuration. A workspace skill is an ordinary directory and files: A's snapshot omits it and B's snapshot contains it. A tool or system package outside the workspace belongs in the OCI image. With Docker, a user may enter a disposable container, make the change, commit a new layer, and give AgentLab that image. With E2B, the same OCI definition is compiled into a credential-free, build-pinned template whose runtime metadata is bound into the run identity.
 
 AgentLab does not need a factor map, treatment registry, preparation DSL, or special knowledge of any of these concepts. Human-friendly experiment names may live in an external notebook or orchestration script, but they never substitute for content-addressed evidence.
 
@@ -341,6 +341,14 @@ agentlab apply
 
 In the direct-Docker implementation, lifecycle commands manage retained named containers. `resume` restarts or re-enters the exact retained persistent filesystem and container configuration. It does not imply restoration of process memory. Unsupported operations such as memory resume must fail explicitly rather than being simulated.
 
+Backend selection is an option on `run` rather than a new command family.
+`--backend NAME` selects a private
+host-configured profile whose explicit driver chooses Docker, E2B, or another
+implementation; omitting it uses local Docker by default. Retained lifecycle
+commands recover the backend and provider-native identifiers from the run
+record rather than asking the user to select them again. Backend endpoints,
+transports, and credentials live outside the workspace under test.
+
 Representative use:
 
 ```bash
@@ -370,7 +378,13 @@ Keep Docker-specific mechanics in one internal package with only the operations 
 prepare -> run -> inspect -> export -> stop/resume -> delete
 ```
 
-Do not design a public generalized backend framework yet. Do not add capability negotiation, abstract checkpoint hierarchies, or lifecycle concepts that have no second implementation. The versioned AgentLab manifests should remain portable enough that a later backend can consume and produce them, but internal interfaces may be refactored when real evidence from that backend exists.
+Milestones 2 through 7 deliberately avoided a public generalized backend
+framework while Docker was the only implementation. The 2026-08-18 E2B
+implementation now supplies real second-backend evidence. Extract only the smallest
+internal execution interface required by both working implementations; do not
+add speculative capability negotiation, abstract checkpoint hierarchies, or
+lifecycle concepts that neither backend can prove. The public selector should
+be a backend name, while versioned AgentLab manifests retain portable meaning.
 
 ### Direct-Docker workflow
 
@@ -398,7 +412,14 @@ Docker stop/start preserves the container's private filesystem state but does no
 
 After Milestones 2 through 4 pass, run a time-boxed Dagger spike against the same conformance fixture. Adopt Dagger only if measured implementation size, correctness, portability, or operational simplicity is materially better than direct Docker. Dagger is not a required AgentLab dependency or planned production backend merely because it is being evaluated.
 
-Add a Firecracker/E2B-compatible VM backend only when stronger isolation, remote placement, VM snapshots, memory checkpoints, or cloud scale becomes a concrete requirement. Preserve the portable AgentLab run and result formats, but allow the internal execution seam to evolve from evidence rather than prediction.
+Strong isolation and remote placement are now concrete requirements. The E2B
+2.38.0 backend on `e2b-dell` successfully creates an x86-64 Firecracker
+sandbox through an ordinary AgentLab run, transfers and verifies the curated
+Daily Log workspace, runs pinned Node and Pi versions with ephemeral runtime
+OAuth, captures immutable base/result filesystems, and terminates the live
+sandbox. Milestone 8 continues with template installation and optional
+filesystem continuation while preserving the portable AgentLab run and result
+formats.
 
 Do not build a daemon, scheduler, database, billing layer, or cloud control plane in the first version.
 
@@ -698,7 +719,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - C contains accepted improvements and excludes rejected or ignored session debris.
 - All prior run evidence remains auditable.
 - `agentlab accept RUN` explicitly accepts the exact workspace/image input tested by a completed run, while `--from-apply APPLY_ID` requires an independent retest of the exact reviewed apply result.
-- `agentlab run --accepted ACCEPTANCE_ID -- COMMAND` reconstructs the accepted snapshot and immutable OCI image, carries verified lineage in the run specification, and never promotes the retest result filesystem.
+- `agentlab run --accepted ACCEPTANCE_ID -- COMMAND` reconstructs the accepted snapshot and immutable resolved environment, reuses the protected test run's backend profile, carries verified lineage in the run specification, and never promotes the retest result filesystem.
 - Accepted input identity is content-based; acceptance remains an explicit decision rather than an interpretation of exit status or evaluator scores.
 - Ordinary removal protects candidate and test runs referenced by accepted lineage.
 
@@ -710,19 +731,78 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 
 ### Milestone 8: Evaluate whether a second backend earns its complexity
 
-**Goal:** Use evidence from the completed Docker implementation to decide whether Dagger or a VM backend materially improves AgentLab.
+**Status:** In progress. The first usable E2B/Firecracker run slice passed on
+2026-08-18; filesystem continuation/fork and automatic template installation
+remain.
 
-**Outcomes:**
+**Goal:** Add the smallest E2B backend that preserves AgentLab's portable
+contract and reduces normal remote execution to one named backend selection.
 
-- A time-boxed Dagger spike runs the existing conformance fixture without changing target workspace conventions or portable AgentLab manifests.
-- The spike compares implementation size, correctness, performance, retained-session behavior, portability, operational dependencies, and failure modes with direct Docker.
-- Dagger is selected only if that comparison demonstrates material value; otherwise the rejection and evidence are documented and no production adapter is added.
-- A Firecracker/E2B-compatible backend is considered separately when strong isolation, remote placement, memory snapshots, or cloud scale is a concrete requirement.
-- Any later backend consumes the same workspace snapshot and emits the same portable delta and result semantics, while its native snapshot or checkpoint remains opaque backend evidence.
+**Completed outcomes:**
 
-**Acceptance:** A decision record grounded in the working Docker implementation either justifies a second backend with measured advantages or explicitly defers it without changing AgentLab's portable protocol.
+- `agentlab run --backend NAME` selects a host-configured execution backend;
+  omission continues to select local Docker.
+- The selected profile declares its driver explicitly. AgentLab never infers
+  Docker or E2B from a profile name, hostname, or SSH alias, and lifecycle
+  commands reuse the backend recorded by the run.
+- Private backend configuration owns the SSH/E2B transport, remote SDK
+  credentials, immutable template/build mapping, non-secret runtime metadata,
+  and asserted Firecracker isolation. Raw IPs and manual SDK scripts do not
+  appear in ordinary run commands.
+- The E2B backend consumes the existing verified AgentLab snapshot and opaque
+  command rather than inventing a workspace convention.
+- A Dockerfile or Containerfile remains the portable environment source. E2B
+  template/build/snapshot IDs and the image-specific runtime environment map
+  are backend evidence bound into, not replacements for, AgentLab identities.
+- Command-scoped Pi and generic secrets retain the current no-path,
+  no-bytes-in-records contract and are revoked before result capture.
+- E2B forces filesystem-only checkpoint boundaries, retains immutable named
+  base/result snapshots, mounts their builds read-only, and emits the same
+  complete portable rootfs delta/result semantics with separate provider
+  evidence.
+- Bounded chunked transfer supports the real 76.7 MB curated Daily Log input;
+  no workspace paths are silently excluded for transport convenience.
+- `list`, `inspect --verify`, `diff`, downstream review/apply/acceptance, and
+  build-bound `rm` work for E2B. The live microVM terminates after the result
+  snapshot, and the CLI does not advertise unsupported continuations.
+- Accepted E2B inputs replay through the backend profile recorded by their
+  protected test run when `--backend` is omitted, then re-verify the exact
+  template build and runtime-environment identity.
+- Pi and generic secrets live only under runtime memory, are removed before
+  the result checkpoint, and are absent from retained base/result manifests.
+- Dagger is no longer the next required spike. It may still be evaluated later
+  only if it offers measured value beyond the two real implementations.
 
-**Hands-on checkpoint:** Run the same safe fixture through direct Docker and the time-boxed Dagger spike if viable, compare their portable results and operational complexity, and record the keep-or-reject decision. Do not build a VM backend as part of this checkpoint unless a concrete strong-isolation or cloud requirement already exists.
+**First-slice acceptance completed:** From the Mac, the normal AgentLab CLI ran
+the curated Daily Log workspace with `--backend e2b-dell`, transferred all
+1,019 paths and 76,707,637 logical bytes into an x86-64 Firecracker microVM,
+injected Pi OAuth for one command, received a successful five-bullet answer,
+removed credential/control paths, retained immutable base/result snapshots,
+reported the source workspace unchanged, and passed `inspect --verify`, raw
+diff, and agent-reduced diff. The fidelity-corrected run finalized in 49.8
+seconds with workspace digest
+`sha256:9fe98c6aae8b1c5d8889a9e92eef9b8a6a09f71eb2f1a1b67cb7ced51a708bc0`.
+
+**Remaining outcomes:**
+
+- Add a first-class installation/build workflow that compiles an OCI
+  definition into an E2B template, derives its non-secret runtime metadata,
+  verifies disk headroom, and updates the immutable profile mapping without
+  manual SDK work.
+- Implement truthful E2B filesystem continuation and fork from retained
+  snapshots, or deliberately keep them unsupported if measured use does not
+  justify the added lifecycle surface. Do not imply process-memory restoration.
+- Run one shared disposable conformance fixture through Docker and E2B, keeping
+  portable assertions shared and provider-native assertions separate.
+
+**Milestone acceptance remaining:** Run the same safe fixture once with the
+default Docker backend and once with `--backend e2b-dell`; then continue or fork
+the E2B filesystem state through only AgentLab commands if that lifecycle slice
+is retained in scope.
+
+**Hands-on checkpoint:** The run/inspect/diff path is ready now using only the
+normal AgentLab CLI plus `--backend e2b-dell`. The next checkpoint is a public
+template-install command, followed by E2B continuation/fork if implemented.
 
 ### Milestone 9: Open-source readiness
 

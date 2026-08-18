@@ -1,15 +1,15 @@
 # AgentLab Specification
 
-Status: Milestones 1–7 working contract
+Status: Milestones 1–7 working contract plus Milestone 8 E2B run slice
 Snapshot schema: `agentlab.snapshot/v1`
-Run schema: `agentlab.run/v3` (`agentlab.run/v1` and `agentlab.run/v2` read compatibility)
-Run-input schema: `agentlab.run-input/v1`
+Run schema: `agentlab.run/v3` (Docker), `agentlab.run/v4` (E2B), with `agentlab.run/v1` and `agentlab.run/v2` read compatibility
+Run-input schema: `agentlab.run-input/v1` (Docker), `agentlab.run-input/v2` (E2B)
 Delta schema: `agentlab.delta/v1`
 Per-file diff schema: `agentlab.file-diffs/v2` (`agentlab.file-diffs/v1` read compatibility)
 Diff-selection schema: `agentlab.diff-selection/v2` (`agentlab.diff-selection/v1` read compatibility)
 Diff-presenter-input schema: `agentlab.diff-presenter-input/v1`
 Diff-presentation schema: `agentlab.diff-presentation/v2`
-Result schema: `agentlab.result/v1`
+Result schema: `agentlab.result/v1` (Docker), `agentlab.result/v2` (E2B)
 Continuation schema: `agentlab.continuation/v1`
 Fork schema: `agentlab.fork/v1`
 Lifecycle event schema: `agentlab.lifecycle-event/v1`
@@ -31,7 +31,7 @@ immutable input
     → complete observation and filesystem delta
 ```
 
-Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained filesystem state and harness-level continuation. Milestone 5 records observations from arbitrary external evaluators. Milestone 6 records a trusted external reviewer's anchored proposal without applying it and provides a separate receipt-bound command for explicitly applying its authorized workspace operations. Milestone 7 records an explicit acceptance of the exact workspace/image input tested by a run, optionally binds it to reviewed application lineage, and launches later runs from that reference. None defines a workspace layout, repository registry, harness integration, authoritative evaluator, automatic apply process, daemon, scheduler, cloud control plane, or generalized execution-backend framework.
+Milestone 1 defines the immutable workspace input. Milestone 2 defines one isolated direct-Docker execution and portable persistent-root-filesystem result. Milestone 3 proves independent repetition and derives comparisons from those existing records. Milestone 4 manages retained Docker filesystem state and harness-level continuation. Milestone 5 records observations from arbitrary external evaluators. Milestone 6 records a trusted external reviewer's anchored proposal without applying it and provides a separate receipt-bound command for explicitly applying its authorized workspace operations. Milestone 7 records an explicit acceptance of the exact workspace/environment input tested by a run, optionally binds it to reviewed application lineage, and launches later runs from that reference. The first Milestone 8 slice adds named backend selection and remote E2B/Firecracker run, observation, and removal while preserving the portable contracts. None defines a workspace layout, repository registry, harness integration, authoritative evaluator, automatic apply process, daemon, scheduler, cloud control plane, or speculative provider-neutral lifecycle framework.
 
 The selected workspace is opaque user content. Names such as `AGENTS.md`, `MEMORY.md`, `repos/`, `skills/`, and `worktrees/` have no meaning to the snapshot protocol.
 
@@ -131,40 +131,48 @@ Snapshot artifacts may contain credentials or other sensitive content. Local-onl
 
 ## 7. Run contract
 
-`agentlab run` combines a workspace snapshot, immutable OCI image resolution, materialization settings, an opaque command, resource and network policy, change-ignore identity, and requested captures. `--workspace PATH` captures the directory at invocation; `--snapshot DIGEST` loads and verifies an existing immutable snapshot; `--accepted ACCEPTANCE_ID` loads the workspace, immutable image, and guest path from an explicit acceptance. These forms are mutually exclusive. The implementation MUST:
+`agentlab run` combines a workspace snapshot, immutable environment resolution, materialization settings, an opaque command, resource and network policy, change-ignore identity, requested captures, and one trusted host backend profile. `--workspace PATH` captures the directory at invocation; `--snapshot DIGEST` loads and verifies an existing immutable snapshot; `--accepted ACCEPTANCE_ID` loads the workspace, environment reference, and guest path from an explicit acceptance. These forms are mutually exclusive. `--backend NAME` selects a configured profile whose explicit driver chooses Docker or E2B; omitting it uses `default_backend` or built-in local Docker. A profile name, hostname, or SSH alias MUST NOT implicitly select a driver.
 
-The default network policy is Docker `bridge`, making ordinary model-backed harness invocations usable without another option. `--network none` explicitly selects an offline run. The resolved policy is a controlled input and MUST be recorded in the run specification.
+The default network policy is `bridge`: Docker bridge networking locally and E2B-managed egress remotely. `--network none` explicitly selects an offline run. The resolved policy is a controlled input and MUST be recorded in the run specification.
 
-1. Reconstruct the workspace from its snapshot in private storage at `/workspace` by default, never through a writable source mount.
-2. Establish and export a prepared base root filesystem after materialization and before command execution.
-3. start a minimal stable container supervisor and execute the command exactly once through Docker exec;
-4. preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events; stdout and stderr are each retained and displayed up to 64 MiB, producer-to-consumer queues are bounded, omitted bytes are drained and disclosed explicitly, and a 24-hour fail-safe deadline terminates the complete host-side exec process group;
-5. reject image-declared volumes and any container mount outside the exported root filesystem, except AgentLab's exact runtime-secret tmpfs;
-6. stop the container before authoritative result inspection, Docker diff, rootfs export, and requested captures so all persistent evidence describes one quiesced state and background guest processes cannot continue writing; restart only the inert supervisor afterward;
-7. retain the running supervisor container for direct inspection and later filesystem continuation; and
-8. state explicitly that pseudo-filesystems and live process memory are not portable persistent state.
+Every backend MUST:
 
-The version-three run specification contains a canonical run-input digest, optional accepted-input provenance, snapshot digest, requested image, resolved immutable image digest, Docker image evidence, target platform, guest workspace path, argv, working directory, resource limits, network policy, capture declarations, runtime secret-injection names, workspace- and change-ignore identities, backend evidence, and AgentLab version.
+1. Reconstruct the workspace from its verified snapshot in private storage at `/workspace` by default, never through a writable source mount.
+2. Establish an immutable prepared-base filesystem after materialization and before command-scoped credentials or execution.
+3. Execute the opaque argv exactly once in that isolated filesystem.
+4. Preserve stdout, stderr, the actual exit code including nonzero values, timestamps, and lifecycle events; each output stream is retained and displayed up to 64 MiB, omitted bytes are drained, and truncation or timeout is explicit.
+5. Reject writable external storage that would escape complete persistent-filesystem observation.
+6. Quiesce execution before authoritative result observation so background processes cannot keep mutating evidence.
+7. Produce canonical base/result rootfs identities, raw and portable deltas, required content, captures, provider-native evidence, and an integrity-bound result.
+8. State explicitly that pseudo-filesystems and live process memory are not portable persistent state.
 
-Every newly created retained run and fork reserves AgentLab's exact 1 MiB in-memory runtime-secret tmpfs so a later continuation can request credentials without reconstructing the container. When `--pi-auth` is selected for an initial run or command-bearing resume, AgentLab reads the invoking host's default `~/.pi/agent/auth.json`, requires a JSON object no larger than 1 MiB, and places the bytes in that tmpfs. It links the file to the configured container user's Pi auth location only while the selected opaque command runs and removes both paths before inspect, diff, capture, or root-filesystem export. The run specification or continuation records only the stable name `pi-auth`; host paths, credential bytes, and credential-derived hashes MUST NOT be recorded. A continuation does not implicitly receive the credential: it must select `resume --pi-auth`. Retained containers that predate the exact secure mount MUST be rejected for credentialed continuation rather than receive the credential in persistent storage.
+The Docker driver resolves the OCI image, rejects image volumes and external mounts except AgentLab's exact runtime-secret tmpfs, starts an inert supervisor, runs the command through Docker exec with a 24-hour fail-safe deadline, stops the container for export/diff/capture, and restarts only the supervisor. It retains the container for Docker lifecycle operations.
 
-Before copying any runtime secret, AgentLab MUST hold a per-run credential lock and durably record a lease bound to the exact run label, container name, and container ID. Ctrl-C or termination during the guest command MUST terminate execution, clear the tmpfs by stop/start, scrub AgentLab's reserved persistent symlink, remove the lease, and exit 130. A hard crash may prevent immediate cleanup, so the durable lease remains authoritative dirty state: the next lifecycle operation for that completed run MUST recover it before proceeding, and every new credential lease MUST scan for recoverable crashed initial runs while leaving locks held by live AgentLab processes alone. Recovery verifies ownership before stopping, restarting, or removing a container. An incomplete initial run is removed after recovery; an interrupted continuation returns the retained container to its prior running/stopped state and removes its incomplete continuation directory. This protects against persistence by AgentLab, not against the opaque command deliberately printing or copying credentials while authorized.
+The E2B driver maps the requested image name to a template tag and mandatory build UUID in trusted host configuration. It verifies the tag before and immediately after Firecracker sandbox creation, transfers the private workspace, uses filesystem-only checkpoints for immutable base/result boundaries, mounts both retained builds read-only for exact inventory/content extraction, and terminates the live microVM. The current service boundary gives the guest command 58 minutes and rejects Docker-specific `--memory` and `--cpus` options rather than translating them silently. E2B stop/resume/fork are outside this slice.
 
-`agentlab.run-input/v1` is SHA-256 over canonical compact JSON containing the actual resolved snapshot and immutable image identities; target platform; materialization and working paths; argv; resource/network policy; captures; secret-injection names when supported; workspace- and change-ignore digests; backend name/version; and the complete AgentLab build version. Development installers append an exact source build ID so runs from different development commits cannot be mistaken for repetitions. It excludes run ID, timestamps, requested image alias, accepted-input provenance, backend-native image/container evidence, outcome, and descriptive labels. Version-two and version-three specifications MUST store this digest and verification MUST recompute it.
+The version-three Docker and version-four E2B run specifications contain a canonical run-input digest, optional accepted-input provenance, snapshot digest, requested and resolved environment identities, target platform, guest workspace path, argv, working directory, resource policy, network policy, capture declarations, stable runtime-secret names, workspace- and change-ignore identities, backend profile/driver/native evidence as applicable, and AgentLab version.
 
-Version-one and version-two run specifications remain readable. The version-one legacy `factors` map is retained only during deserialization and is excluded from derived run-input identity, comparison, and reporting. Version-three writers MUST NOT emit it.
+When `--pi-auth` is selected, AgentLab reads the invoking host's default `~/.pi/agent/auth.json`, requires a JSON object within the combined 1 MiB secret limit, and exposes it only while the selected opaque command runs. Named `--secret-file` inputs share that limit. Records contain stable injection names; host paths, bytes, and credential-derived hashes MUST NOT be recorded. AgentLab removes its credential and control paths before result capture. This protects against persistence by AgentLab, not against the trusted opaque command deliberately printing or copying credentials while authorized.
 
-The Docker image and container identifiers are evidence, not AgentLab's portable run identity. A prepared Docker image ID may be nondeterministic without changing the meaning of the declared input.
+Docker reserves an exact runtime-secret tmpfs for every lifecycle-capable run and fork. Before copying a secret, it holds a per-run credential lock and durably records a lease bound to the exact run label, container name, and container ID. Ctrl-C terminates execution, clears the tmpfs by stop/start, scrubs the reserved persistent symlink, removes the lease, and exits 130. A hard-crash lease is recovered by the next lifecycle or credentialed operation after ownership verification. A continuation receives no credential unless it explicitly selects the corresponding option.
+
+E2B places secrets beneath `/run`, links Pi auth only at the configured command home, and removes both locations before the result checkpoint. Interruption terminates the active microVM and deletes incomplete snapshots; successful execution retains no live sandbox. The remote helper and staging are private to the SSH user, while E2B API credentials remain on the remote host.
+
+`agentlab.run-input/v1` (Docker) and `agentlab.run-input/v2` (E2B) are SHA-256 identities over canonical compact JSON containing the actual snapshot and resolved environment identities; target platform; materialization and working paths; argv; resource/network policy; captures; secret-injection names; workspace- and change-ignore digests; backend identity; and the complete AgentLab build version. E2B additionally binds the profile, driver, template/build/runtime-environment identity, and SDK version. Development installers append an exact source build ID so different development commits cannot be mistaken for repetitions. The identities exclude run ID, timestamps, requested aliases, accepted-input provenance, provider resource IDs, outcomes, and descriptive labels.
+
+Version-one and version-two run specifications remain readable. The version-one legacy `factors` map is retained only during deserialization and is excluded from derived run-input identity, comparison, and reporting. New writers MUST NOT emit it.
+
+Docker image/container identifiers and E2B template/sandbox/snapshot identifiers are provider evidence, not replacements for AgentLab's portable identities. A prepared Docker image ID may be nondeterministic without changing the declared input; an E2B template tag is accepted only while it resolves to the configured build UUID.
 
 ## 8. Persistent root-filesystem observation
 
-AgentLab exports both the prepared base and completed merged root filesystems. It normalizes each path to a sorted manifest containing its absolute UTF-8 path, type, relevant mode, regular-file digest and size, or symlink target. Supported normalized types are regular file, directory, and symlink; archive hard links resolve to the target regular-file identity. Unsupported persistent archive types fail explicitly.
+AgentLab observes both the prepared base and completed merged root filesystems. It normalizes each path to a sorted manifest containing its root-relative UTF-8 path, type, relevant mode, regular-file digest and size, or symlink target. Supported normalized types are regular file, directory, and symlink; Docker archive hard links resolve to the target regular-file identity. Unsupported persistent types fail explicitly.
 
 Comparison produces one of: `added`, `modified`, `deleted`, `type_changed`, `mode_changed`, or `symlink_changed`. A rename is portable as an authoritative delete plus add. Result regular-file bodies are inserted into the content-addressed store.
 
-Docker diff output is retained as path evidence and checked against the authoritative comparison. It does not replace the prepared/result exports: export provides merged content but not deletions, while Docker diff lacks complete portable content and metadata. Any normalized path not covered by Docker diff is recorded explicitly as evidence and a warning rather than silently discarded.
+Docker retains export and diff evidence. Diff paths are checked against the authoritative prepared/result export comparison but never replace it. E2B retains its template/build/sandbox/snapshot evidence plus exact no-follow inventories and required content extracted from read-only immutable build mounts. Both drivers produce the same canonical comparison semantics.
 
-Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds, named volumes, cache mounts, and image volumes are unsupported because their contents would fall outside the captured root filesystem. The sole supported run mount is AgentLab's exact private tmpfs for runtime secret injection; it is empty of the injected secret before persistent observation begins.
+Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds, named volumes, cache mounts, image volumes, and E2B external volume mounts are unsupported because their contents would fall outside the captured root filesystem. Backend-private runtime memory may hold credentials only between the base and result boundaries and MUST be empty of AgentLab-injected secrets before persistent result observation.
 
 ## 9. Delta contract
 
@@ -176,7 +184,7 @@ Runtime-only pseudo-filesystems are reported as nonportable. Writable host binds
 - normalized path changes; and
 - explicit ignored-change records.
 
-`delta.raw.json` records every normalized persistent change. `delta.json` applies `.agentlabignore` from the selected workspace root, or an explicit `--change-ignore` file, using Git-compatible patterns. Ignore rules affect only portable selection: ignored paths remain observed in the raw delta and present in the retained container. They are never represented as unobserved.
+`delta.raw.json` records every normalized persistent change. `delta.json` applies `.agentlabignore` from the selected workspace root, or an explicit `--change-ignore` file, using Git-compatible patterns. Ignore rules affect only portable selection: ignored paths remain observed in the raw delta and provider result state. They are never represented as unobserved.
 
 The delta identity is SHA-256 over compact JSON containing every semantic field except the digest itself. Arrays are deterministically path ordered by rootfs comparison.
 
@@ -279,29 +287,31 @@ declare arbitrary command-created copies safe.
 
 ## 10. Result contract and integrity
 
-`agentlab.result/v1` contains the run ID and run-spec digest, timing and lifecycle, exit code, stdout/stderr and requested capture artifacts, rootfs and delta identities, Docker evidence, observation status, warnings, and a path-to-digest integrity map. Its identity is SHA-256 over compact JSON containing those semantic fields except the result digest itself.
+`agentlab.result/v1` (Docker) and `agentlab.result/v2` (E2B) contain the run ID and run-spec digest, timing and lifecycle, exit code, stdout/stderr and requested capture artifacts, rootfs and delta identities, exactly one provider-evidence record, observation status, warnings, and a path-to-digest integrity map. Each identity is SHA-256 over compact JSON containing its semantic fields except the result digest itself.
 
-Run-local artifacts include the specification, normalized rootfs manifests, raw and portable deltas, complete base/result exports, stdout, stderr, requested/resolved image inspection, preparation/result container inspection and diff evidence, and requested capture archives. `agentlab inspect --verify RUN` recalculates every listed artifact digest and the result identity before reporting success. Default inspection reports metadata and paths without printing captured file content.
+Run-local artifacts include the specification, normalized rootfs manifests, raw and portable deltas, exact content needed to derive and apply workspace changes, stdout, stderr, provider environment/resource evidence, and requested capture archives. Docker retains complete base/result exports and inspect/diff records; E2B retains exact base/result inventories and content bundles. `agentlab inspect --verify RUN` recalculates every listed artifact digest and the result identity before reporting success. Default inspection reports metadata and paths without printing captured file content.
 
-Run artifacts and complete rootfs exports may contain credentials or other sensitive information. A retained container and local state directory are private operational artifacts, not safe publication units.
+Run artifacts and rootfs evidence may contain credentials or other sensitive information. Retained containers or snapshots and the local state directory are private operational artifacts, not safe publication units.
 
 ## 11. Comparable repetition
 
-Independent `agentlab run` invocations may execute concurrently against the same stored snapshot and image. Each MUST verify and reconstruct the snapshot independently and receive a distinct private Docker writable layer and retained container. Concurrent snapshot/content-store writes MUST preserve immutable content-addressed semantics. Reusing an explicit snapshot digest is the authoritative way to request byte-identical workspace input; independently reading a mutable host directory twice is not.
+Independent `agentlab run` invocations may execute concurrently against the same stored snapshot and environment. Each MUST verify and reconstruct the snapshot independently and receive a distinct provider resource: a private Docker writable layer/container or independent E2B sandbox and snapshots. Concurrent snapshot/content-store writes MUST preserve immutable content-addressed semantics. Reusing an explicit snapshot digest is the authoritative way to request byte-identical workspace input; independently reading a mutable host directory twice is not.
 
 `agentlab compare LEFT RIGHT` loads and integrity-verifies both results and specifications. It reports:
 
 - equality of complete run-input, workspace snapshot, and resolved image identities;
 - equality of the exported prepared-base rootfs identity;
-- distinct retained container IDs and names;
+- distinct retained provider resource IDs and names;
 - controlled-input differences across command, workspace materialization, resource/network settings, captures, ignore identities, backend evidence, and AgentLab version;
 - equality or difference of portable result-rootfs identities.
 
-A comparison is a `comparable_repetition` only when complete run-input, workspace, resolved image, and prepared-base identities are identical; retained containers are distinct; and no controlled input differs. It is `different_inputs` when actual controlled inputs differ, and `same_inputs_not_independent` when recorded inputs match but the independence/base conditions do not. Image request aliases are not treated as controlled differences when they resolve to the same immutable image; resolved identity is authoritative.
+A comparison is a `comparable_repetition` only when complete run-input, workspace, resolved environment, and prepared-base identities are identical; retained provider resources are distinct; and no controlled input differs. It is `different_inputs` when actual controlled inputs differ, and `same_inputs_not_independent` when recorded inputs match but the independence/base conditions do not. Requested aliases are not treated as controlled differences when they resolve to the same immutable environment; resolved identity is authoritative.
 
 Comparison is derived metadata rather than a new persisted experimental-cell object. Concurrent launch uses ordinary independent CLI processes in this milestone; AgentLab does not introduce a scheduler, daemon, treatment registry, preparation DSL, automatic statistical conclusion, or label registry.
 
 ## 12. Retained lifecycle
+
+The initial run, portable evidence, `list`, `inspect --verify`, downstream evaluation/review/apply/acceptance, and exact removal are backend-independent. Mutating continuation semantics are currently Docker-specific; E2B runs retain immutable base/result snapshots and terminate the live microVM, so `stop`, `resume`, and `fork` MUST reject them explicitly rather than simulate a live resource or process-memory restoration.
 
 Lifecycle-capable containers carry exact AgentLab run ownership and lifecycle-version labels. Every mutating operation MUST acquire the run's crash-safe advisory operation lock, load the local record, inspect Docker, match the complete expected container ID and run label, reject external mounts, and reject legacy containers without lifecycle semantics. A container name alone is never sufficient authorization, and concurrent stop, resume/continue, fork, or remove operations on one run MUST fail before mutating it.
 
@@ -323,11 +333,11 @@ Initial runs preserve the exact change-ignore rule bytes as an integrity-checked
 
 `agentlab fork RUN` quiesces the selected parent, commits exactly that state privately, restores the parent's prior running/stopped state, creates a stopped child from the commit, exports that child as the recorded portable base, and only then starts it. The child and its base manifest therefore derive from the same immutable image state. `agentlab.fork/v1` anchors to the parent record, identifies its exported portable base and Docker evidence, inherits materialization/resource/capture/change-ignore settings, and states `filesystem_state_copied: true` and `process_memory_copied: false`. Fork continuation deltas use that copied filesystem as their base.
 
-`agentlab rm RUN` removes only the exact ownership-verified container, that run's unique image tag, and that run's local artifact directory. It does not delete parents, children, other AgentLab runs, unrelated Docker resources, shared content-addressed blobs, or workspace snapshots. Local run-artifact deletion is irreversible; the explicit `rm` command is the authorization boundary.
+For Docker, `agentlab rm RUN` removes only the exact ownership-verified container, that run's unique image tag, and that run's local artifact directory. For E2B, it first verifies the complete result and the recorded profile/transport/isolation and snapshot-to-build bindings, then deletes exactly the run's base/result snapshot pair and local artifacts. It does not delete parents, children, other AgentLab runs, unrelated provider resources, shared content-addressed blobs, or workspace snapshots. Local run-artifact and provider-snapshot deletion is irreversible; the explicit `rm` command is the authorization boundary.
 
-`agentlab inspect --verify RUN` verifies the initial result or fork record plus every continuation and lifecycle event. `agentlab list` derives current Docker state and marks pre-lifecycle runs as legacy rather than attempting unsafe restart.
+`agentlab inspect --verify RUN` verifies the initial result or fork record plus every continuation and lifecycle event. `agentlab list` reports the recorded backend and retained resource; it derives current Docker state, marks pre-lifecycle Docker runs as legacy, and labels E2B snapshots immutable rather than implying a live sandbox.
 
-Lifecycle-capable OCI images currently MUST provide `/bin/sh`, `sleep`, and `/bin/true` for the preparation and stable-supervisor processes. Unsupported minimal images fail rather than falling back to semantics that might rerun the agent command.
+Docker lifecycle-capable OCI images currently MUST provide `/bin/sh`, `sleep`, and `/bin/true` for the preparation and stable-supervisor processes. Unsupported minimal images fail rather than falling back to semantics that might rerun the agent command.
 
 ## 13. External evaluation
 
@@ -396,28 +406,28 @@ Human-readable review currently reports every disposition, reason, recommendatio
 
 ## 16. Accepted-input lineage
 
-`agentlab accept RUN` explicitly accepts the exact starting input tested by one completed initial run. It MUST verify the run and all of its referenced immutable lifecycle, evaluation, review, apply, and prior-acceptance evidence before recording the decision. It accepts the starting workspace/image input, not the run's result filesystem. This is the bootstrap form for naming an already tested input and MAY point to a prior acceptance when RUN itself started from one.
+`agentlab accept RUN` explicitly accepts the exact starting input tested by one completed initial run. It MUST verify the run and all of its referenced immutable lifecycle, evaluation, review, apply, and prior-acceptance evidence before recording the decision. It accepts the starting workspace/environment input, not the run's result filesystem. This is the bootstrap form for naming an already tested input and MAY point to a prior acceptance when RUN itself started from one.
 
-`agentlab accept RETEST_RUN --from-apply APPLY_ID` adds reviewed application lineage. It MUST resolve and verify exactly one apply receipt; require RETEST_RUN to differ from the apply's candidate run; require the retest starting workspace snapshot to equal the apply receipt's exact after snapshot; and require the retest and candidate to share resolved OCI image digest, target platform, and guest workspace path. The initial workspace result remains the only apply target in `agentlab.acceptance/v1`; environment recommendations are not promoted into an image.
+`agentlab accept RETEST_RUN --from-apply APPLY_ID` adds reviewed application lineage. It MUST resolve and verify exactly one apply receipt; require RETEST_RUN to differ from the apply's candidate run; require the retest starting workspace snapshot to equal the apply receipt's exact after snapshot; and require the retest and candidate to share resolved environment digest, target platform, and guest workspace path. The initial workspace result remains the only apply target in `agentlab.acceptance/v1`; environment recommendations are not promoted into an image or template.
 
 The content-based `agentlab.accepted-input/v1` identity hashes:
 
 - workspace snapshot digest;
 - active workspace-ignore identity;
 - guest workspace path;
-- resolved OCI image digest; and
+- resolved environment digest; and
 - target platform.
 
 It excludes acceptance time, acceptance ID, test command, runtime settings, and test output. Those belong to the decision or test lineage rather than the reusable base content.
 
-`agentlab.acceptance/v1` records a unique acceptance ID and record digest; accepted-input digest; timestamp; `tested_input` or `reviewed_application` kind; `explicit` decision; exact workspace snapshot, ignore, and guest-path identities; requested, immutable execution-reference, resolved-digest, Docker-image-ID, and platform image evidence; test run/result/input identities and exit code; optional parent acceptance; optional candidate run/result/input, review, and apply identities; and warnings. Acceptance after a nonzero test exit is allowed because exit status is evidence rather than a universal judgment. The record MUST postdate its test and application evidence.
+`agentlab.acceptance/v1` records a unique acceptance ID and record digest; accepted-input digest; timestamp; `tested_input` or `reviewed_application` kind; `explicit` decision; exact workspace snapshot, ignore, and guest-path identities; requested/execution reference, resolved digest, compatibility image-ID field, and platform environment evidence; test run/result/input identities and exit code; optional parent acceptance; optional candidate run/result/input, review, and apply identities; and warnings. Acceptance after a nonzero test exit is allowed because exit status is evidence rather than a universal judgment. The record MUST postdate its test and application evidence.
 
-Acceptance records live independently beneath the private state root. A completed test run receives at most one acceptance decision. The Docker image execution reference SHOULD be a pullable repository digest; a local-only image ID is valid but MUST produce a portability warning. `agentlab inspect --verify ACCEPTANCE_ID` verifies the record and recursively referenced lineage.
+Acceptance records live independently beneath the private state root. A completed test run receives at most one acceptance decision. A Docker execution reference SHOULD be a pullable repository digest; a local-only image ID is valid but MUST produce a portability warning. An E2B execution reference is the requested mapping key plus its verified template/build/runtime identity in the protected test run. `agentlab inspect --verify ACCEPTANCE_ID` verifies the record and recursively referenced lineage.
 
-`agentlab run --accepted ACCEPTANCE_ID -- COMMAND` MUST verify the selected acceptance before execution, reconstruct its exact workspace snapshot, resolve its immutable OCI execution reference, and require equality of workspace, ignore, guest path, resolved image, and platform identities. The run specification records acceptance ID, record digest, and accepted-input digest as provenance. That reference is deliberately excluded from `agentlab.run-input/v1`: two runs with identical actual controlled inputs remain comparable even if one names the lineage and one supplies the same snapshot/image directly.
+`agentlab run --accepted ACCEPTANCE_ID -- COMMAND` MUST verify the selected acceptance before execution, reconstruct its exact workspace snapshot, reuse the protected test run's backend profile when no explicit backend is supplied, resolve the environment again, and require equality of workspace, ignore, guest path, resolved environment, and platform identities. The run specification records acceptance ID, record digest, and accepted-input digest as provenance. That reference is deliberately excluded from the run-input identity: two runs with identical actual controlled inputs remain comparable even if one names the lineage and one supplies the same snapshot/environment directly.
 
-New runs start from the accepted workspace snapshot and image, never the retest result filesystem. Retest logs, caches, and other session writes therefore do not enter the new base automatically. Candidate changes enter only through the explicit review/apply path. Ordinary run removal MUST refuse to delete a test or candidate run referenced by an acceptance so accepted lineage remains auditable.
+New runs start from the accepted workspace snapshot and resolved environment, never the retest result filesystem. Retest logs, caches, and other session writes therefore do not enter the new base automatically. Candidate changes enter only through the explicit review/apply path. Ordinary run removal MUST refuse to delete a test or candidate run referenced by an acceptance so accepted lineage remains auditable.
 
 ## 17. Current boundary
 
-The host workspace is mutable developer state, not an AgentLab-owned golden copy; an accepted baseline is a reference to tested or reviewed immutable input/result lineage. Workspace treatments are ordinary host changes captured as new snapshots. A treatment outside the workspace is currently prepared through the backend—for example, by committing a changed Docker container as a new image—and supplied by immutable image identity. Apply deliberately leaves environment recommendations unapplied, so the v1 reviewed-application acceptance requires the candidate and retest to use the same OCI image. Retention preserves the private filesystem and container configuration, not the prior process tree or live memory. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.
+The host workspace is mutable developer state, not an AgentLab-owned golden copy; an accepted baseline is a reference to tested or reviewed immutable input/result lineage. Workspace treatments are ordinary host changes captured as new snapshots. A treatment outside the workspace is prepared through the backend—for example, by committing a changed Docker container as a new image or compiling the OCI definition into a pinned E2B template—and supplied by immutable environment identity. Apply deliberately leaves environment recommendations unapplied, so reviewed-application acceptance requires the candidate and retest to use the same resolved environment. Retention preserves a private filesystem boundary, not the prior process tree or a claim of live-memory portability. No protocol field assigns meaning to a harness, model, reasoning level, skill, prompt convention, evaluator score, or workspace layout.

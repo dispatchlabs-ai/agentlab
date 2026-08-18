@@ -28,8 +28,17 @@ pub struct ManagedRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
     pub anchor_digest: String,
+    pub backend_driver: String,
+    pub backend_profile: String,
+    pub resource_kind: String,
+    pub resource_name: String,
+    pub resource_id: String,
+    pub resource_state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_state: String,
     pub lifecycle_capable: bool,
     pub continuation_count: usize,
@@ -123,8 +132,15 @@ pub struct ResumeSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemovalSummary {
     pub run_id: String,
+    pub backend_driver: String,
+    pub resource_kind: String,
+    pub resource_name: String,
+    pub resource_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub container_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_tag: String,
     pub run_directory_removed: bool,
 }
@@ -203,6 +219,7 @@ struct Subject {
     kind: String,
     parent_run_id: Option<String>,
     anchor_digest: String,
+    backend_profile: String,
     container_name: String,
     container_id: String,
     image_tag: String,
@@ -257,19 +274,18 @@ impl Drop for ForkCleanup {
 pub fn list(store: &Store) -> Result<Vec<ManagedRun>> {
     let mut runs = Vec::new();
     for run_id in store.list_run_ids()? {
-        if let Ok(subject) = load_subject(store, &run_id) {
-            runs.push(managed_run(store, &subject));
+        if let Ok(run) = managed_run_record(store, &run_id) {
+            runs.push(run);
         }
     }
     Ok(runs)
 }
 
 pub fn inspect(store: &Store, run_id: &str, verify: bool) -> Result<ManagedRun> {
-    let subject = load_subject(store, run_id)?;
     if verify {
         verify_all(store, run_id)?;
     }
-    Ok(managed_run(store, &subject))
+    managed_run_record(store, run_id)
 }
 
 pub fn stop(store: &Store, run_id: &str) -> Result<ManagedRun> {
@@ -511,6 +527,32 @@ pub fn remove(store: &Store, run_id: &str) -> Result<RemovalSummary> {
             acceptances.join(", ")
         );
     }
+    if store.run_file_exists(run_id, "result.json")? {
+        let result = run::load_result(store, run_id)?;
+        if let Some(e2b) = &result.e2b {
+            run::verify_result(store, &result)?;
+            crate::e2b::remove_retained_snapshots(store, e2b)?;
+            store.remove_run_directory(run_id)?;
+            return Ok(RemovalSummary {
+                run_id: run_id.to_owned(),
+                backend_driver: "e2b".to_owned(),
+                resource_kind: "snapshot pair".to_owned(),
+                resource_name: format!(
+                    "{} + {}",
+                    e2b.base_snapshot.snapshot_id, e2b.result_snapshot.snapshot_id
+                ),
+                resource_id: format!(
+                    "{} + {}",
+                    e2b.base_snapshot.build_id, e2b.result_snapshot.build_id
+                ),
+                container_name: String::new(),
+                container_id: String::new(),
+                image_tag: String::new(),
+                run_directory_removed: true,
+            });
+        }
+    }
+
     let subject = load_subject(store, run_id)?;
     assert_owned_container(&subject)?;
     run::docker_status(
@@ -521,6 +563,10 @@ pub fn remove(store: &Store, run_id: &str) -> Result<RemovalSummary> {
     store.remove_run_directory(run_id)?;
     Ok(RemovalSummary {
         run_id: run_id.to_owned(),
+        backend_driver: "docker".to_owned(),
+        resource_kind: "container".to_owned(),
+        resource_name: subject.container_name.clone(),
+        resource_id: subject.container_id.clone(),
         container_name: subject.container_name,
         container_id: subject.container_id,
         image_tag: subject.image_tag,
@@ -1028,6 +1074,9 @@ fn load_subject(store: &Store, run_id: &str) -> Result<Subject> {
     if store.run_file_exists(run_id, "result.json")? {
         let result: RunResult = run::load_result(store, run_id)?;
         let spec: RunSpec = run::load_spec(store, run_id)?;
+        let docker = result.docker.context(
+            "this run retained an E2B snapshot, not a Docker container; E2B lifecycle commands are not available in this build",
+        )?;
         let compact = run_id.replace('-', "");
         let base_manifest =
             serde_json::from_slice(&store.read_run_file(run_id, "base-rootfs.json")?)?;
@@ -1036,8 +1085,9 @@ fn load_subject(store: &Store, run_id: &str) -> Result<Subject> {
             kind: "run".to_owned(),
             parent_run_id: None,
             anchor_digest: result.digest,
-            container_name: result.docker.retained_container_name,
-            container_id: result.docker.retained_container_id,
+            backend_profile: spec.backend_profile.unwrap_or_else(|| "local".to_owned()),
+            container_name: docker.retained_container_name,
+            container_id: docker.retained_container_id,
             image_tag: format!("agentlab-prepared:{}", &compact[..12]),
             workspace_guest_path: spec.workspace_guest_path,
             network_policy: spec.network_policy,
@@ -1056,6 +1106,7 @@ fn load_subject(store: &Store, run_id: &str) -> Result<Subject> {
             kind: "fork".to_owned(),
             parent_run_id: Some(fork.parent_run_id),
             anchor_digest: fork.digest,
+            backend_profile: "local".to_owned(),
             container_name: fork.container_name,
             container_id: fork.container_id,
             image_tag: fork.image_tag,
@@ -1093,12 +1144,63 @@ fn managed_run(store: &Store, subject: &Subject) -> ManagedRun {
         kind: subject.kind.clone(),
         parent_run_id: subject.parent_run_id.clone(),
         anchor_digest: subject.anchor_digest.clone(),
+        backend_driver: "docker".to_owned(),
+        backend_profile: subject.backend_profile.clone(),
+        resource_kind: "container".to_owned(),
+        resource_name: subject.container_name.clone(),
+        resource_id: subject.container_id.clone(),
+        resource_state: container_state.clone(),
         container_name: subject.container_name.clone(),
         container_id: subject.container_id.clone(),
         container_state,
         lifecycle_capable,
         continuation_count,
     }
+}
+
+fn managed_run_record(store: &Store, run_id: &str) -> Result<ManagedRun> {
+    if store.run_file_exists(run_id, "result.json")? {
+        let result = run::load_result(store, run_id)?;
+        if let Some(e2b) = result.e2b {
+            let resource_state = match e2b.retained_snapshot_state.as_str() {
+                "immutable_snapshot" => "retained".to_owned(),
+                state => state.to_owned(),
+            };
+            return Ok(ManagedRun {
+                run_id: run_id.to_owned(),
+                kind: "run".to_owned(),
+                parent_run_id: None,
+                anchor_digest: result.digest,
+                backend_driver: "e2b".to_owned(),
+                backend_profile: e2b.profile,
+                resource_kind: "snapshot".to_owned(),
+                resource_name: e2b.result_snapshot.snapshot_id,
+                resource_id: e2b.result_snapshot.build_id,
+                resource_state,
+                container_name: String::new(),
+                container_id: String::new(),
+                container_state: String::new(),
+                lifecycle_capable: false,
+                continuation_count: continuation_count(store, run_id),
+            });
+        }
+    }
+    let subject = load_subject(store, run_id)?;
+    Ok(managed_run(store, &subject))
+}
+
+fn continuation_count(store: &Store, run_id: &str) -> usize {
+    store
+        .run_path(run_id, "continuations")
+        .ok()
+        .and_then(|path| fs::read_dir(path).ok())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().join("continuation.json").is_file())
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 struct InspectMetadata {

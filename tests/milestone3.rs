@@ -66,6 +66,7 @@ count=$(find /workspace -maxdepth 1 -name 'owner-*' | wc -l | tr -d ' ')
 test "$count" = 1
 "#;
     let base_options = RunOptions {
+        backend: None,
         workspace: WorkspaceSource::Snapshot(source_before.clone()),
         workspace_capture_mode: snapshot::CaptureMode::All,
         image: "alpine:3.21".to_owned(),

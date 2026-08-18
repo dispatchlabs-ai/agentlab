@@ -139,6 +139,7 @@ exit 23
     let mut observer = RecordingObserver::default();
     let summary = run::execute_with_observer(
         &RunOptions {
+            backend: None,
             workspace: WorkspaceSource::Directory(workspace.clone()),
             workspace_capture_mode: snapshot::CaptureMode::All,
             image: "ubuntu:24.04".to_owned(),
@@ -191,7 +192,14 @@ exit 23
     run::verify_result(&store, &result)?;
     let spec = run::load_spec(&store, &summary.run_id)?;
     ensure!(spec.secret_injections == ["aws-credentials", "pi-auth"]);
-    ensure!(result.docker.retained_container_state == "running");
+    ensure!(
+        result
+            .docker
+            .as_ref()
+            .context("Docker result omitted Docker evidence")?
+            .retained_container_state
+            == "running"
+    );
     ensure!(
         result
             .captures

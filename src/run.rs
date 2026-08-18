@@ -15,17 +15,20 @@ use uuid::Uuid;
 
 use crate::acceptance;
 use crate::build_version;
+use crate::config::{BackendDriver, SelectedBackend};
 use crate::lock::AdvisoryLock;
 use crate::rootfs::{self, ChangeKind, RootFsChange, RootFsManifest};
 use crate::snapshot;
 use crate::store::{Store, hex_digest};
 
 pub const RUN_SCHEMA_VERSION: &str = "agentlab.run/v3";
+pub const E2B_RUN_SCHEMA_VERSION: &str = "agentlab.run/v4";
 pub const LEGACY_RUN_SCHEMA_VERSION: &str = "agentlab.run/v1";
 pub const LEGACY_RUN_SCHEMA_VERSION_V2: &str = "agentlab.run/v2";
 pub const RUN_INPUT_SCHEMA_VERSION: &str = "agentlab.run-input/v1";
 pub const DELTA_SCHEMA_VERSION: &str = "agentlab.delta/v1";
 pub const RESULT_SCHEMA_VERSION: &str = "agentlab.result/v1";
+pub const E2B_RESULT_SCHEMA_VERSION: &str = "agentlab.result/v2";
 pub(crate) const PI_AUTH_SECRET_NAME: &str = "pi-auth";
 const PI_AUTH_SECRET_DIRECTORY: &str = "/run/agentlab-secrets";
 const PI_AUTH_SECRET_PATH: &str = "/run/agentlab-secrets/pi-auth.json";
@@ -38,6 +41,9 @@ const MAX_RUNTIME_SECRET_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
+    /// The selected execution profile. Library callers that leave this unset
+    /// retain the historical built-in local Docker behavior.
+    pub backend: Option<SelectedBackend>,
     pub workspace: WorkspaceSource,
     pub workspace_capture_mode: snapshot::CaptureMode,
     pub image: String,
@@ -104,7 +110,14 @@ pub struct RunSpec {
     pub workspace_snapshot_digest: String,
     pub image_requested: String,
     pub image_resolved_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub docker_image_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_native_environment: Option<String>,
     pub target_platform: String,
     pub workspace_guest_path: String,
     pub command: Vec<String>,
@@ -171,6 +184,36 @@ pub struct DockerEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct E2bSnapshotEvidence {
+    /// Provider-native snapshot reference accepted by `Sandbox.create`.
+    pub snapshot_id: String,
+    /// Immutable E2B build ID resolved from the snapshot tag at capture time.
+    pub build_id: String,
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct E2bEvidence {
+    pub profile: String,
+    pub transport: String,
+    pub ssh_alias: String,
+    pub sdk_version: String,
+    pub isolation: String,
+    pub template_requested: String,
+    pub template_resolved: String,
+    pub template_build_id: String,
+    pub sandbox_id: String,
+    pub base_snapshot: E2bSnapshotEvidence,
+    pub result_snapshot: E2bSnapshotEvidence,
+    pub retained_snapshot_state: String,
+    pub provider_metadata: Artifact,
+    pub base_inventory: Artifact,
+    pub result_inventory: Artifact,
+    pub base_content_bundle: Artifact,
+    pub result_content_bundle: Artifact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservationStatus {
     pub persistent_root_filesystem: String,
     pub ignored_portable_changes: String,
@@ -196,7 +239,10 @@ pub struct RunResult {
     pub result_filesystem_digest: String,
     pub raw_delta_digest: String,
     pub portable_delta_digest: String,
-    pub docker: DockerEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<DockerEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2b: Option<E2bEvidence>,
     pub observations: ObservationStatus,
     pub warnings: Vec<String>,
     pub integrity: BTreeMap<String, String>,
@@ -212,8 +258,20 @@ pub struct RunSummary {
     pub exit_code: i64,
     pub changes: usize,
     pub ignored_changes: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub retained_container_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub retained_container_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend_profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend_driver: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub retained_resource_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub retained_resource_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub retained_resource_id: String,
     pub source_workspace_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_input: Option<AcceptedInputReference>,
@@ -279,6 +337,29 @@ struct RunInputIdentity<'a> {
 }
 
 #[derive(Serialize)]
+struct E2bRunInputIdentity<'a> {
+    schema_version: &'static str,
+    workspace_snapshot_digest: &'a str,
+    image_resolved_digest: &'a str,
+    target_platform: &'a str,
+    workspace_guest_path: &'a str,
+    command: &'a [String],
+    working_directory: &'a str,
+    resource_limits: &'a ResourceLimits,
+    network_policy: &'a str,
+    captures: &'a [CaptureSpec],
+    secret_injections: &'a [String],
+    workspace_ignore_digest: &'a str,
+    change_ignore_digest: &'a str,
+    backend_profile: &'a str,
+    backend_driver: &'a str,
+    backend_native_environment: &'a str,
+    backend_name: &'a str,
+    backend_version: &'a str,
+    agentlab_version: &'a str,
+}
+
+#[derive(Serialize)]
 struct DeltaIdentity<'a> {
     schema_version: &'a str,
     base_filesystem_digest: &'a str,
@@ -305,6 +386,28 @@ struct ResultIdentity<'a> {
     raw_delta_digest: &'a str,
     portable_delta_digest: &'a str,
     docker: &'a DockerEvidence,
+    observations: &'a ObservationStatus,
+    warnings: &'a [String],
+    integrity: &'a BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct E2bResultIdentity<'a> {
+    schema_version: &'a str,
+    run_id: &'a str,
+    run_spec_digest: &'a str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    lifecycle: &'a [LifecycleEvent],
+    exit_code: i64,
+    stdout: &'a Artifact,
+    stderr: &'a Artifact,
+    captures: &'a [Artifact],
+    base_filesystem_digest: &'a str,
+    result_filesystem_digest: &'a str,
+    raw_delta_digest: &'a str,
+    portable_delta_digest: &'a str,
+    e2b: &'a E2bEvidence,
     observations: &'a ObservationStatus,
     warnings: &'a [String],
     integrity: &'a BTreeMap<String, String>,
@@ -363,6 +466,22 @@ pub fn execute_with_observer(
     options: &RunOptions,
     store: &Store,
     observer: &mut dyn RunObserver,
+) -> Result<RunSummary> {
+    let backend = options
+        .backend
+        .clone()
+        .unwrap_or_else(SelectedBackend::local);
+    match backend.driver() {
+        BackendDriver::Docker => execute_docker_with_observer(options, store, observer, &backend),
+        BackendDriver::E2b => crate::e2b::execute_with_observer(options, store, observer, &backend),
+    }
+}
+
+fn execute_docker_with_observer(
+    options: &RunOptions,
+    store: &Store,
+    observer: &mut dyn RunObserver,
+    backend: &SelectedBackend,
 ) -> Result<RunSummary> {
     validate_options(options)?;
     let started_at = Utc::now();
@@ -439,6 +558,9 @@ pub fn execute_with_observer(
         image_requested: options.image.clone(),
         image_resolved_digest: resolved_image.resolved_digest.clone(),
         docker_image_id: resolved_image.docker_image_id.clone(),
+        backend_profile: Some(backend.name.clone()),
+        backend_driver: Some("docker".to_owned()),
+        backend_native_environment: None,
         target_platform: resolved_image.platform.clone(),
         workspace_guest_path: options.workspace_guest_path.clone(),
         command: options.command.clone(),
@@ -1004,7 +1126,8 @@ pub fn execute_with_observer(
         result_filesystem_digest: result_manifest.digest,
         raw_delta_digest: raw_delta.digest,
         portable_delta_digest: portable_delta.digest,
-        docker,
+        docker: Some(docker),
+        e2b: None,
         observations,
         warnings,
         integrity,
@@ -1052,7 +1175,27 @@ pub fn execute_with_observer(
         changes: portable_delta.changes.len(),
         ignored_changes: portable_delta.ignored_changes.len(),
         retained_container_name: retained_name,
-        retained_container_id: result.docker.retained_container_id,
+        retained_container_id: result
+            .docker
+            .as_ref()
+            .context("Docker run result omitted Docker evidence")?
+            .retained_container_id
+            .clone(),
+        backend_profile: backend.name.clone(),
+        backend_driver: "docker".to_owned(),
+        retained_resource_kind: "container".to_owned(),
+        retained_resource_name: result
+            .docker
+            .as_ref()
+            .context("Docker run result omitted Docker evidence")?
+            .retained_container_name
+            .clone(),
+        retained_resource_id: result
+            .docker
+            .as_ref()
+            .context("Docker run result omitted Docker evidence")?
+            .retained_container_id
+            .clone(),
         source_workspace_status,
         accepted_input: spec.accepted_input,
     })
@@ -1068,7 +1211,10 @@ pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
         .context("decode run spec")?;
     if !matches!(
         spec.schema_version.as_str(),
-        RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION_V2 | LEGACY_RUN_SCHEMA_VERSION
+        E2B_RUN_SCHEMA_VERSION
+            | RUN_SCHEMA_VERSION
+            | LEGACY_RUN_SCHEMA_VERSION_V2
+            | LEGACY_RUN_SCHEMA_VERSION
     ) {
         bail!(
             "unsupported run specification schema {:?}",
@@ -1078,7 +1224,7 @@ pub fn load_spec(store: &Store, run_id: &str) -> Result<RunSpec> {
     let computed = compute_run_input_digest(&spec)?;
     if matches!(
         spec.schema_version.as_str(),
-        RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION_V2
+        E2B_RUN_SCHEMA_VERSION | RUN_SCHEMA_VERSION | LEGACY_RUN_SCHEMA_VERSION_V2
     ) && spec.run_input_digest != computed
     {
         bail!(
@@ -1151,7 +1297,10 @@ pub fn verify_result(store: &Store, result: &RunResult) -> Result<()> {
 }
 
 pub(crate) fn verify_result_identity(store: &Store, result: &RunResult) -> Result<()> {
-    if result.schema_version != RESULT_SCHEMA_VERSION {
+    if !matches!(
+        result.schema_version.as_str(),
+        RESULT_SCHEMA_VERSION | E2B_RESULT_SCHEMA_VERSION
+    ) {
         bail!("unsupported run result schema {:?}", result.schema_version);
     }
     let spec = load_spec(store, &result.run_id)?;
@@ -1165,27 +1314,7 @@ pub(crate) fn verify_result_identity(store: &Store, result: &RunResult) -> Resul
             result.run_spec_digest
         );
     }
-    let identity = ResultIdentity {
-        schema_version: RESULT_SCHEMA_VERSION,
-        run_id: &result.run_id,
-        run_spec_digest: &result.run_spec_digest,
-        started_at: result.started_at,
-        completed_at: result.completed_at,
-        lifecycle: &result.lifecycle,
-        exit_code: result.exit_code,
-        stdout: &result.stdout,
-        stderr: &result.stderr,
-        captures: &result.captures,
-        base_filesystem_digest: &result.base_filesystem_digest,
-        result_filesystem_digest: &result.result_filesystem_digest,
-        raw_delta_digest: &result.raw_delta_digest,
-        portable_delta_digest: &result.portable_delta_digest,
-        docker: &result.docker,
-        observations: &result.observations,
-        warnings: &result.warnings,
-        integrity: &result.integrity,
-    };
-    let actual = sha256_bytes(&serde_json::to_vec(&identity)?);
+    let actual = compute_result_identity_digest(result)?;
     if actual != result.digest {
         bail!(
             "run result integrity mismatch: expected {}, got {actual}",
@@ -1193,6 +1322,68 @@ pub(crate) fn verify_result_identity(store: &Store, result: &RunResult) -> Resul
         );
     }
     Ok(())
+}
+
+pub(crate) fn compute_result_identity_digest(result: &RunResult) -> Result<String> {
+    if result.schema_version == RESULT_SCHEMA_VERSION {
+        let docker = result
+            .docker
+            .as_ref()
+            .context("Docker result omitted Docker evidence")?;
+        if result.e2b.is_some() {
+            bail!("Docker result unexpectedly contains E2B evidence");
+        }
+        let identity = ResultIdentity {
+            schema_version: RESULT_SCHEMA_VERSION,
+            run_id: &result.run_id,
+            run_spec_digest: &result.run_spec_digest,
+            started_at: result.started_at,
+            completed_at: result.completed_at,
+            lifecycle: &result.lifecycle,
+            exit_code: result.exit_code,
+            stdout: &result.stdout,
+            stderr: &result.stderr,
+            captures: &result.captures,
+            base_filesystem_digest: &result.base_filesystem_digest,
+            result_filesystem_digest: &result.result_filesystem_digest,
+            raw_delta_digest: &result.raw_delta_digest,
+            portable_delta_digest: &result.portable_delta_digest,
+            docker,
+            observations: &result.observations,
+            warnings: &result.warnings,
+            integrity: &result.integrity,
+        };
+        Ok(sha256_bytes(&serde_json::to_vec(&identity)?))
+    } else {
+        let e2b = result
+            .e2b
+            .as_ref()
+            .context("E2B result omitted E2B evidence")?;
+        if result.docker.is_some() {
+            bail!("E2B result unexpectedly contains Docker evidence");
+        }
+        let identity = E2bResultIdentity {
+            schema_version: E2B_RESULT_SCHEMA_VERSION,
+            run_id: &result.run_id,
+            run_spec_digest: &result.run_spec_digest,
+            started_at: result.started_at,
+            completed_at: result.completed_at,
+            lifecycle: &result.lifecycle,
+            exit_code: result.exit_code,
+            stdout: &result.stdout,
+            stderr: &result.stderr,
+            captures: &result.captures,
+            base_filesystem_digest: &result.base_filesystem_digest,
+            result_filesystem_digest: &result.result_filesystem_digest,
+            raw_delta_digest: &result.raw_delta_digest,
+            portable_delta_digest: &result.portable_delta_digest,
+            e2b,
+            observations: &result.observations,
+            warnings: &result.warnings,
+            integrity: &result.integrity,
+        };
+        Ok(sha256_bytes(&serde_json::to_vec(&identity)?))
+    }
 }
 
 pub(crate) fn verify_delta(delta: &DeltaManifest) -> Result<()> {
@@ -1308,6 +1499,24 @@ pub fn compare_runs(store: &Store, left_run_id: &str, right_run_id: &str) -> Res
     );
     compare_field(
         &mut controlled,
+        "backend_profile",
+        &left.backend_profile,
+        &right.backend_profile,
+    );
+    compare_field(
+        &mut controlled,
+        "backend_driver",
+        &left.backend_driver,
+        &right.backend_driver,
+    );
+    compare_field(
+        &mut controlled,
+        "backend_native_environment",
+        &left.backend_native_environment,
+        &right.backend_native_environment,
+    );
+    compare_field(
+        &mut controlled,
         "agentlab_version",
         &left.agentlab_version,
         &right.agentlab_version,
@@ -1320,10 +1529,9 @@ pub fn compare_runs(store: &Store, left_run_id: &str, right_run_id: &str) -> Res
     let same_resolved_image = left.image_resolved_digest == right.image_resolved_digest;
     let same_portable_base =
         left_result.base_filesystem_digest == right_result.base_filesystem_digest;
-    let distinct_private_containers = left_result.docker.retained_container_id
-        != right_result.docker.retained_container_id
-        && left_result.docker.retained_container_name
-            != right_result.docker.retained_container_name;
+    let left_resource = result_resource_identity(&left_result)?;
+    let right_resource = result_resource_identity(&right_result)?;
+    let distinct_private_containers = left_resource != right_resource;
     let comparable_repetition = same_run_input
         && controlled.is_empty()
         && same_workspace_snapshot
@@ -1356,6 +1564,39 @@ pub fn compare_runs(store: &Store, left_run_id: &str, right_run_id: &str) -> Res
 }
 
 pub fn compute_run_input_digest(spec: &RunSpec) -> Result<String> {
+    if spec.schema_version == E2B_RUN_SCHEMA_VERSION {
+        let identity = E2bRunInputIdentity {
+            schema_version: "agentlab.run-input/v2",
+            workspace_snapshot_digest: &spec.workspace_snapshot_digest,
+            image_resolved_digest: &spec.image_resolved_digest,
+            target_platform: &spec.target_platform,
+            workspace_guest_path: &spec.workspace_guest_path,
+            command: &spec.command,
+            working_directory: &spec.working_directory,
+            resource_limits: &spec.resource_limits,
+            network_policy: &spec.network_policy,
+            captures: &spec.captures,
+            secret_injections: &spec.secret_injections,
+            workspace_ignore_digest: &spec.workspace_ignore_digest,
+            change_ignore_digest: &spec.change_ignore.digest,
+            backend_profile: spec
+                .backend_profile
+                .as_deref()
+                .context("E2B run specification omitted backend profile")?,
+            backend_driver: spec
+                .backend_driver
+                .as_deref()
+                .context("E2B run specification omitted backend driver")?,
+            backend_native_environment: spec
+                .backend_native_environment
+                .as_deref()
+                .context("E2B run specification omitted native environment identity")?,
+            backend_name: &spec.backend_name,
+            backend_version: &spec.backend_version,
+            agentlab_version: &spec.agentlab_version,
+        };
+        return Ok(sha256_bytes(&serde_json::to_vec(&identity)?));
+    }
     let identity = RunInputIdentity {
         schema_version: RUN_INPUT_SCHEMA_VERSION,
         workspace_snapshot_digest: &spec.workspace_snapshot_digest,
@@ -1377,13 +1618,27 @@ pub fn compute_run_input_digest(spec: &RunSpec) -> Result<String> {
     Ok(sha256_bytes(&serde_json::to_vec(&identity)?))
 }
 
+fn result_resource_identity(result: &RunResult) -> Result<(&str, &str)> {
+    match (&result.docker, &result.e2b) {
+        (Some(docker), None) => Ok((
+            docker.retained_container_name.as_str(),
+            docker.retained_container_id.as_str(),
+        )),
+        (None, Some(e2b)) => Ok((
+            e2b.result_snapshot.snapshot_id.as_str(),
+            e2b.result_snapshot.build_id.as_str(),
+        )),
+        _ => bail!("run result must contain exactly one backend evidence record"),
+    }
+}
+
 fn compare_field<T: PartialEq>(differences: &mut Vec<String>, name: &str, left: &T, right: &T) {
     if left != right {
         differences.push(name.to_owned());
     }
 }
 
-fn validate_options(options: &RunOptions) -> Result<()> {
+pub(crate) fn validate_options(options: &RunOptions) -> Result<()> {
     if options.image.trim().is_empty() {
         bail!("run requires --image IMAGE");
     }
@@ -1422,6 +1677,33 @@ fn validate_options(options: &RunOptions) -> Result<()> {
 
 pub fn immutable_image_reference(store: &Store, run_id: &str) -> Result<String> {
     let spec = load_spec(store, run_id)?;
+    if spec.schema_version == E2B_RUN_SCHEMA_VERSION {
+        let result = load_result(store, run_id)?;
+        verify_result(store, &result)?;
+        let e2b = result
+            .e2b
+            .as_ref()
+            .context("E2B run result omitted E2B evidence")?;
+        let native_environment = spec
+            .backend_native_environment
+            .as_deref()
+            .context("E2B run specification omitted its native environment identity")?;
+        let (template, build_and_runtime) = native_environment
+            .rsplit_once("@build:")
+            .context("E2B native environment identity omitted its template build")?;
+        let (build, runtime_environment) = build_and_runtime
+            .split_once("+runtime-env:")
+            .context("E2B native environment identity omitted its runtime environment")?;
+        if e2b.template_requested != spec.image_requested
+            || e2b.template_resolved != template
+            || e2b.template_build_id != build
+            || !runtime_environment.starts_with("sha256:")
+            || sha256_bytes(native_environment.as_bytes()) != spec.image_resolved_digest
+        {
+            bail!("E2B environment evidence does not agree with the run specification");
+        }
+        return Ok(spec.image_requested);
+    }
     let inspect = store.read_run_file(run_id, "evidence/image-inspect.json")?;
     let value: Value = serde_json::from_slice(&inspect).context("decode Docker image evidence")?;
     let image = value
@@ -1620,7 +1902,7 @@ fn validate_pi_auth(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn secret_injection_names(options: &RunOptions) -> Vec<String> {
+pub(crate) fn secret_injection_names(options: &RunOptions) -> Vec<String> {
     let mut names: Vec<_> = options
         .secret_files
         .iter()
@@ -2184,7 +2466,7 @@ pub(crate) fn container_status(inspect: &[u8]) -> Result<(i64, String)> {
     ))
 }
 
-fn resolve_change_ignore(
+pub(crate) fn resolve_change_ignore(
     options: &RunOptions,
     workspace: &snapshot::Manifest,
     store: &Store,
@@ -2475,7 +2757,7 @@ fn uncovered_by_docker_diff(changes: &[RootFsChange], docker_diff: &[u8]) -> Vec
         .collect()
 }
 
-fn sensitive_path_warnings(changes: &[RootFsChange]) -> Vec<String> {
+pub(crate) fn sensitive_path_warnings(changes: &[RootFsChange]) -> Vec<String> {
     let markers = ["auth.json", "credentials", "id_rsa", ".ssh/", ".aws/"];
     changes
         .iter()
@@ -2489,7 +2771,7 @@ fn sensitive_path_warnings(changes: &[RootFsChange]) -> Vec<String> {
         .collect()
 }
 
-fn report_stage(observer: &mut dyn RunObserver, message: &str) -> Result<()> {
+pub(crate) fn report_stage(observer: &mut dyn RunObserver, message: &str) -> Result<()> {
     observer.stage(message).context("write run progress output")
 }
 
@@ -2665,14 +2947,19 @@ fn read_guest_stream(mut stream: impl Read, stdout: bool, sender: SyncSender<Gue
     }
 }
 
-fn event(name: &str) -> LifecycleEvent {
+pub(crate) fn event(name: &str) -> LifecycleEvent {
     LifecycleEvent {
         event: name.to_string(),
         timestamp: Utc::now(),
     }
 }
 
-fn write_artifact(store: &Store, run_id: &str, relative: &str, bytes: &[u8]) -> Result<Artifact> {
+pub(crate) fn write_artifact(
+    store: &Store,
+    run_id: &str,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<Artifact> {
     store.write_run_file(run_id, relative, bytes)?;
     Ok(Artifact {
         path: relative.to_string(),
@@ -2817,6 +3104,7 @@ mod tests {
 
     fn options(workspace: PathBuf, captures: Vec<CaptureSpec>) -> RunOptions {
         RunOptions {
+            backend: None,
             workspace: WorkspaceSource::Directory(workspace),
             workspace_capture_mode: snapshot::CaptureMode::All,
             image: "unused:latest".to_owned(),

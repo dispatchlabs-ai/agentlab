@@ -201,17 +201,17 @@ cargo test --test milestone6 -- --ignored --nocapture
 
 The Docker-gated fixture executes the public accepted-input → independent candidates → review → apply → retest → acceptance → improved-run journey. It proves:
 
-1. One completed seed run can explicitly accept its exact starting workspace/image input without promoting the seed result filesystem.
-2. The accepted-input digest is derived from workspace snapshot, ignore identity, guest path, resolved OCI image, and platform, while the decision receives a separate acceptance ID and record digest.
+1. One completed seed run can explicitly accept its exact starting workspace/environment input without promoting the seed result filesystem.
+2. The accepted-input digest is derived from workspace snapshot, ignore identity, guest path, resolved environment, and platform, while the decision receives a separate acceptance ID and record digest.
 3. Two public `run --accepted` invocations reconstruct the same actual input in distinct retained containers and qualify as a comparable repetition.
 4. Both candidate specifications preserve the exact initial acceptance reference without adding labels to canonical run-input identity.
 5. Candidate A creates one proposed improvement, rejected and conflicting workspace changes, ignored session debris, and an environment recommendation; review accounts for the complete raw delta.
 6. Apply changes only the proposed file in the independently advanced host workspace. The rejected file remains at base content, the conflict remains current content, current-only work survives, and session/environment candidates remain absent.
 7. Candidate B is rejected as a retest for the application because it began from the old accepted workspace rather than the apply after snapshot.
-8. A distinct run tests the exact apply after snapshot with the candidate's immutable OCI image, platform, and guest path.
+8. A distinct run tests the exact apply after snapshot with the candidate's immutable environment, platform, guest path, and recorded backend profile.
 9. `accept RETEST --from-apply APPLY` creates `agentlab.acceptance/v1` with parent acceptance, candidate run/result/input, review, apply, retest run/result/input, exit status, and new accepted-input identity.
 10. The improved accepted workspace materializes with the authorized improvement, base/current versions of unapplied files, and no ignored session debris.
-11. Run C starts through `run --accepted` from the improved snapshot/image, verifies the expected content, and stores the new acceptance reference in `agentlab.run/v3`.
+11. Run C starts through `run --accepted` from the improved snapshot/environment, ignores a deliberately different ambient backend default, reuses the protected test run's local Docker profile, verifies the expected content, and stores the new acceptance reference in `agentlab.run/v3`.
 12. `inspect --verify ACCEPTANCE` recursively checks complete lineage, while ordinary `rm` refuses to delete the referenced candidate evidence.
 
 Run the case explicitly:
@@ -220,4 +220,23 @@ Run the case explicitly:
 cargo test --test milestone7 -- --ignored --nocapture
 ```
 
-Later suites cover backend capability equivalence and the public fresh-host quickstart. Their authoritative outcomes and hands-on checkpoints remain in `agentlab-plan.md` until implemented.
+## Milestone 8: remote E2B/Firecracker run slice
+
+Unit, CLI, local-Docker regression, and private Dell hands-on coverage prove:
+
+1. Omitting `--backend` continues to use local Docker unless trusted host configuration explicitly selects another default.
+2. `--backend NAME` resolves one declared profile; its explicit `driver` chooses E2B, and profile names, SSH aliases, and hostnames do not infer behavior.
+3. E2B configuration rejects unsafe SSH/path/template values, missing template mappings, unpinned template tags, non-UUID build pins, unsupported isolation, and invalid or oversized runtime metadata; the exact non-secret runtime map is bound into environment identity.
+4. An E2B run consumes the same verified AgentLab workspace snapshot and opaque argv as Docker, transfers all selected paths privately, and never mounts or mutates the source workspace.
+5. AgentLab resolves the configured template tag to its pinned build UUID before launch and confirms the tag did not change during sandbox creation before uploading workspace or credentials.
+6. The backend creates the sandbox through the remote E2B SDK, records asserted Firecracker isolation and provider evidence, and does not require E2B API credentials or a network tunnel on the invoking Mac.
+7. Filesystem-only boundaries produce distinct immutable base and result snapshots; both builds are mounted read-only and scanned with root-relative no-follow traversal into canonical complete rootfs manifests.
+8. Pi and named secrets live beneath runtime memory only for the guest command, record only stable names, and are absent from both retained manifests. Interruption kills the active sandbox and removes incomplete snapshots/staging.
+9. Guest output is streamed and retained within bounded limits, nonzero exit status remains evidence, the one-hour service boundary becomes an explicit 58-minute guest timeout, and unsupported Docker resource limits fail rather than being silently reinterpreted.
+10. `list`, `inspect --verify`, `diff`, comparison, evaluation, review, apply, and acceptance consume the portable E2B result normally. E2B run summaries advertise no unsupported stop/resume/fork command.
+11. `rm` verifies the result, recorded E2B connection/isolation, and both snapshot-to-build bindings before deleting exactly the snapshot pair and local run artifacts.
+12. A full ignored Milestone 7 Docker test still passes while trusted configuration sets an E2B ambient default, proving accepted local inputs replay through their recorded backend rather than ambient state.
+13. The curated Daily Log hands-on run transferred 1,019 paths and 76,707,637 logical bytes with zero exclusions, ran Pi 0.86.9 successfully in an x86-64 Firecracker microVM, reported the source unchanged, retained verified base/result evidence, and finalized in 49.8 seconds.
+14. A disposable post-hardening Firecracker smoke run completed in 24.0 seconds, passed `inspect --verify`, removed both snapshots through the public CLI, and left no active Firecracker process, staging file, or rootfs mount.
+
+The remaining Milestone 8 conformance work is a public Dockerfile-to-E2B-template installation command and one shared disposable fixture run through both backends. E2B filesystem continuation/fork remains optional and MUST stay explicitly unsupported unless implemented and tested. Milestone 9 covers the public fresh-host quickstart.

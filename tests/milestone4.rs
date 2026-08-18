@@ -81,6 +81,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
 
     let summary = run::execute(
         &RunOptions {
+            backend: None,
             workspace: WorkspaceSource::Directory(workspace.clone()),
             workspace_capture_mode: snapshot::CaptureMode::All,
             image: "alpine:3.21".to_owned(),
@@ -116,7 +117,14 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
 
     ensure!(summary.exit_code == 19);
     let result = run::load_result(&store, &summary.run_id)?;
-    ensure!(result.docker.retained_container_state == "running");
+    ensure!(
+        result
+            .docker
+            .as_ref()
+            .context("Docker result omitted Docker evidence")?
+            .retained_container_state
+            == "running"
+    );
     let background_after_capture = docker_success(
         Command::new("docker").args([
             "exec",

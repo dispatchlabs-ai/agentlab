@@ -413,7 +413,7 @@ fn accepted_run_errors_explain_which_input_it_already_supplies() {
                 "--",
                 "/bin/true",
             ],
-            "supplies the OCI image",
+            "supplies the environment",
         ),
         (
             vec![

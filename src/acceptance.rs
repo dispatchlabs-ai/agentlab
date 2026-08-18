@@ -443,7 +443,7 @@ fn verify_applied_test_input(
     if candidate.image_resolved_digest != test.image_resolved_digest
         || candidate.target_platform != test.target_platform
     {
-        bail!("test run did not use the candidate run's exact OCI image and platform");
+        bail!("test run did not use the candidate run's exact resolved environment and platform");
     }
     if candidate.workspace_guest_path != test.workspace_guest_path {
         bail!("test run changed the accepted workspace materialization path");

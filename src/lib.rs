@@ -4,6 +4,7 @@ pub mod apply;
 mod cancel;
 pub mod config;
 pub mod diff;
+mod e2b;
 pub mod evaluation;
 pub mod lifecycle;
 mod lock;
