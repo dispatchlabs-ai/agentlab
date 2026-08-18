@@ -31,7 +31,9 @@ The plan is goal-oriented. Implementation choices are subordinate to the observa
 - Milestone 6 is complete: any trusted command-line reviewer receives anchored base/candidate/current copies plus the complete machine delta, AgentLab validates and records its proposal without applying it, and a separate receipt-bound command applies only authorized workspace paths after stale-current checks, explicit conflict/unresolved acknowledgements, private staging, recoverable backup capture, and exact after-snapshot verification.
 - Runtime credentials now have one provider-neutral file primitive: repeatable `--secret-file NAME=HOST_PATH` inputs exist only in private runtime memory for the selected run or continuation command, are removed before capture/export, and record only stable names. `--pi-auth` remains the ergonomic Pi-specific adapter over the same boundary.
 - Human diff presentation now separates deterministic evidence from filtering and AI curation: AgentLab retains a content-addressed per-file bundle with unified text patches or explicit binary/metadata records, then derives a separately addressed presentation selection from explicit global Git-compatible ignore patterns and implied added-directory collapse. An optional trusted host harness selected only from `~/.agentlab/config.toml` may present the important parts. Deterministic, inventory, raw, single-file, and JSON views remain available; `--raw` and `--file` bypass presentation rules, and failed agent presentation falls back without hiding or changing the underlying evidence.
-- The adversarial hardening pass is complete for realistic P1–P3 findings: content-store objects and snapshot source descriptors are no-follow and byte-verified; diff bundles and selections are re-derived from authenticated run evidence with v1 receipt compatibility; apply uses pinned descriptor-relative mutation; Git directory rules and safe collapse semantics are explicit; terminal presentation neutralizes control text while retaining raw evidence; and presenter, reviewer, evaluator, guest-output, patch, request, and metadata captures have bounded resource behavior with process-group cleanup and timeouts where host commands are invoked.
+- The initial adversarial hardening pass closed its realistic P1–P3 findings: content-store objects and snapshot source descriptors are no-follow and byte-verified; diff bundles and selections are re-derived from authenticated run evidence with v1 receipt compatibility; Git directory rules and safe collapse semantics are explicit; terminal presentation neutralizes control text while retaining raw evidence; and host-side presenter, reviewer, and evaluator invocations have bounded resource behavior with process-group cleanup and timeouts.
+- A second independent adversarial review's five P1 findings are closed without changing the normal CLI workflow: snapshot traversal is descriptor-relative from one pinned root; initial and continuation output use one bounded, cancellable executor; authoritative results and forks derive from quiesced container states under per-run lifecycle locks; durable credential leases recover after Ctrl-C or a hard crash; and apply is one workspace-locked, descriptor-bound transaction whose rollback reuses the same root and parent generations.
+- The second review's P2 and P3 findings are intentionally not included in this P1-only repair. They remain separate follow-up work rather than being silently broadened into this change.
 
 ## North-star goal
 
@@ -533,6 +535,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Special files are either supported explicitly or cause a precise failure; they are never silently lost.
 - A permission-only mutation that occurs while a regular file is captured causes a precise consistency failure.
 - A manifest can reconstruct the snapshot byte-for-byte with relevant modes and symlinks.
+- On Unix, traversal starts from one pinned root descriptor, opens each child directory and file relative to its pinned parent without following symlinks, and fails if directory or root identity changes before capture completes.
 - Manifest verification independently proves that `ignore_rules_digest` matches the recorded ignore rules.
 - `agentlab snapshot --workspace PATH` exposes snapshotting through the public CLI and reports the snapshot digest plus a concise inclusion/exclusion summary.
 - `agentlab inspect SNAPSHOT` shows the manifest's paths, hashes, sizes, modes, symlink targets, discovered repositories, and active ignore-rule identity without printing file contents by default.
@@ -562,6 +565,8 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - `.agentlabignore` can omit selected exported changes using Git-compatible patterns.
 - Ignored changes remain inside the retained container.
 - stdout, stderr, nonzero exit status, lifecycle, Docker identifiers and inspection evidence, and integrity hashes are recorded.
+- Guest stdout/stderr use bounded producer queues and retained budgets, and initial/continued commands share a 24-hour fail-safe deadline with process-group termination.
+- The container is stopped before result rootfs, Docker diff, and requested captures are collected, so background processes cannot make those artifacts describe different moments; only the inert supervisor is restarted afterward.
 - The run can be inspected without printing changed file contents.
 - Agent-writable persistent mounts outside the exported rootfs are rejected.
 
@@ -598,11 +603,12 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 **Outcomes:**
 
 - Runs can be listed, inspected, stopped, restarted, resumed at the harness level, and deleted.
+- Mutating lifecycle operations for one run are serialized by a crash-safe advisory lock.
 - Docker container identity and exact persistent filesystem state survive stop/start.
 - Requested capture paths can export harness state outside `/workspace`.
 - Backend-native state is clearly distinguished from the portable filesystem delta.
-- A filesystem-level fork may commit/export the retained container and launch another container from that state.
-- Initial and continued Pi commands can receive the host's current default credential through command-scoped runtime memory without persisting its path or bytes.
+- A filesystem-level fork quiesces and commits the parent once, then exports the stopped child made from that commit as the exact recorded fork base before starting it.
+- Initial and continued Pi commands can receive the host's current default credential through command-scoped runtime memory without persisting its path or bytes. Durable leases, signal-aware cleanup, ownership-verified stop/start recovery, and active-lease locks prevent an interrupt or hard crash from silently extending that lifetime.
 - Live-process and memory resume are explicitly unsupported rather than simulated.
 - Cleanup is explicit and recoverable where practical.
 
@@ -666,7 +672,7 @@ Each milestone must end with a documented, user-visible hands-on checkpoint that
 - Nonrepository changes use base/candidate/current comparison.
 - Environment changes are evaluated across the entire machine delta, but the initial explicit apply implementation is limited to safely expressible workspace changes. Valuable non-workspace changes become explicit recommendations or proposed declarative image-source edits; they are never copied blindly from `/usr`, `/etc`, `/var`, caches, or credentials.
 - `agentlab apply REVIEW_ID --workspace CURRENT` is a separate explicit authorization. It resnapshots current, rejects stale proposals, blocks conflicts or unresolved entries by default, applies only receipt-authorized paths, preserves a recoverable patch/backup artifact, and verifies the resulting snapshot.
-- Apply privately stages the intended workspace, serializes concurrent attempts, refuses recursive removal of unreviewed directory content, rolls back authorized paths after a failed write or verification mismatch, records one immutable `agentlab.apply/v1` receipt per review, and rejects repeated application.
+- Apply privately stages the intended workspace, acquires a lock keyed to the workspace generation before the first current-state snapshot, pins authorized parent generations before mutation, and writes a durable workspace transaction marker naming the recovery evidence. It refuses recursive removal of unreviewed directory content, uses the same pinned root and parents for final verification or rollback, clears the marker only after verified success or rollback, records one immutable `agentlab.apply/v1` receipt per review, and rejects repeated application.
 - Review and apply emit immutable records with reconciled proposed/rejected/conflicted/unresolved/applied counts and exact before/after identities.
 - Human review must ultimately be delightful in a terminal: provide a clear colorized unified or side-by-side diff across base/candidate/current and before/after states, including type, mode, symlink, deletion, binary, and environment-recommendation treatment. Library and renderer selection are deliberately deferred; the view must derive from immutable records and never become an authorization channel.
 - Application does not silently change the accepted baseline. Acceptance/promotion is a later explicit lineage decision.

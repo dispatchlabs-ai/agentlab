@@ -286,6 +286,13 @@ fn review_and_receipt_bound_apply_preserve_authorization_boundaries() -> Result<
     ensure!(!workspace.join("etc/agentlab-review.conf").exists());
     let applied_snapshot = snapshot::create(&workspace, &store)?.manifest;
     ensure!(applied_snapshot.digest == apply_record.after_workspace_snapshot_digest);
+    let workspace_locks = state.join("locks").join("workspaces");
+    ensure!(
+        !fs::read_dir(&workspace_locks)?.any(|entry| {
+            entry.is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        }),
+        "successful apply left an interrupted workspace transaction marker"
+    );
 
     let backup_bytes = store.read_run_file(&summary.run_id, &apply_record.backup_artifact.path)?;
     let backup: agentlab::snapshot::Manifest = serde_json::from_slice(&backup_bytes)?;

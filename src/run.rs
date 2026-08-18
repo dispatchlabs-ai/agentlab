@@ -3,7 +3,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 use crate::acceptance;
 use crate::build_version;
+use crate::lock::AdvisoryLock;
 use crate::rootfs::{self, ChangeKind, RootFsChange, RootFsManifest};
 use crate::snapshot;
 use crate::store::{Store, hex_digest};
@@ -27,6 +29,9 @@ pub const RESULT_SCHEMA_VERSION: &str = "agentlab.result/v1";
 pub(crate) const PI_AUTH_SECRET_NAME: &str = "pi-auth";
 const PI_AUTH_SECRET_DIRECTORY: &str = "/run/agentlab-secrets";
 const PI_AUTH_SECRET_PATH: &str = "/run/agentlab-secrets/pi-auth.json";
+const RUNTIME_SECRET_LEASE_PATH: &str = "runtime-secret-lease.json";
+const RUNTIME_SECRET_LEASE_LOCK_PATH: &str = "runtime-secret-lease.lock";
+const RUNTIME_SECRET_LEASE_SCHEMA: &str = "agentlab.runtime-secret-lease/v1";
 pub(crate) const PI_AUTH_TMPFS_MOUNT: &str =
     "type=tmpfs,destination=/run/agentlab-secrets,tmpfs-mode=0711,tmpfs-size=1048576";
 const MAX_RUNTIME_SECRET_BYTES: u64 = 1024 * 1024;
@@ -220,7 +225,7 @@ pub trait RunObserver {
     fn command_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()>;
 }
 
-struct SilentRunObserver;
+pub(crate) struct SilentRunObserver;
 
 impl RunObserver for SilentRunObserver {
     fn stage(&mut self, _message: &str) -> std::io::Result<()> {
@@ -601,6 +606,22 @@ pub fn execute_with_observer(
         "start retained container supervisor",
     )?;
     lifecycle.push(event("retained_container_started"));
+    let mut runtime_secret_lease = if options.pi_auth.is_some() || !options.secret_files.is_empty()
+    {
+        report_stage(
+            observer,
+            "Opening a command-scoped runtime credential lease",
+        )?;
+        Some(RuntimeSecretLease::begin(
+            store,
+            &run_id,
+            &retained_name,
+            secret_injection_names(options),
+            None,
+        )?)
+    } else {
+        None
+    };
     let mut secret_file_guard = if options.secret_files.is_empty() {
         None
     } else {
@@ -622,6 +643,19 @@ pub fn execute_with_observer(
         &format!("Running command: {}", display_command(&options.command)),
     )?;
     let command_output = execute_guest_command(&retained_name, &options.command, observer);
+    if command_output
+        .as_ref()
+        .is_ok_and(|output| output.cancelled || output.timed_out)
+    {
+        docker_status(
+            Command::new("docker").args(["stop", "--time", "1", &retained_name]),
+            "stop retained container after interrupted guest execution",
+        )?;
+        docker_status(
+            Command::new("docker").args(["start", &retained_name]),
+            "restart retained container with empty runtime memory",
+        )?;
+    }
     let auth_cleanup = match &mut pi_auth_guard {
         Some(guard) => guard.cleanup(),
         None => Ok(()),
@@ -630,10 +664,21 @@ pub fn execute_with_observer(
         Some(guard) => guard.cleanup(),
         None => Ok(()),
     };
+    let lease_cleanup = match &mut runtime_secret_lease {
+        Some(lease) => lease.complete(),
+        None => Ok(()),
+    };
     let command_output = command_output?;
     auth_cleanup?;
     secret_file_cleanup?;
-    let exit_code = command_output.status.code().map(i64::from).unwrap_or(-1);
+    lease_cleanup?;
+    if command_output.cancelled {
+        if runtime_secret_lease.is_some() {
+            bail!("agent command interrupted; runtime credentials were revoked");
+        }
+        bail!("agent command interrupted");
+    }
+    let exit_code = command_output.exit_code;
     let mut command_output_warnings = Vec::new();
     if command_output.stdout.truncated {
         command_output_warnings.push(format!(
@@ -649,10 +694,22 @@ pub fn execute_with_observer(
             command_output.stderr.total_bytes
         ));
     }
-    if !command_output_warnings.is_empty() {
+    if command_output.timed_out {
+        command_output_warnings.push(format!(
+            "guest command exceeded the automatic {} second safety timeout and was terminated",
+            crate::process::DEFAULT_GUEST_TIMEOUT_SECONDS
+        ));
+    }
+    if command_output.stdout.truncated || command_output.stderr.truncated {
         report_stage(
             observer,
             "Guest output reached AgentLab's capture limit; filesystem capture is continuing",
+        )?;
+    }
+    if command_output.timed_out {
+        report_stage(
+            observer,
+            "Guest command reached AgentLab's 24-hour fail-safe deadline; finalizing its filesystem evidence",
         )?;
     }
     lifecycle.push(event("command_completed"));
@@ -673,19 +730,14 @@ pub fn execute_with_observer(
         &command_output.stderr.bytes,
     )?;
 
-    report_stage(observer, "Capturing complete result filesystem")?;
-    let result_inspect_bytes = docker_output_bytes(
+    report_stage(observer, "Finalizing one immutable result filesystem")?;
+    let mut quiesced = quiesce_container(&retained_name)?;
+    lifecycle.push(event("result_container_quiesced"));
+    let stopped_inspect = docker_output_bytes(
         Command::new("docker").args(["inspect", &retained_name]),
-        "inspect completed retained container",
+        "inspect quiesced retained container",
     )?;
-    ensure_no_external_mounts(&result_inspect_bytes)?;
-    let (_, retained_state) = container_status(&result_inspect_bytes)?;
-    let result_inspect = write_artifact(
-        store,
-        &run_id,
-        "evidence/result-inspect.json",
-        &result_inspect_bytes,
-    )?;
+    ensure_no_external_mounts(&stopped_inspect)?;
     let docker_diff_bytes = docker_output_bytes(
         Command::new("docker").args(["diff", &retained_name]),
         "collect Docker filesystem diff",
@@ -711,6 +763,22 @@ pub fn execute_with_observer(
         "export result root filesystem",
     )?;
     lifecycle.push(event("result_rootfs_exported"));
+    let captures = export_captures(store, &run_id, &retained_name, &options.captures)?;
+    lifecycle.push(event("requested_captures_exported"));
+    quiesced.restart()?;
+    lifecycle.push(event("retained_container_restarted_after_capture"));
+    let result_inspect_bytes = docker_output_bytes(
+        Command::new("docker").args(["inspect", &retained_name]),
+        "inspect retained container after immutable capture",
+    )?;
+    ensure_no_external_mounts(&result_inspect_bytes)?;
+    let (_, retained_state) = container_status(&result_inspect_bytes)?;
+    let result_inspect = write_artifact(
+        store,
+        &run_id,
+        "evidence/result-inspect.json",
+        &result_inspect_bytes,
+    )?;
 
     report_stage(observer, "Scanning complete base filesystem")?;
     let base_manifest = rootfs::scan_export(&base_export_path)?;
@@ -821,12 +889,15 @@ pub fn execute_with_observer(
     store.write_run_file(&run_id, "delta.json", &portable_delta_bytes)?;
     lifecycle.push(event("portable_delta_created"));
 
-    let captures = export_captures(store, &run_id, &retained_name, &options.captures)?;
     let base_export = artifact_for_file("artifacts/base-rootfs.tar", &base_export_path)?;
     let result_export = artifact_for_file("artifacts/result-rootfs.tar", &result_export_path)?;
     let uncovered = uncovered_by_docker_diff(&all_changes, &docker_diff_bytes);
     let mut warnings = workspace_warnings;
     warnings.extend(command_output_warnings);
+    warnings.push(
+        "the container was quiesced before result capture; background processes were terminated"
+            .to_owned(),
+    );
     if !uncovered.is_empty() {
         warnings.push(format!(
             "{} normalized rootfs changes were not covered by a Docker diff path; see docker_diff_uncovered_changes",
@@ -1642,6 +1713,293 @@ fn container_user_identity(container: &str, purpose: &str) -> Result<(String, St
     Ok((uid.to_owned(), gid.to_owned(), home.to_owned()))
 }
 
+#[derive(Serialize, Deserialize)]
+struct RuntimeSecretLeaseRecord {
+    schema_version: String,
+    run_id: String,
+    container_name: String,
+    container_id: String,
+    started_at: DateTime<Utc>,
+    secret_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incomplete_artifact_directory: Option<String>,
+}
+
+/// Durable indication that a retained container may still contain a runtime
+/// credential. The marker is written before injection and removed only after
+/// the reserved tmpfs and Pi symlink have both been scrubbed.
+pub(crate) struct RuntimeSecretLease {
+    store: Store,
+    run_id: String,
+    container: String,
+    active: bool,
+    _lock: AdvisoryLock,
+}
+
+impl RuntimeSecretLease {
+    pub(crate) fn begin(
+        store: &Store,
+        run_id: &str,
+        container: &str,
+        mut secret_names: Vec<String>,
+        incomplete_artifact_directory: Option<String>,
+    ) -> Result<Self> {
+        recover_all_interrupted_secret_leases(store)?;
+        let lock_path = store.run_path(run_id, RUNTIME_SECRET_LEASE_LOCK_PATH)?;
+        let lease_lock = AdvisoryLock::acquire(
+            &lock_path,
+            &format!("runtime credential lease for run {run_id}"),
+        )?;
+        if store.run_file_exists(run_id, RUNTIME_SECRET_LEASE_PATH)? {
+            bail!(
+                "run {run_id:?} has an interrupted runtime credential lease; recover it before injecting credentials again"
+            );
+        }
+        let inspect = docker_output_bytes(
+            Command::new("docker").args(["inspect", container]),
+            "inspect container before opening runtime credential lease",
+        )?;
+        let container_id = validate_runtime_secret_container(&inspect, run_id, container, None)?;
+        scrub_runtime_secrets(container)?;
+        secret_names.sort();
+        secret_names.dedup();
+        let record = RuntimeSecretLeaseRecord {
+            schema_version: RUNTIME_SECRET_LEASE_SCHEMA.to_owned(),
+            run_id: run_id.to_owned(),
+            container_name: container.to_owned(),
+            container_id,
+            started_at: Utc::now(),
+            secret_names,
+            incomplete_artifact_directory,
+        };
+        store.write_run_file(run_id, RUNTIME_SECRET_LEASE_PATH, &pretty_json(&record)?)?;
+        Ok(Self {
+            store: store.clone(),
+            run_id: run_id.to_owned(),
+            container: container.to_owned(),
+            active: true,
+            _lock: lease_lock,
+        })
+    }
+
+    pub(crate) fn complete(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        scrub_runtime_secrets(&self.container)?;
+        remove_secret_lease_marker(&self.store, &self.run_id)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RuntimeSecretLease {
+    fn drop(&mut self) {
+        let _ = self.complete();
+    }
+}
+
+pub(crate) fn interrupted_secret_lease_exists(store: &Store, run_id: &str) -> Result<bool> {
+    store.run_file_exists(run_id, RUNTIME_SECRET_LEASE_PATH)
+}
+
+pub(crate) fn recover_interrupted_secret_lease(
+    store: &Store,
+    run_id: &str,
+    container: &str,
+) -> Result<bool> {
+    if !interrupted_secret_lease_exists(store, run_id)? {
+        return Ok(false);
+    }
+    let lock_path = store.run_path(run_id, RUNTIME_SECRET_LEASE_LOCK_PATH)?;
+    let _lock = AdvisoryLock::acquire(
+        &lock_path,
+        &format!("runtime credential lease for run {run_id}"),
+    )?;
+    if !interrupted_secret_lease_exists(store, run_id)? {
+        return Ok(false);
+    }
+    recover_interrupted_secret_lease_locked(store, run_id, container)
+}
+
+fn recover_interrupted_secret_lease_locked(
+    store: &Store,
+    run_id: &str,
+    container: &str,
+) -> Result<bool> {
+    let bytes = store.read_run_file(run_id, RUNTIME_SECRET_LEASE_PATH)?;
+    let record: RuntimeSecretLeaseRecord =
+        serde_json::from_slice(&bytes).context("decode interrupted runtime secret lease")?;
+    if record.schema_version != RUNTIME_SECRET_LEASE_SCHEMA
+        || record.run_id != run_id
+        || record.container_name != container
+    {
+        bail!("runtime secret lease does not match the selected run and container");
+    }
+
+    let inspect = docker_output_bytes(
+        Command::new("docker").args(["inspect", container]),
+        "inspect container with interrupted runtime credentials",
+    )?;
+    validate_runtime_secret_container(&inspect, run_id, container, Some(&record.container_id))?;
+    if record.incomplete_artifact_directory.is_none()
+        && !store.run_file_exists(run_id, "result.json")?
+        && !store.run_file_exists(run_id, "fork.json")?
+    {
+        remove_interrupted_initial_run(store, run_id, container, &inspect)?;
+        return Ok(true);
+    }
+    let (_, state) = container_status(&inspect)?;
+    let was_running = state == "running";
+    if was_running {
+        docker_status(
+            Command::new("docker").args(["stop", "--time", "1", container]),
+            "stop container to revoke interrupted runtime credentials",
+        )?;
+    }
+    docker_status(
+        Command::new("docker").args(["start", container]),
+        "restart container with an empty runtime-secret tmpfs",
+    )?;
+    scrub_runtime_secrets(container)?;
+    if !was_running {
+        docker_status(
+            Command::new("docker").args(["stop", "--time", "1", container]),
+            "restore stopped container state after revoking interrupted runtime credentials",
+        )?;
+    }
+    remove_secret_lease_marker(store, run_id)?;
+    if let Some(relative) = &record.incomplete_artifact_directory {
+        let receipt = format!("{relative}/continuation.json");
+        if !store.run_file_exists(run_id, &receipt)? {
+            let directory = store.run_path(run_id, relative)?;
+            match fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("remove interrupted continuation artifacts");
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn remove_interrupted_initial_run(
+    store: &Store,
+    run_id: &str,
+    container: &str,
+    inspect: &[u8],
+) -> Result<()> {
+    let value: Value = serde_json::from_slice(inspect).context("decode interrupted run inspect")?;
+    let image_tag = value
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|container| container.pointer("/Config/Labels/agentlab.image_tag"))
+        .and_then(Value::as_str)
+        .context("interrupted AgentLab container omitted its private image tag")?;
+    docker_status(
+        Command::new("docker").args(["rm", "--force", container]),
+        "remove interrupted credentialed run container",
+    )?;
+    let removal = crate::process::output_bounded(
+        Command::new("docker").args(["image", "rm", image_tag]),
+        crate::process::MAX_IGNORE_RULE_BYTES,
+    )
+    .context("remove interrupted credentialed run image")?;
+    if !removal.status.success()
+        && !String::from_utf8_lossy(&removal.stderr.bytes).contains("No such image")
+    {
+        bail!(
+            "remove interrupted credentialed run image: {}",
+            bounded_lossy_summary(&removal.stderr.bytes, 4096)
+        );
+    }
+    store.remove_run_directory(run_id)?;
+    Ok(())
+}
+
+fn validate_runtime_secret_container(
+    inspect: &[u8],
+    run_id: &str,
+    container_name: &str,
+    expected_id: Option<&str>,
+) -> Result<String> {
+    ensure_pi_auth_tmpfs(inspect)?;
+    let value: Value =
+        serde_json::from_slice(inspect).context("decode credential lease inspect")?;
+    let container = value
+        .as_array()
+        .and_then(|values| values.first())
+        .context("Docker inspect returned no credential lease container")?;
+    let actual_id = container["Id"]
+        .as_str()
+        .context("credential lease container omitted ID")?;
+    let actual_name = container["Name"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let actual_run = container
+        .pointer("/Config/Labels/agentlab.run_id")
+        .and_then(Value::as_str);
+    if actual_name != container_name
+        || actual_run != Some(run_id)
+        || expected_id.is_some_and(|expected| expected != actual_id)
+    {
+        bail!("runtime credential lease container does not match the selected AgentLab run");
+    }
+    Ok(actual_id.to_owned())
+}
+
+fn recover_all_interrupted_secret_leases(store: &Store) -> Result<()> {
+    for run_id in store.list_run_ids()? {
+        if !interrupted_secret_lease_exists(store, &run_id)? {
+            continue;
+        }
+        let lock_path = store.run_path(&run_id, RUNTIME_SECRET_LEASE_LOCK_PATH)?;
+        let Some(_lock) = AdvisoryLock::try_acquire(
+            &lock_path,
+            &format!("runtime credential lease for run {run_id}"),
+        )?
+        else {
+            // Another AgentLab process still owns this command-scoped lease.
+            continue;
+        };
+        let bytes = store.read_run_file(&run_id, RUNTIME_SECRET_LEASE_PATH)?;
+        let record: RuntimeSecretLeaseRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode runtime credential lease for run {run_id}"))?;
+        recover_interrupted_secret_lease_locked(store, &run_id, &record.container_name)?;
+    }
+    Ok(())
+}
+
+fn remove_secret_lease_marker(store: &Store, run_id: &str) -> Result<()> {
+    let path = store.run_path(run_id, RUNTIME_SECRET_LEASE_PATH)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove completed runtime secret lease"),
+    }
+}
+
+pub(crate) fn scrub_runtime_secrets(container: &str) -> Result<()> {
+    let (_, _, home) = container_user_identity(container, "scrub runtime secret locations")?;
+    docker_status(
+        Command::new("docker").args([
+            "exec",
+            "--user",
+            "0",
+            container,
+            "/bin/sh",
+            "-c",
+            "set -eu; home=$1; target=\"$home/.pi/agent/auth.json\"; if [ -L \"$target\" ] && [ \"$(readlink \"$target\")\" = /run/agentlab-secrets/pi-auth.json ]; then rm -f -- \"$target\"; fi; for path in /run/agentlab-secrets/* /run/agentlab-secrets/.[!.]* /run/agentlab-secrets/..?*; do if [ -e \"$path\" ] || [ -L \"$path\" ]; then rm -f -- \"$path\"; fi; done",
+            "agentlab-secret-scrub",
+            &home,
+        ]),
+        "scrub reserved runtime secret locations",
+    )
+}
+
 pub(crate) struct SecretFileGuard {
     container: String,
     paths: Vec<String>,
@@ -2158,30 +2516,52 @@ enum GuestOutputChunk {
     ReadError(String),
 }
 
-struct GuestCommandOutput {
-    status: std::process::ExitStatus,
-    stdout: crate::process::BoundedCapture,
-    stderr: crate::process::BoundedCapture,
+pub(crate) struct GuestCommandOutput {
+    pub(crate) exit_code: i64,
+    pub(crate) stdout: crate::process::BoundedCapture,
+    pub(crate) stderr: crate::process::BoundedCapture,
+    pub(crate) timed_out: bool,
+    pub(crate) cancelled: bool,
 }
 
-fn execute_guest_command(
+pub(crate) fn execute_guest_command(
     container: &str,
     command: &[String],
     observer: &mut dyn RunObserver,
 ) -> Result<GuestCommandOutput> {
-    let mut child = Command::new("docker")
-        .args(["exec", container])
-        .args(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("execute command in retained run container")?;
+    let mut invocation = Command::new("docker");
+    invocation.args(["exec", container]).args(command);
+    execute_streaming_command(
+        &mut invocation,
+        observer,
+        Duration::from_secs(crate::process::DEFAULT_GUEST_TIMEOUT_SECONDS),
+        crate::process::MAX_RUN_OUTPUT_BYTES,
+    )
+    .context("execute command in retained run container")
+}
+
+fn execute_streaming_command(
+    invocation: &mut Command,
+    observer: &mut dyn RunObserver,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<GuestCommandOutput> {
+    invocation.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::process::isolate_process_group(invocation);
+    let mut child = invocation.spawn().context("start streamed command")?;
     let child_stdout = child.stdout.take().context("capture guest stdout")?;
     let child_stderr = child.stderr.take().context("capture guest stderr")?;
-    let (sender, receiver) = mpsc::channel();
+    // At most sixteen 8 KiB chunks may wait for the terminal consumer. The
+    // retained byte budget alone is not a memory bound if producers can queue
+    // unbounded data before the consumer applies it.
+    let (sender, receiver) = mpsc::sync_channel(16);
     let mut stdout = crate::process::BoundedCapture::default();
     let mut stderr = crate::process::BoundedCapture::default();
     let mut observer_error = None;
+    let mut status = None;
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let started = Instant::now();
 
     std::thread::scope(|scope| {
         let stdout_sender = sender.clone();
@@ -2190,46 +2570,78 @@ fn execute_guest_command(
         scope.spawn(move || read_guest_stream(child_stderr, false, stderr_sender));
         drop(sender);
 
-        for chunk in receiver {
-            match chunk {
-                GuestOutputChunk::Stdout(bytes) => {
-                    let retained = stdout.push(&bytes, crate::process::MAX_RUN_OUTPUT_BYTES);
-                    if retained > 0 && observer_error.is_none() {
-                        if let Err(error) = observer.command_stdout(&bytes[..retained]) {
-                            observer_error = Some(error);
+        let mut disconnected = false;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => match chunk {
+                    GuestOutputChunk::Stdout(bytes) => {
+                        let retained = stdout.push(&bytes, output_limit);
+                        if retained > 0 && observer_error.is_none() {
+                            if let Err(error) = observer.command_stdout(&bytes[..retained]) {
+                                observer_error = Some(error);
+                            }
                         }
                     }
-                }
-                GuestOutputChunk::Stderr(bytes) => {
-                    let retained = stderr.push(&bytes, crate::process::MAX_RUN_OUTPUT_BYTES);
-                    if retained > 0 && observer_error.is_none() {
-                        if let Err(error) = observer.command_stderr(&bytes[..retained]) {
-                            observer_error = Some(error);
+                    GuestOutputChunk::Stderr(bytes) => {
+                        let retained = stderr.push(&bytes, output_limit);
+                        if retained > 0 && observer_error.is_none() {
+                            if let Err(error) = observer.command_stderr(&bytes[..retained]) {
+                                observer_error = Some(error);
+                            }
                         }
                     }
-                }
-                GuestOutputChunk::ReadError(error) => {
-                    if observer_error.is_none() {
-                        observer_error = Some(std::io::Error::other(error));
+                    GuestOutputChunk::ReadError(error) => {
+                        if observer_error.is_none() {
+                            observer_error = Some(std::io::Error::other(error));
+                        }
+                    }
+                },
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => disconnected = true,
+            }
+
+            if status.is_none() {
+                cancelled = crate::cancel::requested();
+                timed_out = !cancelled && started.elapsed() >= timeout;
+                if cancelled || timed_out || observer_error.is_some() {
+                    let _ = crate::process::terminate_process_group(&mut child);
+                    status = child.wait().ok();
+                } else {
+                    status = child.try_wait().context("poll streamed command")?;
+                    if status.is_some() {
+                        let _ = crate::process::terminate_process_group(&mut child);
                     }
                 }
             }
+
+            if status.is_some() && disconnected {
+                break;
+            }
         }
-    });
-    let status = child
-        .wait()
-        .context("wait for command in retained run container")?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    let status = status
+        .or_else(|| child.wait().ok())
+        .context("wait for streamed command")?;
     if let Some(error) = observer_error {
         return Err(error).context("stream guest command output");
     }
     Ok(GuestCommandOutput {
-        status,
+        exit_code: if cancelled {
+            130
+        } else if timed_out {
+            124
+        } else {
+            status.code().map(i64::from).unwrap_or(-1)
+        },
         stdout,
         stderr,
+        timed_out,
+        cancelled,
     })
 }
 
-fn read_guest_stream(mut stream: impl Read, stdout: bool, sender: mpsc::Sender<GuestOutputChunk>) {
+fn read_guest_stream(mut stream: impl Read, stdout: bool, sender: SyncSender<GuestOutputChunk>) {
     let mut buffer = [0_u8; 8192];
     loop {
         match stream.read(&mut buffer) {
@@ -2305,6 +2717,55 @@ pub(crate) fn docker_success(command: &mut Command, context: &str) -> Result<Str
         .to_string())
 }
 
+pub(crate) struct QuiescedContainer {
+    container: String,
+    restart: bool,
+}
+
+impl QuiescedContainer {
+    pub(crate) fn restart(&mut self) -> Result<()> {
+        if self.restart {
+            docker_status(
+                Command::new("docker").args(["start", &self.container]),
+                "restart retained container after immutable filesystem capture",
+            )?;
+            self.restart = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QuiescedContainer {
+    fn drop(&mut self) {
+        if self.restart {
+            let _ = Command::new("docker")
+                .args(["start", &self.container])
+                .output();
+        }
+    }
+}
+
+pub(crate) fn quiesce_container(container: &str) -> Result<QuiescedContainer> {
+    let inspect = docker_output_bytes(
+        Command::new("docker").args(["inspect", container]),
+        "inspect retained container before immutable capture",
+    )?;
+    let (_, state) = container_status(&inspect)?;
+    let restart = state == "running";
+    if restart {
+        docker_status(
+            Command::new("docker").args(["stop", "--time", "1", container]),
+            "quiesce retained container for immutable filesystem capture",
+        )?;
+    } else if state != "exited" && state != "created" {
+        bail!("cannot capture container {container:?} from state {state:?}");
+    }
+    Ok(QuiescedContainer {
+        container: container.to_owned(),
+        restart,
+    })
+}
+
 pub(crate) fn docker_status(command: &mut Command, context: &str) -> Result<()> {
     docker_success(command, context).map(|_| ())
 }
@@ -2352,6 +2813,7 @@ fn bounded_lossy_summary(bytes: &[u8], limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::rootfs::RootFsEntry;
+    use std::time::Duration;
 
     fn options(workspace: PathBuf, captures: Vec<CaptureSpec>) -> RunOptions {
         RunOptions {
@@ -2484,5 +2946,61 @@ mod tests {
         };
         let ignored = evaluate_change_ignore_bytes(b"/secrets/\n", &[directory, ordinary]).unwrap();
         assert_eq!(ignored, ["/secrets".to_owned()].into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_execution_bounds_both_output_queues_and_retained_bytes() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "dd if=/dev/zero bs=1024 count=256 2>/dev/null; (dd if=/dev/zero bs=1024 count=256 2>/dev/null) >&2",
+        ]);
+
+        let output = execute_streaming_command(
+            &mut command,
+            &mut SilentRunObserver,
+            Duration::from_secs(5),
+            4096,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.bytes.len(), 4096);
+        assert_eq!(output.stderr.bytes.len(), 4096);
+        assert_eq!(output.stdout.total_bytes, 256 * 1024);
+        assert_eq!(output.stderr.total_bytes, 256 * 1024);
+        assert!(output.stdout.truncated);
+        assert!(output.stderr.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_execution_timeout_kills_the_complete_process_group() {
+        let temporary = tempfile::tempdir().unwrap();
+        let delayed_write = temporary.path().join("descendant-survived");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(sleep 1; printf leaked > \"$1\") & wait",
+                "agentlab-timeout-test",
+            ])
+            .arg(&delayed_write);
+
+        let started = Instant::now();
+        let output = execute_streaming_command(
+            &mut command,
+            &mut SilentRunObserver,
+            Duration::from_millis(100),
+            4096,
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
+        assert_eq!(output.exit_code, 124);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!delayed_write.exists());
     }
 }

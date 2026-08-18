@@ -1,10 +1,12 @@
 pub mod acceptance;
 pub mod app;
 pub mod apply;
+mod cancel;
 pub mod config;
 pub mod diff;
 pub mod evaluation;
 pub mod lifecycle;
+mod lock;
 pub mod process;
 pub mod review;
 pub mod rootfs;
@@ -24,4 +26,9 @@ pub fn build_version() -> String {
         Some(build_id) => format!("{VERSION}+{build_id}"),
         None => VERSION.to_owned(),
     }
+}
+
+#[doc(hidden)]
+pub fn install_signal_handlers() -> anyhow::Result<()> {
+    cancel::install_signal_handlers()
 }

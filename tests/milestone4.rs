@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::io::Read;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use agentlab::lifecycle;
 use agentlab::run::{self, CaptureSpec, RunOptions, SecretFileSpec, WorkspaceSource};
@@ -85,7 +87,7 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
             command: vec![
                 "/bin/sh".to_owned(),
                 "-c".to_owned(),
-                "printf '1\\n' > /root/session.txt; printf 'initial\\n' > /workspace/initial.txt; exit 19"
+                "(i=0; while :; do i=$((i + 1)); printf '%s\\n' \"$i\" > /root/background-writer.txt; sleep 0.02; done) >/dev/null 2>&1 & printf '1\\n' > /root/session.txt; printf 'initial\\n' > /workspace/initial.txt; exit 19"
                     .to_owned(),
             ],
             workspace_guest_path: "/workspace".to_owned(),
@@ -115,6 +117,29 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     ensure!(summary.exit_code == 19);
     let result = run::load_result(&store, &summary.run_id)?;
     ensure!(result.docker.retained_container_state == "running");
+    let background_after_capture = docker_success(
+        Command::new("docker").args([
+            "exec",
+            &summary.retained_container_name,
+            "cat",
+            "/root/background-writer.txt",
+        ]),
+        "read quiesced background fixture",
+    )?;
+    thread::sleep(Duration::from_millis(150));
+    ensure!(
+        background_after_capture
+            == docker_success(
+                Command::new("docker").args([
+                    "exec",
+                    &summary.retained_container_name,
+                    "cat",
+                    "/root/background-writer.txt",
+                ]),
+                "re-read quiesced background fixture",
+            )?,
+        "background guest writer survived immutable result capture"
+    );
     lifecycle::verify_all(&store, &summary.run_id)?;
     let listed = lifecycle::list(&store)?;
     ensure!(listed.iter().any(|run| {
@@ -197,6 +222,144 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
         "continuation Pi auth leaked into persistent filesystem changes"
     );
 
+    let continuation_directory = store
+        .root()
+        .join("runs")
+        .join(&summary.run_id)
+        .join("continuations");
+    let completed_continuation_count = fs::read_dir(&continuation_directory)?.count();
+    let interrupt_secret = temporary.path().join("interrupt-secret");
+    fs::write(&interrupt_secret, b"interrupt-only\n")?;
+    let mut interrupted = spawn_credentialed_resume(
+        &store,
+        &summary.run_id,
+        "interrupt-secret",
+        &interrupt_secret,
+    )?;
+    wait_for_container_file(
+        &mut interrupted,
+        &summary.retained_container_name,
+        "/run/agentlab-secrets/interrupt-secret",
+    )?;
+
+    let concurrent_fork = lifecycle::fork(&store, &summary.run_id)
+        .err()
+        .context("concurrent fork unexpectedly succeeded")?;
+    ensure!(
+        concurrent_fork.to_string().contains("already in progress"),
+        "concurrent lifecycle operation failed unclearly: {concurrent_fork:#}"
+    );
+    signal_child(&interrupted, rustix::process::Signal::INT)?;
+    let interrupted_output = interrupted.wait_with_output()?;
+    ensure!(
+        interrupted_output.status.code() == Some(130),
+        "Ctrl-C continuation returned {:?}: {}",
+        interrupted_output.status.code(),
+        String::from_utf8_lossy(&interrupted_output.stderr)
+    );
+    ensure!(
+        !store.run_file_exists(&summary.run_id, "runtime-secret-lease.json")?,
+        "Ctrl-C left an active credential lease"
+    );
+    ensure!(
+        fs::read_dir(&continuation_directory)?.count() == completed_continuation_count,
+        "Ctrl-C left an incomplete continuation"
+    );
+    assert_container_file_absent(
+        &summary.retained_container_name,
+        "/run/agentlab-secrets/interrupt-secret",
+    )?;
+
+    let crash_secret = temporary.path().join("crash-secret");
+    fs::write(&crash_secret, b"crash-only\n")?;
+    let mut crashed =
+        spawn_credentialed_resume(&store, &summary.run_id, "crash-secret", &crash_secret)?;
+    wait_for_container_file(
+        &mut crashed,
+        &summary.retained_container_name,
+        "/run/agentlab-secrets/crash-secret",
+    )?;
+    signal_child(&crashed, rustix::process::Signal::KILL)?;
+    let crashed_output = crashed.wait_with_output()?;
+    ensure!(!crashed_output.status.success());
+    ensure!(
+        store.run_file_exists(&summary.run_id, "runtime-secret-lease.json")?,
+        "forced crash did not preserve a recoverable credential lease"
+    );
+
+    let recovered_stop = lifecycle::stop(&store, &summary.run_id)?;
+    ensure!(recovered_stop.container_state == "exited");
+    ensure!(
+        !store.run_file_exists(&summary.run_id, "runtime-secret-lease.json")?,
+        "next lifecycle operation did not clear the crashed credential lease"
+    );
+    ensure!(
+        fs::read_dir(&continuation_directory)?.count() == completed_continuation_count,
+        "credential recovery left an incomplete continuation"
+    );
+    lifecycle::resume(&store, &summary.run_id, &[])?;
+    assert_container_file_absent(
+        &summary.retained_container_name,
+        "/run/agentlab-secrets/crash-secret",
+    )?;
+    lifecycle::verify_all(&store, &summary.run_id)?;
+
+    let initial_crash_secret = temporary.path().join("initial-crash-secret");
+    fs::write(&initial_crash_secret, b"initial-crash-only\n")?;
+    let mut crashed_initial = spawn_credentialed_initial_run(
+        &store,
+        &workspace,
+        "initial-crash-secret",
+        &initial_crash_secret,
+    )?;
+    let (orphan_run_id, orphan_container) =
+        wait_for_new_runtime_lease(&mut crashed_initial, &store, &summary.run_id)?;
+    cleanup.run_ids.push(orphan_run_id.clone());
+    cleanup.containers.push(orphan_container.clone());
+    let orphan_compact = orphan_run_id.replace('-', "");
+    let orphan_image_tag = format!("agentlab-prepared:{}", &orphan_compact[..12]);
+    cleanup.image_tags.push(orphan_image_tag.clone());
+    wait_for_container_file(
+        &mut crashed_initial,
+        &orphan_container,
+        "/run/agentlab-secrets/initial-crash-secret",
+    )?;
+    signal_child(&crashed_initial, rustix::process::Signal::KILL)?;
+    ensure!(!crashed_initial.wait_with_output()?.status.success());
+    ensure!(store.run_file_exists(&orphan_run_id, "runtime-secret-lease.json")?);
+
+    let recovery_trigger = temporary.path().join("recovery-trigger");
+    fs::write(&recovery_trigger, b"trigger\n")?;
+    let recovery_continuation = lifecycle::resume_with_secrets(
+        &store,
+        &summary.run_id,
+        &["/bin/true".to_owned()],
+        None,
+        &[SecretFileSpec {
+            name: "recovery-trigger".to_owned(),
+            source: recovery_trigger,
+        }],
+    )?;
+    ensure!(
+        recovery_continuation
+            .continuation
+            .context("missing recovery-trigger continuation")?
+            .exit_code
+            == 0
+    );
+    ensure!(
+        !store.root().join("runs").join(&orphan_run_id).exists(),
+        "a new credential lease did not remove the crashed initial run state"
+    );
+    ensure!(
+        !docker_exists(&orphan_container),
+        "a new credential lease did not remove the crashed credentialed container"
+    );
+    ensure!(
+        !docker_image_exists(&orphan_image_tag),
+        "a new credential lease did not remove the crashed run image tag"
+    );
+
     let fork = lifecycle::fork(&store, &summary.run_id)?;
     cleanup.run_ids.push(fork.run_id.clone());
     cleanup.containers.push(fork.container_name.clone());
@@ -248,11 +411,6 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     ensure!(docker_exists(&unrelated_name));
     ensure!(docker_id(&unrelated_name)? == unrelated_id);
 
-    let continuation_directory = store
-        .root()
-        .join("runs")
-        .join(&summary.run_id)
-        .join("continuations");
     let continuation_count = fs::read_dir(&continuation_directory)?.count();
     let failed_continuation = lifecycle::resume(
         &store,
@@ -295,6 +453,127 @@ fn retained_lifecycle_continuation_fork_and_exact_removal() -> Result<()> {
     Ok(())
 }
 
+fn spawn_credentialed_resume(
+    store: &Store,
+    run_id: &str,
+    secret_name: &str,
+    secret_path: &std::path::Path,
+) -> Result<Child> {
+    Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .env("AGENTLAB_STATE_DIR", store.root())
+        .arg("resume")
+        .arg("--secret-file")
+        .arg(format!("{secret_name}={}", secret_path.display()))
+        .arg(run_id)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -f \"$1\"; while :; do sleep 1; done",
+            "agentlab-interruption-fixture",
+            &format!("/run/agentlab-secrets/{secret_name}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start credentialed continuation fixture")
+}
+
+fn spawn_credentialed_initial_run(
+    store: &Store,
+    workspace: &std::path::Path,
+    secret_name: &str,
+    secret_path: &std::path::Path,
+) -> Result<Child> {
+    Command::new(env!("CARGO_BIN_EXE_agentlab"))
+        .env("AGENTLAB_STATE_DIR", store.root())
+        .arg("run")
+        .arg("--workspace")
+        .arg(workspace)
+        .args(["--image", "alpine:3.21", "--network", "none"])
+        .arg("--secret-file")
+        .arg(format!("{secret_name}={}", secret_path.display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -f \"$1\"; while :; do sleep 1; done",
+            "agentlab-initial-crash-fixture",
+            &format!("/run/agentlab-secrets/{secret_name}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start credentialed initial-run fixture")
+}
+
+fn wait_for_new_runtime_lease(
+    child: &mut Child,
+    store: &Store,
+    excluded_run_id: &str,
+) -> Result<(String, String)> {
+    for _ in 0..800 {
+        ensure!(
+            child.try_wait()?.is_none(),
+            "credentialed initial run exited before opening its lease"
+        );
+        for run_id in store.list_run_ids()? {
+            if run_id == excluded_run_id
+                || !store.run_file_exists(&run_id, "runtime-secret-lease.json")?
+            {
+                continue;
+            }
+            let lease: serde_json::Value = serde_json::from_slice(
+                &store.read_run_file(&run_id, "runtime-secret-lease.json")?,
+            )?;
+            let container = lease["container_name"]
+                .as_str()
+                .context("runtime lease omitted its container")?;
+            return Ok((run_id, container.to_owned()));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    anyhow::bail!("timed out waiting for initial runtime credential lease")
+}
+
+fn wait_for_container_file(child: &mut Child, container: &str, path: &str) -> Result<()> {
+    for _ in 0..200 {
+        ensure!(
+            child.try_wait()?.is_none(),
+            "credentialed continuation exited before its secret was observable"
+        );
+        if Command::new("docker")
+            .args(["exec", container, "test", "-f", path])
+            .output()?
+            .status
+            .success()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    anyhow::bail!("timed out waiting for credential lease fixture")
+}
+
+fn signal_child(child: &Child, signal: rustix::process::Signal) -> Result<()> {
+    let raw = i32::try_from(child.id()).context("fixture process ID overflow")?;
+    let pid = rustix::process::Pid::from_raw(raw).context("fixture process ID was zero")?;
+    rustix::process::kill_process(pid, signal).context("signal credential lease fixture")?;
+    Ok(())
+}
+
+fn assert_container_file_absent(container: &str, path: &str) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["exec", container, "test", "!", "-e", path])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "runtime credential remained at {path}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 fn read_only_regular_file_from_tar(path: &std::path::Path) -> Result<Vec<u8>> {
     let file = fs::File::open(path)?;
     let mut archive = tar::Archive::new(file);
@@ -312,6 +591,13 @@ fn read_only_regular_file_from_tar(path: &std::path::Path) -> Result<Vec<u8>> {
 fn docker_exists(name: &str) -> bool {
     Command::new("docker")
         .args(["inspect", name])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn docker_image_exists(name: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", name])
         .output()
         .is_ok_and(|output| output.status.success())
 }

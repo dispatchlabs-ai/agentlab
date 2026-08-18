@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use super::{Candidate, CandidateKind, IgnoreRule, Repository};
+use super::{Candidate, CandidateKind, IgnoreRule, PinnedWorkspace, Repository};
 use crate::store::hex_digest;
 
 pub(crate) struct RepositoryDiscovery {
@@ -192,6 +192,7 @@ pub(crate) fn discover_repositories(root: &Path, candidates: &[Candidate]) -> Re
 }
 
 pub(crate) fn active_ignore_rules(
+    source: &PinnedWorkspace,
     candidates: &[Candidate],
     ignored: &HashSet<String>,
 ) -> Result<(Vec<IgnoreRule>, String)> {
@@ -204,8 +205,16 @@ pub(crate) fn active_ignore_rules(
         if parent.is_some_and(|parent| ignored.contains(parent)) {
             continue;
         }
-        let content = fs::read(&candidate.absolute)
+        let mut file = source.open_stable_candidate(candidate)?;
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)
             .with_context(|| format!("read active ignore file {:?}", candidate.path))?;
+        if !source.path_entry_unchanged(candidate)? {
+            bail!(
+                "workspace changed while reading active ignore file {:?}; retry from a stable source",
+                candidate.path
+            );
+        }
         rules.push(IgnoreRule {
             path: candidate.path.clone(),
             digest: format!("sha256:{}", hex_digest(&Sha256::digest(content))),

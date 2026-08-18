@@ -3,6 +3,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 
 pub const DEFAULT_EXTERNAL_TIMEOUT_SECONDS: u64 = 30 * 60;
+pub const DEFAULT_GUEST_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 pub const MAX_EXTERNAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RUN_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DIFF_REQUEST_BYTES: usize = 32 * 1024 * 1024;

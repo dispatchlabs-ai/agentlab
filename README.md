@@ -25,32 +25,32 @@ Milestones 1 through 7 implement deterministic workspace snapshots, isolated and
 - Produces a canonical snapshot identity and a versioned JSON manifest.
 - Inspects paths, hashes, sizes, modes, symlink targets, repositories, and ignore-rule identity without printing file contents.
 - Verifies manifest and blob integrity.
-- Opens blobs and source files without following symlinks, re-hashes the exact open descriptor before use, detects same-metadata source substitution, and replaces corrupt local cache objects only with verified bytes.
+- Pins the selected workspace root, traverses every directory through no-follow descriptors, opens blobs and source files without following symlinks, re-hashes the exact open descriptor before use, detects same-metadata source substitution, and replaces corrupt local cache objects only with verified bytes.
 - Fails precisely on unsupported special files instead of silently dropping them.
 - Resolves an OCI image immutably and executes one command in a uniquely named retained Docker container.
-- Optionally injects the host's default Pi authentication file from private runtime memory, records only the injection name, and removes it before filesystem export.
+- Optionally injects the host's default Pi authentication file from private runtime memory, records only the injection name, and removes it before filesystem export; Ctrl-C revokes the lease immediately, while durable lease state lets the next lifecycle or credentialed operation recover safely after a hard crash.
 - Captures persistent changes across the complete guest root filesystem, including content, modes, types, symlink targets, and deletions.
 - Records raw and `.agentlabignore`-filtered deltas, stdout, stderr, nonzero exit status, lifecycle events, Docker evidence, requested captures, and integrity hashes.
 - Rejects image volumes and external writable mounts that would escape complete root-filesystem observation.
 - Runs directly from either a mutable host directory (snapshotted at invocation) or an already stored snapshot digest.
 - Shows elapsed-time progress, streams guest stdout/stderr live, and recaptures a direct source workspace after execution to report whether it remained unchanged.
-- Escapes terminal control and bidirectional-display characters in human output while keeping original receipt bytes, and bounds live/retained guest output to 64 MiB per stream with an explicit warning if truncation occurs.
+- Escapes terminal control and bidirectional-display characters in human output while keeping original receipt bytes, bounds the producer queue and live/retained guest output to 64 MiB per stream, and applies a 24-hour fail-safe deadline to both initial and resumed commands; truncation and timeout are explicit.
 - Derives a canonical run-input identity from the actual snapshot, resolved image, command, resource/network policy, captures, ignore rules, backend, and AgentLab version.
 - Supports concurrent independent runs and verifies exact repetitions or reports which real controlled inputs differ.
 - Retains a stable container supervisor so stop/start never reruns the original agent command.
-- Supports integrity-checked harness continuation from the exact filesystem, while explicitly reporting that process memory was not restored.
-- Creates independent filesystem-level forks and deletes only the selected run's owned container, image tag, and local artifacts.
+- Supports integrity-checked harness continuation from the exact filesystem, while explicitly reporting that process memory was not restored. Result rootfs, Docker diff, and requested captures are taken from one stopped container state, so background processes cannot mutate evidence during capture.
+- Serializes each run's stop, resume, continuation, fork, and removal operations; creates independent filesystem-level forks from one quiesced commit whose stopped child is also the recorded portable base; and deletes only the selected run's owned container, image tag, and local artifacts.
 - Invokes arbitrary external evaluators against integrity-checked results and records their command, output, status, stdout/stderr, and named JSON observations.
 - Runs diff presenters, reviewers, and evaluators in isolated process groups with descendant cleanup, bounded output, and generous default timeouts; ordinary successful commands require no additional flags.
 - Aligns actual run-input, workspace, image, portable-base identities, and evaluator score names into Markdown or JSON rows without aggregation, ranking, statistics, or causal claims.
 - Constructs immutable base/candidate/current review bundles, exposes the original command output, structured evaluator observations, and actual changed-machine content to any trusted command-line reviewer, validates complete proposed/rejected/conflicted/unresolved dispositions and declarative environment recommendations, and records a proposal without applying it.
 - Shows elapsed review progress, retains every reviewer invocation as integrity-checked evidence, permits one constrained schema-correction attempt, and keeps rejected output inspectable without treating it as an actionable proposal.
 - Applies one review receipt only when the host workspace still exactly matches the reviewed current snapshot, requires explicit acknowledgement of conflicts or unresolved candidates, privately stages the result, retains a complete before snapshot, changes only proposed workspace operations, rolls back path-scoped failures, and verifies the exact after snapshot.
-- Performs apply mutations relative to pinned no-follow directory handles so a parent-path symlink swap cannot redirect an authorized operation outside the workspace.
+- Serializes apply by workspace identity and keeps the same pinned root and parent-directory generations from the first current-state snapshot through mutation, verification, and rollback, so a rename or parent-path symlink swap cannot redirect an authorized operation outside the workspace or make rollback target a replacement tree.
 - Records an explicit `agentlab.acceptance/v1` decision for the exact workspace snapshot, immutable OCI image, platform, and guest workspace path tested by a completed run; exit status remains evidence rather than an automatic verdict.
 - Runs directly from an accepted input without repeating workspace/image flags, preserves parent review/apply/retest lineage, excludes test-session output from the next base, and protects referenced evidence from ordinary removal.
 
-AgentLab does not attempt to make a transactionally consistent snapshot of a workspace that is being modified concurrently. It detects changes to regular files while reading them and asks the user to retry from a stable source.
+AgentLab does not freeze a mutable host workspace. It pins the selected root, never follows an intermediate or final symlink while traversing on Unix, revalidates directories and files, and fails with a retry message when concurrent mutation prevents one stable snapshot from being proven.
 
 ## Requirements
 
@@ -260,6 +260,16 @@ a file prevents AgentLab itself from persisting it; the opaque command is still
 trusted with the credential and can print or copy it. Use least-privilege,
 noninteractive credentials appropriate to the experiment.
 
+Credential injection opens a durable, command-scoped lease before the first
+byte is copied. Ctrl-C terminates the active execution, restarts the retained
+container with an empty secret tmpfs, scrubs the reserved paths, and exits 130.
+If AgentLab is killed too abruptly to clean up, the lease remains as recovery
+state rather than a false claim that cleanup succeeded. The next lifecycle
+operation on a completed run revokes that lease automatically; before opening
+any later credential lease, AgentLab also recovers crashed initial runs while
+skipping leases still held by another live AgentLab process. No extra recovery
+flag is required.
+
 The container remains running under an inert shell supervisor after the initial `docker exec` command completes. This makes later stop/start truthful: restarting the container starts only the supervisor and never reruns the original command.
 
 Launch independent runs concurrently using ordinary processes. Reuse one snapshot digest for repetitions; create a new snapshot only after making a real treatment change to the host workspace:
@@ -301,9 +311,9 @@ Manage retained filesystem state:
 ./target/release/agentlab rm RUN_OR_FORK_ID
 ```
 
-`resume RUN` restarts the same stable container when stopped. Supplying a command executes a harness-level continuation in that container, re-exports and normalizes its complete persistent root filesystem, reapplies the preserved change-ignore rules, refreshes every requested capture, and writes `agentlab.continuation/v1`. Add `--pi-auth` or repeatable `--secret-file NAME=HOST_PATH` options before the run ID when that continuation needs current host credentials. AgentLab injects them only for that command, cleans them before capture, and records only their stable names in the continuation. Newly created runs and forks reserve the private in-memory credential mount even when their initial command does not need it; older retained runs without that mount are rejected rather than receiving a credential through persistent storage. Resume reports `filesystem_state_reused: true` and `process_memory_restored: false`—filesystem continuation is real, but the previous process tree and live memory are gone.
+`resume RUN` restarts the same stable container when stopped. Supplying a command executes a harness-level continuation in that container, re-exports and normalizes its complete persistent root filesystem, reapplies the preserved change-ignore rules, refreshes every requested capture, and writes `agentlab.continuation/v1`. Initial and resumed commands share the same bounded streaming executor and 24-hour fail-safe deadline. Before authoritative result capture, AgentLab stops the container; that terminates background processes and makes the rootfs export, Docker diff, and requested captures describe one immutable moment, after which the inert supervisor is restarted. Add `--pi-auth` or repeatable `--secret-file NAME=HOST_PATH` options before the run ID when that continuation needs current host credentials. AgentLab injects them only for that command, cleans them before capture, and records only their stable names in the continuation. Newly created runs and forks reserve the private in-memory credential mount even when their initial command does not need it; older retained runs without that mount are rejected rather than receiving a credential through persistent storage. Resume reports `filesystem_state_reused: true` and `process_memory_restored: false`—filesystem continuation is real, but the previous process tree and live memory are gone. Mutating lifecycle commands for one run are serialized; a concurrent command fails clearly instead of racing the same container.
 
-`fork` commits the selected retained filesystem, exports it as the fork's portable base, and launches a separately owned stable container. Its `agentlab.fork/v1` record reports `filesystem_state_copied: true` and `process_memory_copied: false`. Forks can themselves be stopped, resumed, continued, inspected, and removed.
+`fork` stops the selected parent, commits that one filesystem state, creates a separately owned stopped child from the commit, and exports that child as the fork's portable base before starting it. The child therefore starts from the same bytes named by its base digest. The parent's prior running/stopped state is preserved. Its `agentlab.fork/v1` record reports `filesystem_state_copied: true` and `process_memory_copied: false`. Forks can themselves be stopped, resumed, continued, inspected, and removed.
 
 Lifecycle operations require runs created by a lifecycle-capable AgentLab build. `list` marks older retained containers as `legacy`, and mutating commands reject them rather than risking rerunning their original command.
 
@@ -436,7 +446,7 @@ agentlab apply \
   --acknowledge-unresolved
 ```
 
-Those flags do not apply conflicted or unresolved paths; they authorize AgentLab to continue with only the proposal's `proposed` workspace operations. Rejected paths and all environment paths remain untouched. AgentLab permits one accepted apply per review, privately stages the exact intended result, takes a complete content-addressed before snapshot, serializes concurrent attempts, and performs each exact mutation through pinned workspace directory handles that never follow parent symlinks. It does not recursively delete unreviewed directory content, verifies the resulting snapshot, and records `agentlab.apply/v1`. If a path-scoped operation fails, AgentLab attempts to restore every authorized path from the before snapshot. An interrupted apply leaves an exclusive lock and backup evidence so a later invocation does not guess whether it is safe to continue.
+Those flags do not apply conflicted or unresolved paths; they authorize AgentLab to continue with only the proposal's `proposed` workspace operations. Rejected paths and all environment paths remain untouched. AgentLab permits one accepted apply per review, privately stages the exact intended result, takes a complete content-addressed before snapshot, and serializes different reviews that target the same workspace. It pins the workspace generation before the first current-state snapshot, pre-opens authorized parent generations, and uses those same handles for mutation, final verification, and rollback. It does not recursively delete unreviewed directory content, verifies the resulting snapshot and root reachability, and records `agentlab.apply/v1`. If a path-scoped operation fails, AgentLab attempts to restore every authorized path from the before snapshot through those same handles. Immediately before mutation it writes a workspace-scoped transaction marker naming the review and backup; successful verification or successful rollback clears it. A crash or failed rollback leaves that marker (and the per-review recovery evidence) so every later review is blocked from touching the workspace until the recorded backup state is inspected.
 
 The current human output deliberately emphasizes disposition, reason, operation, path, and exact snapshot identity. A polished terminal diff remains planned: it should offer an excellent unified or side-by-side view over immutable base/candidate/current and before/after content, with color and binary/type/mode handling. That renderer will be a read-only view; review receipts—not presentation output—remain the authority for apply.
 

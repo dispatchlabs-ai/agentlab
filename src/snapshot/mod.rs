@@ -4,8 +4,14 @@ mod materialize;
 pub use materialize::materialize;
 
 use std::collections::HashSet;
-use std::fs::{self, File, FileType, Metadata, OpenOptions};
-use std::path::{Component, Path, PathBuf};
+#[cfg(any(not(unix), test))]
+use std::fs::OpenOptions;
+use std::fs::{self, File, FileType, Metadata};
+#[cfg(unix)]
+use std::os::fd::{AsFd, OwnedFd};
+#[cfg(not(unix))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
@@ -101,6 +107,7 @@ pub(crate) enum CandidateKind {
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
     pub path: String,
+    #[cfg(any(not(unix), test))]
     pub absolute: PathBuf,
     pub kind: CandidateKind,
     pub mode: u32,
@@ -116,6 +123,122 @@ pub(crate) struct Candidate {
     pub changed_nanoseconds: i64,
 }
 
+/// A workspace generation pinned for the complete duration of an operation.
+///
+/// On Unix, every snapshot read and traversal starts from this directory
+/// descriptor. The canonical pathname is retained only for display, Git
+/// discovery, and a reachability check; it is never used to open captured
+/// content.
+pub(crate) struct PinnedWorkspace {
+    path: PathBuf,
+    #[cfg(unix)]
+    root: OwnedFd,
+}
+
+impl PinnedWorkspace {
+    pub(crate) fn open(workspace: &Path) -> Result<Self> {
+        let workspace = if workspace.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            workspace
+        };
+        let absolute = if workspace.is_absolute() {
+            workspace.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("resolve current directory")?
+                .join(workspace)
+        };
+        let path = fs::canonicalize(&absolute)
+            .with_context(|| format!("resolve workspace {}", workspace.display()))?;
+        path.to_str().context("workspace path is not valid UTF-8")?;
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+
+            let root = rustix::fs::open(
+                &path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .with_context(|| {
+                format!(
+                    "open workspace root {} without following symlinks",
+                    path.display()
+                )
+            })?;
+            let pinned = Self { path, root };
+            pinned.verify_path_identity()?;
+            Ok(pinned)
+        }
+
+        #[cfg(not(unix))]
+        {
+            if !fs::metadata(&path).context("inspect workspace")?.is_dir() {
+                bail!("workspace {:?} is not a directory", workspace);
+            }
+            Ok(Self { path })
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn duplicate_root(&self) -> Result<OwnedFd> {
+        rustix::io::dup(&self.root).context("duplicate pinned workspace root")
+    }
+
+    pub(crate) fn lock_identity(&self) -> Result<String> {
+        #[cfg(unix)]
+        {
+            let metadata = metadata_for_fd(&self.root)?;
+            Ok(format!(
+                "unix-device-{}-inode-{}",
+                unix_device(&metadata),
+                unix_inode(&metadata)
+            ))
+        }
+
+        #[cfg(not(unix))]
+        Ok(format!("path-{}", self.path.display()))
+    }
+
+    /// Prove that the selected pathname still names the pinned directory
+    /// generation. This deliberately checks identity, not timestamps: apply
+    /// is allowed to change the pinned directory's contents.
+    pub(crate) fn verify_path_identity(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let open = metadata_for_fd(&self.root)?;
+            let visible = fs::symlink_metadata(&self.path)
+                .with_context(|| format!("reinspect workspace root {}", self.path.display()))?;
+            if !visible.file_type().is_dir()
+                || unix_device(&open) != unix_device(&visible)
+                || unix_inode(&open) != unix_inode(&visible)
+            {
+                bail!(
+                    "workspace root {} was renamed or replaced during the operation",
+                    self.path.display()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        if !fs::metadata(&self.path)
+            .with_context(|| format!("reinspect workspace root {}", self.path.display()))?
+            .is_dir()
+        {
+            bail!(
+                "workspace root {} is no longer a directory",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn create(workspace: &Path, store: &Store) -> Result<SnapshotResult> {
     create_with_mode(workspace, store, CaptureMode::All)
 }
@@ -125,7 +248,16 @@ pub fn create_with_mode(
     store: &Store,
     capture_mode: CaptureMode,
 ) -> Result<SnapshotResult> {
-    let (root, candidates) = scan(workspace)?;
+    let source = PinnedWorkspace::open(workspace)?;
+    create_from_pinned(&source, store, capture_mode)
+}
+
+pub(crate) fn create_from_pinned(
+    source: &PinnedWorkspace,
+    store: &Store,
+    capture_mode: CaptureMode,
+) -> Result<SnapshotResult> {
+    let (root, candidates, root_candidate) = scan(source)?;
     let discovery = ignore::discover_repositories(&root, &candidates);
     let ignored = match capture_mode {
         CaptureMode::RespectGitignore => {
@@ -134,7 +266,9 @@ pub fn create_with_mode(
         CaptureMode::All => HashSet::new(),
     };
     let (ignore_rules, ignore_rules_digest) = match capture_mode {
-        CaptureMode::RespectGitignore => ignore::active_ignore_rules(&candidates, &ignored)?,
+        CaptureMode::RespectGitignore => {
+            ignore::active_ignore_rules(source, &candidates, &ignored)?
+        }
         CaptureMode::All => {
             let rules = Vec::new();
             let digest = ignore::ignore_rules_digest(&rules);
@@ -199,17 +333,15 @@ pub fn create_with_mode(
         match candidate.kind {
             CandidateKind::File => {
                 entry.kind = "file".to_string();
-                let mut source = open_stable_candidate(candidate)?;
+                let mut source_file = source.open_stable_candidate(candidate)?;
                 let stored = store
-                    .put_reader(&mut source)
+                    .put_reader(&mut source_file)
                     .with_context(|| format!("capture file {:?}", candidate.path))?;
-                let opened_after = source
+                let opened_after = source_file
                     .metadata()
                     .with_context(|| format!("reinspect open file {:?}", candidate.path))?;
-                let path_after = fs::symlink_metadata(&candidate.absolute)
-                    .with_context(|| format!("reinspect file path {:?}", candidate.path))?;
                 if !file_metadata_unchanged(candidate, &opened_after)
-                    || !file_metadata_unchanged(candidate, &path_after)
+                    || !source.path_entry_unchanged(candidate)?
                 {
                     bail!(
                         "workspace changed while snapshotting {:?}; retry from a stable source",
@@ -225,20 +357,13 @@ pub fn create_with_mode(
                     result.reused_blobs += 1;
                 }
             }
-            CandidateKind::Directory => entry.kind = "directory".to_string(),
+            CandidateKind::Directory => {
+                source.verify_directory(candidate)?;
+                entry.kind = "directory".to_string();
+            }
             CandidateKind::Symlink => {
                 entry.kind = "symlink".to_string();
-                let target = fs::read_link(&candidate.absolute)
-                    .with_context(|| format!("read symlink {:?}", candidate.path))?;
-                entry.link_target = target
-                    .to_str()
-                    .with_context(|| {
-                        format!(
-                            "symlink target for {:?} is not valid UTF-8 and cannot be represented by snapshot schema {SCHEMA_VERSION}",
-                            candidate.path
-                        )
-                    })?
-                    .to_string();
+                entry.link_target = source.read_stable_link(candidate)?;
             }
             CandidateKind::Special => bail!(
                 "unsupported special file {:?} with mode {:o}; special files are never silently omitted",
@@ -248,6 +373,8 @@ pub fn create_with_mode(
         }
         entries.push(entry);
     }
+    source.verify_directory(&root_candidate)?;
+    source.verify_path_identity()?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     let identity = IdentityDocument {
@@ -327,32 +454,155 @@ pub fn verify(store: &Store, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn scan(workspace: &Path) -> Result<(PathBuf, Vec<Candidate>)> {
-    let workspace = if workspace.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        workspace
-    };
-    let absolute = if workspace.is_absolute() {
-        workspace.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolve current directory")?
-            .join(workspace)
-    };
-    let root = fs::canonicalize(&absolute)
-        .with_context(|| format!("resolve workspace {}", workspace.display()))?;
-    root.to_str().context("workspace path is not valid UTF-8")?;
-    if !fs::metadata(&root).context("inspect workspace")?.is_dir() {
-        bail!("workspace {:?} is not a directory", workspace);
+fn scan(source: &PinnedWorkspace) -> Result<(PathBuf, Vec<Candidate>, Candidate)> {
+    #[cfg(unix)]
+    {
+        let root_metadata = metadata_for_fd(&source.root)?;
+        let root_candidate = candidate_from_open_metadata(
+            ".".to_owned(),
+            source.path.clone(),
+            CandidateKind::Directory,
+            &root_metadata,
+        );
+        let mut candidates = Vec::new();
+        scan_directory_descriptor(source, &source.root, "", &mut candidates)?;
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok((source.path.clone(), candidates, root_candidate))
     }
-    let mut candidates = Vec::new();
-    scan_directory(&root, &root, &mut candidates)?;
-    candidates.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok((root, candidates))
+
+    #[cfg(not(unix))]
+    {
+        let mut candidates = Vec::new();
+        scan_directory_path(&source.path, &source.path, &mut candidates)?;
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        let metadata = fs::metadata(&source.path).context("inspect workspace")?;
+        let root_candidate = candidate_from_open_metadata(
+            ".".to_owned(),
+            source.path.clone(),
+            CandidateKind::Directory,
+            &metadata,
+        );
+        Ok((source.path.clone(), candidates, root_candidate))
+    }
 }
 
-fn scan_directory(root: &Path, directory: &Path, candidates: &mut Vec<Candidate>) -> Result<()> {
+#[cfg(unix)]
+fn scan_directory_descriptor(
+    source: &PinnedWorkspace,
+    directory: &impl AsFd,
+    prefix: &str,
+    candidates: &mut Vec<Candidate>,
+) -> Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType as RustixFileType, Mode, OFlags};
+
+    let mut names = Vec::new();
+    let entries = Dir::read_from(directory).with_context(|| {
+        format!(
+            "walk pinned workspace directory {:?}",
+            if prefix.is_empty() { "." } else { prefix }
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.context("read pinned workspace directory entry")?;
+        let bytes = entry.file_name().to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        let name = std::str::from_utf8(bytes).with_context(|| {
+            format!(
+                "workspace path is not valid UTF-8 and cannot be represented by snapshot schema {SCHEMA_VERSION}"
+            )
+        })?;
+        names.push(name.to_owned());
+    }
+    names.sort();
+
+    for name in names {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let stat = rustix::fs::statat(directory, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .with_context(|| format!("inspect pinned workspace path {path:?}"))?;
+        let kind = match RustixFileType::from_raw_mode(stat.st_mode as _) {
+            RustixFileType::RegularFile => CandidateKind::File,
+            RustixFileType::Directory => CandidateKind::Directory,
+            RustixFileType::Symlink => CandidateKind::Symlink,
+            _ => CandidateKind::Special,
+        };
+        let absolute = source.path.join(path.split('/').collect::<PathBuf>());
+
+        match kind {
+            CandidateKind::File => {
+                let descriptor = rustix::fs::openat(
+                    directory,
+                    name.as_str(),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .with_context(|| format!("open pinned workspace file {path:?}"))?;
+                let metadata = metadata_for_fd(&descriptor)?;
+                let candidate =
+                    candidate_from_open_metadata(path, absolute, CandidateKind::File, &metadata);
+                if !stat_matches_candidate(&stat, &candidate) {
+                    bail!(
+                        "workspace changed while scanning {:?}; retry from a stable source",
+                        candidate.path
+                    );
+                }
+                candidates.push(candidate);
+            }
+            CandidateKind::Directory => {
+                let descriptor = rustix::fs::openat(
+                    directory,
+                    name.as_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .with_context(|| format!("open pinned workspace directory {path:?}"))?;
+                let metadata = metadata_for_fd(&descriptor)?;
+                let candidate = candidate_from_open_metadata(
+                    path.clone(),
+                    absolute,
+                    CandidateKind::Directory,
+                    &metadata,
+                );
+                if !stat_matches_candidate(&stat, &candidate) {
+                    bail!(
+                        "workspace changed while scanning {:?}; retry from a stable source",
+                        candidate.path
+                    );
+                }
+                candidates.push(candidate.clone());
+                scan_directory_descriptor(source, &descriptor, &path, candidates)?;
+                let opened_after = metadata_for_fd(&descriptor)?;
+                let visible_after =
+                    rustix::fs::statat(directory, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                        .with_context(|| format!("reinspect workspace directory {path:?}"))?;
+                if !file_metadata_unchanged(&candidate, &opened_after)
+                    || !stat_matches_candidate(&visible_after, &candidate)
+                {
+                    bail!(
+                        "workspace changed while scanning {:?}; retry from a stable source",
+                        candidate.path
+                    );
+                }
+            }
+            CandidateKind::Symlink | CandidateKind::Special => {
+                candidates.push(candidate_from_stat(path, absolute, kind, &stat)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn scan_directory_path(
+    root: &Path,
+    directory: &Path,
+    candidates: &mut Vec<Candidate>,
+) -> Result<()> {
     let mut children: Vec<_> = fs::read_dir(directory)
         .with_context(|| format!("walk workspace directory {}", directory.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
@@ -366,29 +616,20 @@ fn scan_directory(root: &Path, directory: &Path, candidates: &mut Vec<Candidate>
             .context("compute workspace-relative path")?;
         let path = slash_path(relative)?;
         let kind = candidate_from_metadata(&metadata);
-        candidates.push(Candidate {
+        candidates.push(candidate_from_open_metadata(
             path,
-            absolute: absolute.clone(),
+            absolute.clone(),
             kind,
-            mode: portable_mode(&metadata),
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: unix_device(&metadata),
-            #[cfg(unix)]
-            inode: unix_inode(&metadata),
-            #[cfg(unix)]
-            changed_seconds: unix_changed_seconds(&metadata),
-            #[cfg(unix)]
-            changed_nanoseconds: unix_changed_nanoseconds(&metadata),
-        });
+            &metadata,
+        ));
         if kind == CandidateKind::Directory {
-            scan_directory(root, &absolute, candidates)?;
+            scan_directory_path(root, &absolute, candidates)?;
         }
     }
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn slash_path(path: &Path) -> Result<String> {
     let mut pieces = Vec::new();
     for component in path.components() {
@@ -422,6 +663,70 @@ fn candidate_from_metadata(metadata: &Metadata) -> CandidateKind {
     }
 }
 
+fn candidate_from_open_metadata(
+    path: String,
+    _absolute: PathBuf,
+    kind: CandidateKind,
+    metadata: &Metadata,
+) -> Candidate {
+    Candidate {
+        path,
+        #[cfg(any(not(unix), test))]
+        absolute: _absolute,
+        kind,
+        mode: portable_mode(metadata),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: unix_device(metadata),
+        #[cfg(unix)]
+        inode: unix_inode(metadata),
+        #[cfg(unix)]
+        changed_seconds: unix_changed_seconds(metadata),
+        #[cfg(unix)]
+        changed_nanoseconds: unix_changed_nanoseconds(metadata),
+    }
+}
+
+#[cfg(unix)]
+fn candidate_from_stat(
+    path: String,
+    _absolute: PathBuf,
+    kind: CandidateKind,
+    stat: &rustix::fs::Stat,
+) -> Result<Candidate> {
+    Ok(Candidate {
+        path,
+        #[cfg(test)]
+        absolute: _absolute,
+        kind,
+        mode: (stat.st_mode as u32) & 0o7777,
+        size: u64::try_from(stat.st_size).context("workspace entry has negative size")?,
+        modified: None,
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+        changed_seconds: 0,
+        changed_nanoseconds: 0,
+    })
+}
+
+#[cfg(unix)]
+fn stat_matches_candidate(stat: &rustix::fs::Stat, candidate: &Candidate) -> bool {
+    use rustix::fs::FileType as RustixFileType;
+
+    let kind = match RustixFileType::from_raw_mode(stat.st_mode as _) {
+        RustixFileType::RegularFile => CandidateKind::File,
+        RustixFileType::Directory => CandidateKind::Directory,
+        RustixFileType::Symlink => CandidateKind::Symlink,
+        _ => CandidateKind::Special,
+    };
+    kind == candidate.kind
+        && ((stat.st_mode as u32) & 0o7777) == candidate.mode
+        && u64::try_from(stat.st_size).ok() == Some(candidate.size)
+        && stat.st_dev as u64 == candidate.device
+        && stat.st_ino == candidate.inode
+}
+
 fn file_metadata_unchanged(candidate: &Candidate, after: &Metadata) -> bool {
     let portable = candidate_from_metadata(after) == candidate.kind
         && portable_mode(after) == candidate.mode
@@ -441,6 +746,7 @@ fn file_metadata_unchanged(candidate: &Candidate, after: &Metadata) -> bool {
     }
 }
 
+#[cfg(any(not(unix), test))]
 fn open_stable_candidate(candidate: &Candidate) -> Result<File> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -465,6 +771,186 @@ fn open_stable_candidate(candidate: &Candidate) -> Result<File> {
         );
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn metadata_for_fd(fd: &impl AsFd) -> Result<Metadata> {
+    let duplicate = rustix::io::dup(fd).context("duplicate filesystem descriptor")?;
+    File::from(duplicate)
+        .metadata()
+        .context("inspect pinned filesystem descriptor")
+}
+
+impl PinnedWorkspace {
+    #[cfg(unix)]
+    fn open_parent(&self, relative: &str) -> Result<(OwnedFd, String)> {
+        use rustix::fs::{Mode, OFlags};
+
+        validate_relative_path(relative)?;
+        let mut components: Vec<_> = relative.split('/').collect();
+        let name = components
+            .pop()
+            .context("validated workspace path has no final component")?
+            .to_owned();
+        let mut directory = self.duplicate_root()?;
+        for component in components {
+            directory = rustix::fs::openat(
+                &directory,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .with_context(|| {
+                format!(
+                    "open workspace ancestor {component:?} for {relative:?} without following symlinks"
+                )
+            })?;
+        }
+        Ok((directory, name))
+    }
+
+    fn open_stable_candidate(&self, candidate: &Candidate) -> Result<File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+
+            let (parent, name) = self.open_parent(&candidate.path)?;
+            let descriptor = rustix::fs::openat(
+                &parent,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .with_context(|| {
+                format!(
+                    "open workspace file {:?} through the pinned root",
+                    candidate.path
+                )
+            })?;
+            let file = File::from(descriptor);
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect open workspace file {:?}", candidate.path))?;
+            if !file_metadata_unchanged(candidate, &metadata) {
+                bail!(
+                    "workspace changed before snapshotting {:?}; retry from a stable source",
+                    candidate.path
+                );
+            }
+            Ok(file)
+        }
+
+        #[cfg(not(unix))]
+        open_stable_candidate(candidate)
+    }
+
+    fn path_entry_unchanged(&self, candidate: &Candidate) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::AtFlags;
+            let (parent, name) = self.open_parent(&candidate.path)?;
+            let stat = rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                .with_context(|| format!("reinspect workspace path {:?}", candidate.path))?;
+            Ok(stat_matches_candidate(&stat, candidate))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::symlink_metadata(&candidate.absolute)
+                .with_context(|| format!("reinspect workspace path {:?}", candidate.path))?;
+            Ok(file_metadata_unchanged(candidate, &metadata))
+        }
+    }
+
+    fn verify_directory(&self, candidate: &Candidate) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+
+            let descriptor = if candidate.path == "." {
+                self.duplicate_root()?
+            } else {
+                let (parent, name) = self.open_parent(&candidate.path)?;
+                rustix::fs::openat(
+                    &parent,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .with_context(|| format!("reopen workspace directory {:?}", candidate.path))?
+            };
+            let metadata = metadata_for_fd(&descriptor)?;
+            if !file_metadata_unchanged(candidate, &metadata)
+                || (candidate.path != "." && !self.path_entry_unchanged(candidate)?)
+            {
+                bail!(
+                    "workspace changed while snapshotting {:?}; retry from a stable source",
+                    candidate.path
+                );
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::metadata(&candidate.absolute)
+                .with_context(|| format!("reinspect workspace directory {:?}", candidate.path))?;
+            if !file_metadata_unchanged(candidate, &metadata) {
+                bail!(
+                    "workspace changed while snapshotting {:?}; retry from a stable source",
+                    candidate.path
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn read_stable_link(&self, candidate: &Candidate) -> Result<String> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::AtFlags;
+
+            let (parent, name) = self.open_parent(&candidate.path)?;
+            let before = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .with_context(|| format!("inspect symlink {:?}", candidate.path))?;
+            if !stat_matches_candidate(&before, candidate) {
+                bail!(
+                    "workspace changed before snapshotting {:?}; retry from a stable source",
+                    candidate.path
+                );
+            }
+            let target = rustix::fs::readlinkat(&parent, &name, Vec::new())
+                .with_context(|| format!("read symlink {:?}", candidate.path))?;
+            let after = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .with_context(|| format!("reinspect symlink {:?}", candidate.path))?;
+            if !stat_matches_candidate(&after, candidate) {
+                bail!(
+                    "workspace changed while snapshotting {:?}; retry from a stable source",
+                    candidate.path
+                );
+            }
+            String::from_utf8(target.into_bytes()).with_context(|| {
+                format!(
+                    "symlink target for {:?} is not valid UTF-8 and cannot be represented by snapshot schema {SCHEMA_VERSION}",
+                    candidate.path
+                )
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let target = fs::read_link(&candidate.absolute)
+                .with_context(|| format!("read symlink {:?}", candidate.path))?;
+            target
+                .to_str()
+                .with_context(|| {
+                    format!(
+                        "symlink target for {:?} is not valid UTF-8 and cannot be represented by snapshot schema {SCHEMA_VERSION}",
+                        candidate.path
+                    )
+                })
+                .map(ToOwned::to_owned)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -670,5 +1156,36 @@ mod tests {
         fs::remove_file(&path).unwrap();
         symlink(&outside, &path).unwrap();
         assert!(open_stable_candidate(&candidate).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_workspace_never_follows_a_replaced_intermediate_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(workspace.join("parent")).unwrap();
+        fs::write(workspace.join("parent/file"), b"inside").unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), b"outside-secret").unwrap();
+
+        let pinned = PinnedWorkspace::open(&workspace).unwrap();
+        let (_, candidates, _) = scan(&pinned).unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.path == "parent/file")
+            .unwrap();
+
+        fs::rename(workspace.join("parent"), workspace.join("original-parent")).unwrap();
+        symlink(&outside, workspace.join("parent")).unwrap();
+
+        let error = pinned.open_stable_candidate(candidate).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("without following symlinks"),
+            "unexpected error: {error:#}"
+        );
     }
 }

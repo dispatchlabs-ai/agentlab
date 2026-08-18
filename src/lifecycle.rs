@@ -10,6 +10,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::acceptance;
+use crate::lock::AdvisoryLock;
 use crate::rootfs::{self, RootFsManifest};
 use crate::run::{
     self, Artifact, CaptureSpec, IgnoreIdentity, ResourceLimits, RunResult, RunSpec, SecretFileSpec,
@@ -272,7 +273,9 @@ pub fn inspect(store: &Store, run_id: &str, verify: bool) -> Result<ManagedRun> 
 }
 
 pub fn stop(store: &Store, run_id: &str) -> Result<ManagedRun> {
+    let _lock = acquire_run_lock(store, run_id)?;
     let subject = load_subject(store, run_id)?;
+    run::recover_interrupted_secret_lease(store, run_id, &subject.container_name)?;
     let inspect = assert_owned_container(&subject)?;
     let (_, state) = run::container_status(&inspect)?;
     if state == "running" {
@@ -307,11 +310,14 @@ pub fn resume_with_secrets(
     pi_auth: Option<&Path>,
     secret_files: &[SecretFileSpec],
 ) -> Result<ResumeSummary> {
+    let _lock = acquire_run_lock(store, run_id)?;
     let subject = load_subject(store, run_id)?;
+    let recovered_credential_lease =
+        run::recover_interrupted_secret_lease(store, run_id, &subject.container_name)?;
     let inspect = assert_owned_container(&subject)?;
     let (_, state) = run::container_status(&inspect)?;
-    let restarted = state != "running";
-    if restarted {
+    let restarted = recovered_credential_lease || state != "running";
+    if state != "running" {
         run::docker_status(
             Command::new("docker").args(["start", &subject.container_name]),
             "restart retained run container",
@@ -345,7 +351,9 @@ pub fn resume_with_secrets(
 }
 
 pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
+    let _lock = acquire_run_lock(store, parent_run_id)?;
     let parent = load_subject(store, parent_run_id)?;
+    run::recover_interrupted_secret_lease(store, parent_run_id, &parent.container_name)?;
     assert_owned_container(&parent)?;
     let run_id = Uuid::new_v4().to_string();
     let directory = store.create_run_directory(&run_id)?;
@@ -361,28 +369,13 @@ pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
         armed: true,
     };
 
-    let export_path = directory.join("artifacts/base-rootfs.tar");
-    run::docker_status(
-        Command::new("docker").args([
-            "export",
-            "--output",
-            export_path.to_str().context("fork path is not UTF-8")?,
-            &parent.container_name,
-        ]),
-        "export retained filesystem for fork base",
-    )?;
-    let base_manifest = rootfs::scan_export(&export_path)?;
-    let required_blob_paths =
-        run::required_result_file_paths(&base_manifest, &[], &parent.workspace_guest_path);
-    rootfs::store_required_file_blobs(&export_path, &base_manifest, &required_blob_paths, store)?;
-    let base_manifest_bytes = run::pretty_json(&base_manifest)?;
-    store.write_run_file(&run_id, "base-rootfs.json", &base_manifest_bytes)?;
-    let base_export = run::artifact_for_file("artifacts/base-rootfs.tar", &export_path)?;
-
+    let mut parent_quiesced = run::quiesce_container(&parent.container_name)?;
     let image_id = run::docker_success(
         Command::new("docker").args(["commit", &parent.container_name, &image_tag]),
-        "commit retained filesystem for fork",
+        "commit one quiesced filesystem state for fork",
     )?;
+    parent_quiesced.restart()?;
+
     let mut create = Command::new("docker");
     create
         .args(["create", "--name", &container_name])
@@ -408,6 +401,28 @@ pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
         "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
     ]);
     let container_id = run::docker_success(&mut create, "create filesystem fork container")?;
+
+    // Export the stopped child created from the committed image. The bytes
+    // described by the fork manifest are therefore the exact bytes the child
+    // will start from, not an earlier export of a live parent.
+    let export_path = directory.join("artifacts/base-rootfs.tar");
+    run::docker_status(
+        Command::new("docker").args([
+            "export",
+            "--output",
+            export_path.to_str().context("fork path is not UTF-8")?,
+            &container_name,
+        ]),
+        "export immutable filesystem fork base",
+    )?;
+    let base_manifest = rootfs::scan_export(&export_path)?;
+    let required_blob_paths =
+        run::required_result_file_paths(&base_manifest, &[], &parent.workspace_guest_path);
+    rootfs::store_required_file_blobs(&export_path, &base_manifest, &required_blob_paths, store)?;
+    let base_manifest_bytes = run::pretty_json(&base_manifest)?;
+    store.write_run_file(&run_id, "base-rootfs.json", &base_manifest_bytes)?;
+    let base_export = run::artifact_for_file("artifacts/base-rootfs.tar", &export_path)?;
+
     run::docker_status(
         Command::new("docker").args(["start", &container_name]),
         "start filesystem fork container",
@@ -488,6 +503,7 @@ pub fn fork(store: &Store, parent_run_id: &str) -> Result<ForkRecord> {
 }
 
 pub fn remove(store: &Store, run_id: &str) -> Result<RemovalSummary> {
+    let _lock = acquire_run_lock(store, run_id)?;
     let acceptances = acceptance::referencing_run(store, run_id)?;
     if !acceptances.is_empty() {
         bail!(
@@ -510,6 +526,11 @@ pub fn remove(store: &Store, run_id: &str) -> Result<RemovalSummary> {
         image_tag: subject.image_tag,
         run_directory_removed: true,
     })
+}
+
+fn acquire_run_lock(store: &Store, run_id: &str) -> Result<AdvisoryLock> {
+    let path = store.run_path(run_id, "operation.lock")?;
+    AdvisoryLock::acquire(&path, &format!("AgentLab lifecycle for run {run_id}"))
 }
 
 pub fn load_fork(store: &Store, run_id: &str) -> Result<ForkRecord> {
@@ -687,6 +708,24 @@ fn execute_continuation(
     if pi_auth.is_some() || !secret_files.is_empty() {
         run::ensure_pi_auth_tmpfs(&assert_owned_container(subject)?)?;
     }
+    let mut secret_names: Vec<_> = secret_files
+        .iter()
+        .map(|secret| secret.name.clone())
+        .collect();
+    if pi_auth.is_some() {
+        secret_names.push(run::PI_AUTH_SECRET_NAME.to_owned());
+    }
+    let mut runtime_secret_lease = if secret_names.is_empty() {
+        None
+    } else {
+        Some(run::RuntimeSecretLease::begin(
+            store,
+            &subject.run_id,
+            &subject.container_name,
+            secret_names,
+            Some(prefix.clone()),
+        )?)
+    };
     let mut secret_file_guard = if secret_files.is_empty() {
         None
     } else {
@@ -700,18 +739,41 @@ fn execute_continuation(
     } else {
         None
     };
-    let output = Command::new("docker")
-        .args(["exec", &subject.container_name])
-        .args(command)
-        .output()
-        .context("execute harness continuation")?;
+    let output = run::execute_guest_command(
+        &subject.container_name,
+        command,
+        &mut run::SilentRunObserver,
+    );
+    if output
+        .as_ref()
+        .is_ok_and(|output| output.cancelled || output.timed_out)
+    {
+        run::docker_status(
+            Command::new("docker").args(["stop", "--time", "1", &subject.container_name]),
+            "stop retained container after interrupted continuation",
+        )?;
+        run::docker_status(
+            Command::new("docker").args(["start", &subject.container_name]),
+            "restart retained container with empty runtime memory",
+        )?;
+    }
     if let Some(guard) = &mut pi_auth_guard {
         guard.cleanup()?;
     }
     if let Some(guard) = &mut secret_file_guard {
         guard.cleanup()?;
     }
-    let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
+    if let Some(lease) = &mut runtime_secret_lease {
+        lease.complete()?;
+    }
+    let output = output?;
+    if output.cancelled {
+        if runtime_secret_lease.is_some() {
+            bail!("continuation interrupted; runtime credentials were revoked");
+        }
+        bail!("continuation interrupted");
+    }
+    let exit_code = output.exit_code;
     let mut secret_injections: Vec<_> = secret_files
         .iter()
         .map(|secret| secret.name.clone())
@@ -724,15 +786,16 @@ fn execute_continuation(
         store,
         &subject.run_id,
         &format!("{prefix}/artifacts/stdout.bin"),
-        &output.stdout,
+        &output.stdout.bytes,
     )?;
     let stderr = write_bytes_artifact(
         store,
         &subject.run_id,
         &format!("{prefix}/artifacts/stderr.bin"),
-        &output.stderr,
+        &output.stderr.bytes,
     )?;
 
+    let mut quiesced = run::quiesce_container(&subject.container_name)?;
     let result_export_path = directory.join("artifacts/result-rootfs.tar");
     run::docker_status(
         Command::new("docker").args([
@@ -745,6 +808,12 @@ fn execute_continuation(
         ]),
         "export continued root filesystem",
     )?;
+    let diff_bytes = run::docker_output_bytes(
+        Command::new("docker").args(["diff", &subject.container_name]),
+        "collect continued Docker diff",
+    )?;
+    let captures = export_captures(store, subject, &prefix)?;
+    quiesced.restart()?;
     let result_manifest = rootfs::scan_export(&result_export_path)?;
     let result_manifest_bytes = run::pretty_json(&result_manifest)?;
     store.write_run_file(
@@ -817,7 +886,6 @@ fn execute_continuation(
         &format!("{prefix}/delta.json"),
         &portable_delta_bytes,
     )?;
-    let captures = export_captures(store, subject, &prefix)?;
     let inspect_bytes = assert_owned_container(subject)?;
     let (_, state) = run::container_status(&inspect_bytes)?;
     let inspect_artifact = write_bytes_artifact(
@@ -825,10 +893,6 @@ fn execute_continuation(
         &subject.run_id,
         &format!("{prefix}/evidence/container-inspect.json"),
         &inspect_bytes,
-    )?;
-    let diff_bytes = run::docker_output_bytes(
-        Command::new("docker").args(["diff", &subject.container_name]),
-        "collect continued Docker diff",
     )?;
     let diff_artifact = write_bytes_artifact(
         store,
@@ -841,10 +905,32 @@ fn execute_continuation(
         &result_export_path,
     )?;
     let completed_at = Utc::now();
-    let warnings = vec![
+    let mut warnings = vec![
         "filesystem state was reused; the prior process tree and live memory were not restored"
             .to_owned(),
+        "the container was quiesced before result capture; background processes were terminated"
+            .to_owned(),
     ];
+    if output.stdout.truncated {
+        warnings.push(format!(
+            "continuation stdout exceeded {} bytes ({} bytes received); retained output is truncated",
+            crate::process::MAX_RUN_OUTPUT_BYTES,
+            output.stdout.total_bytes
+        ));
+    }
+    if output.stderr.truncated {
+        warnings.push(format!(
+            "continuation stderr exceeded {} bytes ({} bytes received); retained output is truncated",
+            crate::process::MAX_RUN_OUTPUT_BYTES,
+            output.stderr.total_bytes
+        ));
+    }
+    if output.timed_out {
+        warnings.push(format!(
+            "continuation exceeded the automatic {} second safety timeout and was terminated",
+            crate::process::DEFAULT_GUEST_TIMEOUT_SECONDS
+        ));
+    }
     let mut integrity = BTreeMap::new();
     for artifact in [
         &stdout,

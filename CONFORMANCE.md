@@ -46,6 +46,7 @@ The test proves both default complete capture and explicit Git-ignore filtering:
 13. Direct `run` and `evaluate` help succeeds without a command separator, and run help declares `bridge` as the default network policy.
 14. Same-length blob corruption is detected, no blob symlink is followed, and a later verified write atomically heals a corrupt cache object.
 15. Snapshot capture pins the opened source descriptor and compares device, inode, change time, type, mode, size, and modification time before and after reading so a same-size/same-mtime substitution cannot be accepted.
+16. Descriptor-relative traversal never follows a replaced intermediate directory: a forced directory-to-outside-symlink race fails without reading the outside file.
 
 The hands-on checkpoint additionally runs the public CLI against a workspace chosen by the user, repeats the snapshot, inspects and verifies the digest, and independently confirms the source is unchanged.
 
@@ -64,6 +65,8 @@ The Docker-gated fixture uses `ubuntu:24.04`, a disposable Git workspace, and a 
 9. A file outside `/workspace` can be copied from the retained stopped container for direct inspection.
 10. Persistent root changes are distinguished from pseudo-filesystems and unobserved live process memory.
 11. A fixture Pi auth JSON is readable only while the command runs, only `pi-auth` appears in the run specification, and neither the auth path nor secret tmpfs appears in the persistent raw delta.
+12. Initial guest output uses a bounded producer queue as well as a 64 MiB retained limit; shared executor unit coverage proves truncation drains both streams and timeout kills the complete local process group and its descendants.
+13. The retained container is stopped before authoritative result rootfs, Docker diff, and requested-capture collection, then restarted under only its inert supervisor.
 
 Run the Docker-gated case explicitly:
 
@@ -118,17 +121,21 @@ cargo test --test milestone3 -- --ignored --nocapture
 
 The Docker-gated fixture creates session-like state under `/root`, requests it as a capture, and retains a stable Alpine container. It proves:
 
-1. The initial opaque command executes through Docker exec, preserves a known nonzero status, and leaves the supervisor running.
+1. The initial opaque command executes through Docker exec, preserves a known nonzero status, launches an adversarial background writer, and leaves the supervisor running after immutable capture has terminated that writer.
 2. `list` discovers the run, live Docker state, lifecycle capability, and continuation count.
 3. `stop` and `resume` preserve the complete container ID and filesystem while reporting that process memory was not preserved or restored.
 4. A continuation after another stop reads prior session state, receives a fixture Pi credential from the host-only source, updates session and workspace state, and preserves its own known nonzero exit.
-5. `agentlab.continuation/v1` records only the stable `pi-auth` injection name, captures the complete current rootfs and deltas, Docker evidence, stdout/stderr, and an updated requested session archive; the credential paths are absent after execution and from the raw persistent delta.
-6. Initial, lifecycle, and continuation integrity verification succeeds.
-7. A filesystem fork's portable base equals the parent's continued result-rootfs identity.
-8. The fork reads inherited session value `2`, changes its private copy to `3`, and leaves the parent value at `2`.
-9. Fork records and fork continuations explicitly report that filesystem state, but not process memory, was copied or restored.
-10. Deleting the fork leaves its parent and an unrelated control container untouched; deleting the parent still leaves the control container untouched.
-11. Selected run directories and unique image tags are removed while the shared content store and source workspace remain intact.
+5. `agentlab.continuation/v1` records only stable credential names, captures the complete current rootfs and deltas, Docker evidence, bounded stdout/stderr, and an updated requested session archive from one stopped state; credential paths are absent after execution and from the raw persistent delta.
+6. A simultaneous fork attempt is rejected by the run-scoped lifecycle lock before touching Docker state.
+7. Ctrl-C during a credentialed continuation returns exit 130, kills the guest execution, clears the secret tmpfs, removes the durable lease, restores the inert supervisor, and leaves no incomplete continuation.
+8. A forced host-side `SIGKILL` leaves the durable credential lease in place; the next lifecycle operation verifies ownership, stop/starts to revoke the tmpfs, scrubs persistent reserved paths, removes the lease and incomplete continuation, and preserves the requested final stopped state.
+9. A forced crash during an initial credentialed run is discovered before a later credential lease. AgentLab skips active locked leases but removes the verified orphan container, unique image tag, incomplete run state, and injected secret without a manual recovery flag.
+10. Initial, lifecycle, continuation, interruption-recovery, and credential-recovery integrity verification succeeds.
+11. A filesystem fork's portable base equals the parent's continued result-rootfs identity because both the stopped child and its recorded base derive from one quiesced commit.
+12. The fork reads inherited session value `2`, changes its private copy to `3`, and leaves the parent value at `2`.
+13. Fork records and fork continuations explicitly report that filesystem state, but not process memory, was copied or restored.
+14. Deleting the fork leaves its parent and an unrelated control container untouched; deleting the parent still leaves the control container untouched.
+15. Selected run directories and unique image tags are removed while the shared content store and source workspace remain intact.
 
 Run the case explicitly:
 
@@ -180,7 +187,9 @@ The Docker-gated fixture runs from an immutable Git workspace, creates three can
 16. A second apply using the same review receipt is rejected.
 17. Unit coverage additionally proves exact replacement/deletion while preserving unauthorized paths and successful rollback when a later path would require recursively deleting unreviewed directory content.
 18. Apply uses descriptor-relative no-follow traversal for every mutation; a forced race that renames a pinned parent and replaces its visible path with an outside symlink writes only through the original parent descriptor and never reaches the outside target.
-19. Reviewer attempts default to a 30-minute timeout, cap each stream at 16 MiB, terminate complete process groups, and retain timeout/output-limit failures as rejected attempts rather than proposals.
+19. Apply acquires a workspace-identity lock in addition to the per-review recovery lock; the same directory remains serialized across a rename, while unrelated review IDs cannot race one workspace. A simulated interrupted workspace transaction remains as a durable marker and blocks a later apply with its exact recovery path.
+20. The root generation is pinned before snapshotting and reused for mutation, verification, and rollback. A forced root rename plus replacement mutates only the original descriptor-bound generation and makes reachability verification fail rather than touching or accepting the replacement.
+21. Reviewer attempts default to a 30-minute timeout, cap each stream at 16 MiB, terminate complete process groups, and retain timeout/output-limit failures as rejected attempts rather than proposals.
 
 Run the case explicitly:
 
