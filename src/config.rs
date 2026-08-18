@@ -48,39 +48,56 @@ pub struct HarnessConfig {
 #[serde(deny_unknown_fields)]
 pub struct DiffConfig {
     #[serde(default)]
-    pub presentation: DiffPresentation,
+    pub use_agent: bool,
     #[serde(default)]
     pub harness: Option<String>,
+    #[serde(default)]
+    pub ignore: Vec<String>,
     #[serde(default = "enabled")]
     pub show_omitted_count: bool,
-    #[serde(default)]
-    pub fallback: DiffFallback,
+    // Accepted only so configurations written by the development build that
+    // immediately preceded this interface continue to load. New
+    // configurations use `use_agent`.
+    #[serde(default, rename = "presentation")]
+    legacy_presentation: Option<LegacyDiffPresentation>,
+    #[serde(default, rename = "fallback")]
+    legacy_fallback: Option<LegacyDiffFallback>,
 }
 
 impl Default for DiffConfig {
     fn default() -> Self {
         Self {
-            presentation: DiffPresentation::Complete,
+            use_agent: false,
             harness: None,
+            ignore: Vec::new(),
             show_omitted_count: true,
-            fallback: DiffFallback::Complete,
+            legacy_presentation: None,
+            legacy_fallback: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum DiffPresentation {
-    #[default]
+enum LegacyDiffPresentation {
     Complete,
     Important,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum DiffFallback {
-    #[default]
+enum LegacyDiffFallback {
     Complete,
+}
+
+impl DiffConfig {
+    pub fn use_agent(&self) -> bool {
+        match self.legacy_presentation {
+            Some(LegacyDiffPresentation::Complete) => false,
+            Some(LegacyDiffPresentation::Important) => true,
+            None => self.use_agent,
+        }
+    }
 }
 
 impl AgentLabConfig {
@@ -163,6 +180,17 @@ impl AgentLabConfig {
                 }
             }
         }
+        for pattern in &self.diff.ignore {
+            if pattern.contains(['\0', '\n', '\r']) {
+                bail!(
+                    "diff.ignore pattern {pattern:?} contains a NUL byte or newline; use one Git-compatible pattern per TOML string"
+                );
+            }
+        }
+        // Deserializing the sole legacy fallback value is sufficient
+        // validation; touching it here also makes the compatibility field an
+        // explicit part of config validation rather than inert data.
+        let _legacy_fallback = self.diff.legacy_fallback;
         Ok(())
     }
 }
@@ -201,11 +229,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_config_uses_complete_deterministic_diff() {
+    fn missing_config_uses_deterministic_diff_without_an_agent() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(Some(temporary.path())).unwrap();
         let config = AgentLabConfig::load(&store).unwrap();
-        assert_eq!(config.diff.presentation, DiffPresentation::Complete);
+        assert!(!config.diff.use_agent());
+        assert!(config.diff.ignore.is_empty());
         assert!(config.selected_harness(None).unwrap().is_none());
     }
 
@@ -227,18 +256,52 @@ command = ["claude", "--print"]
 timeout_seconds = 1200
 
 [diff]
-presentation = "important"
+use_agent = true
 harness = "careful"
+ignore = ["/tmp/cache/**", "/workspace/*.lock"]
 "#,
         )
         .unwrap();
         let config = AgentLabConfig::load(&store).unwrap();
-        assert_eq!(config.diff.presentation, DiffPresentation::Important);
+        assert!(config.diff.use_agent());
+        assert_eq!(config.diff.ignore, ["/tmp/cache/**", "/workspace/*.lock"]);
         assert_eq!(config.selected_harness(None).unwrap().unwrap().0, "careful");
         assert_eq!(
             config.selected_harness(Some("pi")).unwrap().unwrap().0,
             "pi"
         );
+    }
+
+    #[test]
+    fn immediately_preceding_diff_config_remains_readable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(temporary.path())).unwrap();
+        fs::write(
+            config_path(&store),
+            r#"
+version = 1
+
+[diff]
+presentation = "important"
+fallback = "complete"
+"#,
+        )
+        .unwrap();
+        let config = AgentLabConfig::load(&store).unwrap();
+        assert!(config.diff.use_agent());
+    }
+
+    #[test]
+    fn config_rejects_multiline_ignore_patterns() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(temporary.path())).unwrap();
+        fs::write(
+            config_path(&store),
+            "version = 1\n[diff]\nignore = [\"first\\nsecond\"]\n",
+        )
+        .unwrap();
+        let error = AgentLabConfig::load(&store).unwrap_err().to_string();
+        assert!(error.contains("one Git-compatible pattern"), "{error}");
     }
 
     #[test]

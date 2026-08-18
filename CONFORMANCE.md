@@ -77,14 +77,16 @@ Unit coverage plus the hands-on Wvains checkpoint prove:
 2. Text additions, modifications, and deletions render as unified patches; binary and metadata-only paths are never rendered as invented text.
 3. Missing historical content is explicit, while new runs preserve changed before-content for later review.
 4. Per-file bundles are content-addressed, tied to the selected raw or portable delta, retained beneath the run, and independently verified.
-5. `--complete`, `--file`, `--inventory`, `--raw`, and deterministic JSON remain available without a model.
-6. Only trusted global configuration beneath the private AgentLab state directory selects a named command-argv harness; workspace content cannot choose a host command.
-7. The generic harness receives the complete request on stdin from a private temporary working directory.
-8. The presenter prompt marks all diff content as untrusted data and asks only for relevance-oriented display.
-9. Missing commands, nonzero exits, timeouts, interrupted input, empty output, and non-UTF-8 output are recorded and fall back to the complete deterministic view.
-10. Every presentation records and verifies its run, delta and per-file identities; exact request, stdout and stderr; harness argv; prompt version; timestamps; status; and receipt digest.
-11. `agentlab inspect --verify PRESENTATION_ID` verifies a presentation without rehashing multi-gigabyte rootfs exports; `agentlab inspect --verify RUN_ID` remains the explicit full-artifact audit.
-12. The Wvains dogfood run reduced 19 complete filesystem changes through a no-tools, no-session Pi harness in 24.7 seconds while emitting immediate progress and 10-second heartbeats.
+5. `--no-agent`, `--file`, `--inventory`, `--raw`, and deterministic JSON remain available without a model; `--complete` is unnecessary because per-file evidence is the baseline.
+6. Only trusted global configuration beneath the private AgentLab state directory selects a named command-argv harness or presentation-ignore patterns; workspace content cannot choose a host command or hide evidence.
+7. Git-compatible presentation ignores and implied added-directory collapsing produce a content-addressed selection while leaving raw and portable evidence identities unchanged.
+8. `--raw` and `--file` bypass presentation ignores, structural collapsing, and agent curation.
+9. The generic harness receives only selected per-file records and aggregate hidden/collapsed counts on stdin from a private temporary working directory; exact hidden patterns, paths, and contents remain local in the receipt.
+10. The presenter prompt marks all diff content as untrusted data and asks only for relevance-oriented display.
+11. Missing commands, nonzero exits, timeouts, interrupted input, empty output, and non-UTF-8 output are recorded and fall back to the deterministic filtered selection.
+12. Every version-two presentation records and verifies its run, delta, source per-file, and presented-selection identities; config source; pattern digest and ordered patterns; exact hidden and collapsed paths; source/presented counts; selection, request, stdout and stderr artifacts; harness argv; prompt version; timestamps; status; and receipt digest. Version-one receipts remain verifiable.
+13. `agentlab inspect --verify PRESENTATION_ID` verifies a presentation without rehashing multi-gigabyte rootfs exports; `agentlab inspect --verify RUN_ID` remains the explicit full-artifact audit.
+14. The original Wvains dogfood run reduced 19 complete filesystem changes through a no-tools, no-session Pi harness in 24.7 seconds while emitting immediate progress and 10-second heartbeats. The presentation-filter checkpoint retained the same 19-change source digest, selected 9 changes, hid 5 configured paths, collapsed 5 implied directories, excluded every hidden pattern and path from the model request, completed the Pi review in 24.1 seconds, and independently verified receipt `d90cabd4-0375-4708-b58d-70dd518e570a`.
 
 ## Milestone 3: isolation and repetition
 

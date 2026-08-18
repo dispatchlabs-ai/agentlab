@@ -6,7 +6,9 @@ Run schema: `agentlab.run/v3` (`agentlab.run/v1` and `agentlab.run/v2` read comp
 Run-input schema: `agentlab.run-input/v1`
 Delta schema: `agentlab.delta/v1`
 Per-file diff schema: `agentlab.file-diffs/v1`
-Diff-presentation schema: `agentlab.diff-presentation/v1`
+Diff-selection schema: `agentlab.diff-selection/v1`
+Diff-presenter-input schema: `agentlab.diff-presenter-input/v1`
+Diff-presentation schema: `agentlab.diff-presentation/v2`
 Result schema: `agentlab.result/v1`
 Continuation schema: `agentlab.continuation/v1`
 Fork schema: `agentlab.fork/v1`
@@ -187,35 +189,59 @@ and does not weaken the authoritative path and rootfs metadata.
 New runs preserve content-addressed before-content for every changed regular
 file in addition to required result and workspace content. A per-file bundle
 re-hashes every content blob it reads, has its own canonical identity, and is
-retained beneath the run. `--complete` renders this evidence without AI;
-`--file PATH` selects exactly one record; `--inventory` preserves the concise
-path view; `--raw` alone preserves the existing unfiltered machine inventory;
-and `--json` without a presentation flag preserves the delta-manifest JSON
-contract.
+retained beneath the run. The deterministic per-file presentation is the
+baseline. `--no-agent` explicitly bypasses configured agent curation;
+`--file PATH` selects exactly one raw-evidence record regardless of ignore
+rules; `--inventory` preserves the concise path view; `--raw` renders every
+captured machine change without presentation filtering, structural collapse,
+or AI; and `--json` without explicit `--agent` or `--file` preserves the
+delta-manifest JSON contract and never invokes a model.
 
 `~/.agentlab/config.toml` is trusted host configuration and MUST NOT be loaded
 from the tested workspace. It may define named command-argv harnesses, one
-default harness, and whether the human diff presentation is `complete` or
-`important`. A harness receives the complete versioned request on standard
-input, starts in a private temporary directory, and returns human-facing UTF-8
-text on stdout. AgentLab supplies no captured workspace path or runtime secret
-file to the harness. The process still runs with the invoking host user's
-authority and normal environment; command configuration is therefore a trust
-decision, not a sandbox boundary.
+default harness, whether normal diff presentation uses that agent, and an
+ordered array of Git-compatible presentation-ignore patterns. These patterns
+MUST affect neither raw nor portable delta identity and MUST be applied before
+any selected content is sent to a harness. AgentLab MUST also deterministically
+collapse an added directory record when an added descendant already accounts
+for it in normal presentation. `--raw` and `--file` bypass both behaviors.
+`.agentlabignore` remains the separate portable-evidence selection mechanism.
+A harness receives a filtered `agentlab.diff-presenter-input/v1` request on
+standard input, starts in a private temporary directory, and returns
+human-facing UTF-8 text on stdout. The request includes selected per-file
+records and aggregate hidden/collapsed counts but MUST NOT include
+presentation-ignore patterns, presentation-hidden paths, or their contents.
+Those exact details remain in the local selection and receipt. AgentLab
+supplies no captured workspace path or runtime secret file to the harness. The
+process still runs with the invoking host user's authority and normal
+environment; command configuration is therefore a trust decision, not a
+sandbox boundary.
+
+`agentlab.diff-selection/v1` is a deterministic projection of one source
+`agentlab.file-diffs/v1` bundle. Its identity includes the source run, delta,
+and per-file digests; raw/portable mode; ordered ignore patterns and their
+digest; stable config-source label; exact presentation-hidden paths; exact
+structurally collapsed paths; source/presented counts; presented per-file
+records; and evidence-level ignored-change records. AgentLab reports hidden and
+collapsed counts in normal human output. No universal presentation-ignore list
+is built in.
 
 The presentation prompt identifies every diff body as untrusted evidence and
 limits the requested task to relevance-oriented display. AgentLab verifies the
-run-result identity, selected delta identity, complete per-file bundle, and
-prior presentation records before and after invocation. The explicit
+run-result identity, selected delta identity, complete source per-file bundle,
+deterministic filtered selection, and prior presentation records before and
+after invocation. The explicit
 `agentlab inspect --verify` command remains the full byte-level audit of every
 large run artifact.
-`agentlab.diff-presentation/v1` records the exact harness name and argv, prompt
-version, raw/portable selection, run/delta/per-file identities, timestamps,
-exit status, exact request/stdout/stderr artifacts, warnings, and integrity
-hashes. Command failure, timeout, empty output, or non-UTF-8 output is recorded
-and the human command falls back to the complete deterministic view. The
-presentation is an observation and never changes, deletes, or supersedes its
-underlying evidence.
+`agentlab.diff-presentation/v2` records the exact harness name and argv, prompt
+version, raw/portable selection, run/delta/source-per-file/presented-selection
+identities, config source, ordered patterns and pattern digest, exact hidden and
+collapsed paths, source/presented counts, timestamps, exit status, exact
+selection/request/stdout/stderr artifacts, warnings, and integrity hashes.
+Version-one receipts remain verifiable. Command failure, timeout, empty output,
+or non-UTF-8 output is recorded and the human command falls back to the
+deterministic filtered selection. The presentation is an observation and never
+changes, deletes, or supersedes its underlying evidence.
 
 Because a tested command can deliberately copy an injected secret into
 persistent storage, per-file evidence may be sensitive. Enabling an external

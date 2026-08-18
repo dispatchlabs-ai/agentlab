@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::acceptance::{self, AcceptOptions};
 use crate::apply::{self, ApplyOptions};
 use crate::build_version;
-use crate::config::{AgentLabConfig, DiffPresentation};
+use crate::config::AgentLabConfig;
 use crate::diff;
 use crate::evaluation;
 use crate::lifecycle;
@@ -1374,7 +1374,37 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                 writeln!(stdout, "Status: {}", presentation.status)?;
                 writeln!(stdout, "Run: {}", presentation.run_id)?;
                 writeln!(stdout, "Delta: {}", presentation.delta_digest)?;
-                writeln!(stdout, "Per-file diff: {}", presentation.file_diff_digest)?;
+                writeln!(
+                    stdout,
+                    "Source per-file diff: {}",
+                    presentation.file_diff_digest
+                )?;
+                if let Some(digest) = &presentation.presented_diff_digest {
+                    writeln!(stdout, "Presented diff: {digest}")?;
+                    writeln!(
+                        stdout,
+                        "Changes presented: {} of {}",
+                        presentation.presented_change_count, presentation.source_change_count
+                    )?;
+                    writeln!(
+                        stdout,
+                        "Presentation-hidden changes: {}",
+                        presentation.presentation_ignored_paths.len()
+                    )?;
+                    writeln!(
+                        stdout,
+                        "Collapsed directory changes: {}",
+                        presentation.structurally_collapsed_paths.len()
+                    )?;
+                    if let Some(source) = &presentation.presentation_ignore_source {
+                        writeln!(stdout, "Presentation-ignore source: {source}")?;
+                        writeln!(
+                            stdout,
+                            "Presentation-ignore rules: {}",
+                            presentation.presentation_ignore_digest
+                        )?;
+                    }
+                }
                 writeln!(stdout, "Raw selection: {}", presentation.raw)?;
                 writeln!(stdout, "Harness: {}", presentation.harness_name)?;
                 writeln!(stdout, "Command: {}", display_names(&presentation.command))?;
@@ -1395,6 +1425,15 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
                         writeln!(
                             stdout,
                             "{label}: {}",
+                            store
+                                .run_path(&presentation.run_id, &artifact.path)?
+                                .display()
+                        )?;
+                    }
+                    if let Some(artifact) = &presentation.presented_diff {
+                        writeln!(
+                            stdout,
+                            "Presented selection: {}",
                             store
                                 .run_path(&presentation.run_id, &artifact.path)?
                                 .display()
@@ -1694,8 +1733,8 @@ fn inspect_command(arguments: &[String], stdout: &mut dyn Write) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffView {
     Inventory,
-    Complete,
-    Important,
+    NoAgent,
+    Agent,
 }
 
 fn diff_command(
@@ -1715,8 +1754,14 @@ fn diff_command(
             "--json" => json = true,
             "--raw" => raw = true,
             "--inventory" => set_diff_view(&mut requested_view, DiffView::Inventory)?,
-            "--complete" => set_diff_view(&mut requested_view, DiffView::Complete)?,
-            "--important" => set_diff_view(&mut requested_view, DiffView::Important)?,
+            "--no-agent" => set_diff_view(&mut requested_view, DiffView::NoAgent)?,
+            "--agent" => set_diff_view(&mut requested_view, DiffView::Agent)?,
+            "--complete" => bail!(
+                "--complete is no longer needed; the deterministic per-file diff is the baseline. Use --no-agent to bypass configured agent curation"
+            ),
+            "--important" => {
+                bail!("--important was renamed to --agent; use `agentlab diff --agent RUN`")
+            }
             "--harness" => {
                 harness_name = Some(required_value(arguments, &mut index, "--harness")?.to_owned())
             }
@@ -1726,7 +1771,7 @@ fn diff_command(
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "AgentLab diff\n\nShow persistent filesystem changes as deterministic per-file diffs or a configured agent-curated important-changes presentation. The default respects portable change-ignore rules and ~/.agentlab/config.toml.\n\nUsage:\n  agentlab diff [--complete | --important | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n\nOptions:\n  --complete                Show every selected per-file content diff without AI\n  --important               Ask the configured trusted host harness to present important changes\n  --inventory               Show only the path-level change inventory\n  --harness NAME            Override the configured harness; implies --important\n  --file PATH               Show one authoritative per-file diff; implies --complete\n  --raw                     Include every captured machine change; alone preserves the raw inventory view\n  --json                    Without a presentation flag, preserve the deterministic delta-manifest JSON\n\nConfiguration:\n  ~/.agentlab/config.toml may define default_harness, named [harnesses.NAME] commands, and [diff] presentation = \"complete\" or \"important\". Harnesses receive the complete diff-review request on stdin and run from a private temporary directory. A failed presentation falls back to the complete deterministic view. Workspace-local harness configuration is never loaded."
+                    "AgentLab diff\n\nShow persistent filesystem changes as deterministic per-file diffs, optionally curated by a configured agent. The default uses presentation-only ignore patterns from ~/.agentlab/config.toml without changing captured evidence.\n\nUsage:\n  agentlab diff [--agent | --no-agent | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n\nOptions:\n  --agent                   Force the configured trusted host harness for this view\n  --no-agent                Show the deterministic presentation without agent curation\n  --inventory               Show only the path-level evidence inventory\n  --harness NAME            Select a configured harness; implies --agent\n  --file PATH               Show one exact raw-evidence path regardless of ignore rules\n  --raw                     Show every captured machine change; bypass ignores and agent curation\n  --json                    Write the deterministic delta JSON unless --agent or --file is explicit\n\nConfiguration:\n  ~/.agentlab/config.toml may define default_harness, named [harnesses.NAME] commands, and [diff] use_agent and ignore. Ignore patterns use Git syntax and affect presentation only. Harnesses receive only the filtered diff selection on stdin and run from a private temporary directory. A failed agent presentation falls back to that deterministic selection. Workspace-local harness configuration is never loaded."
                 )?;
                 return Ok(());
             }
@@ -1739,43 +1784,45 @@ fn diff_command(
     let run_id = run_id.ok_or_else(|| anyhow::anyhow!("diff requires RUN"))?;
     if selected_path.is_some() {
         match requested_view {
-            Some(DiffView::Important | DiffView::Inventory) => {
-                bail!("--file cannot be combined with --important or --inventory")
+            Some(DiffView::Agent | DiffView::Inventory) => {
+                bail!("--file cannot be combined with --agent or --inventory")
             }
-            _ => requested_view = Some(DiffView::Complete),
+            _ => requested_view = Some(DiffView::NoAgent),
         }
+        raw = true;
     }
     if harness_name.is_some() {
         match requested_view {
-            Some(DiffView::Complete | DiffView::Inventory) => {
-                bail!("--harness cannot be combined with --complete or --inventory")
+            Some(DiffView::NoAgent | DiffView::Inventory) => {
+                bail!("--harness cannot be combined with --no-agent or --inventory")
             }
-            _ => requested_view = Some(DiffView::Important),
+            _ => requested_view = Some(DiffView::Agent),
         }
+    }
+    if raw && requested_view == Some(DiffView::Agent) {
+        bail!("--raw cannot be combined with --agent or --harness");
     }
 
     let store = Store::open(None)?;
     let delta = run::load_delta(&store, &run_id, raw)?;
-    if json && requested_view.is_none() {
+    if json && requested_view != Some(DiffView::Agent) && selected_path.is_none() {
         serde_json::to_writer_pretty(&mut *stdout, &delta)?;
         writeln!(stdout)?;
         return Ok(());
     }
 
-    let config =
-        if requested_view == Some(DiffView::Important) || (requested_view.is_none() && !raw) {
-            AgentLabConfig::load(&store)?
-        } else {
-            AgentLabConfig::default()
-        };
+    let config = if raw || requested_view == Some(DiffView::Inventory) {
+        AgentLabConfig::default()
+    } else {
+        AgentLabConfig::load(&store)?
+    };
     let view = requested_view.unwrap_or({
         if raw {
-            DiffView::Inventory
+            DiffView::NoAgent
+        } else if config.diff.use_agent() {
+            DiffView::Agent
         } else {
-            match config.diff.presentation {
-                DiffPresentation::Complete => DiffView::Complete,
-                DiffPresentation::Important => DiffView::Important,
-            }
+            DiffView::NoAgent
         }
     });
     if view == DiffView::Inventory {
@@ -1789,27 +1836,34 @@ fn diff_command(
     }
 
     let bundle = diff::ensure_file_diff_bundle(&store, &run_id, raw)?;
-    if view == DiffView::Complete {
+    if let Some(path) = selected_path.as_deref() {
         if json {
-            if let Some(path) = selected_path.as_deref() {
-                let normalized = format!("/{}", path.trim_start_matches('/'));
-                let file = bundle
-                    .files
-                    .iter()
-                    .find(|file| file.path == normalized)
-                    .with_context(|| format!("run has no selected change at {normalized:?}"))?;
-                serde_json::to_writer_pretty(&mut *stdout, file)?;
-            } else {
-                serde_json::to_writer_pretty(&mut *stdout, &bundle)?;
-            }
+            let normalized = format!("/{}", path.trim_start_matches('/'));
+            let file = bundle
+                .files
+                .iter()
+                .find(|file| file.path == normalized)
+                .with_context(|| format!("run has no selected change at {normalized:?}"))?;
+            serde_json::to_writer_pretty(&mut *stdout, file)?;
             writeln!(stdout)?;
-            return Ok(());
+        } else {
+            write!(stdout, "{}", diff::render_complete(&bundle, Some(path))?)?;
         }
-        write!(
-            stdout,
-            "{}",
-            diff::render_complete(&bundle, selected_path.as_deref())?
-        )?;
+        return Ok(());
+    }
+
+    if raw {
+        write!(stdout, "{}", diff::render_complete(&bundle, None)?)?;
+        return Ok(());
+    }
+
+    let selection = diff::select_for_presentation(
+        &bundle,
+        Some("~/.agentlab/config.toml"),
+        &config.diff.ignore,
+    )?;
+    if view == DiffView::NoAgent {
+        write!(stdout, "{}", diff::render_selection(&selection)?)?;
         return Ok(());
     }
 
@@ -1817,15 +1871,15 @@ fn diff_command(
     let Some((selected_harness_name, harness)) = selected_harness else {
         if json {
             bail!(
-                "important diff presentation requires a configured harness in {}",
+                "agent diff presentation requires a configured harness in {}",
                 crate::config::config_path(&store).display()
             );
         }
         writeln!(
             stderr,
-            "AgentLab: important diff presentation requested, but no harness is configured; showing the complete deterministic diff."
+            "AgentLab: agent diff presentation requested, but no harness is configured; showing the deterministic presentation selection."
         )?;
-        write!(stdout, "{}", diff::render_complete(&bundle, None)?)?;
+        write!(stdout, "{}", diff::render_selection(&selection)?)?;
         return Ok(());
     };
     let record = {
@@ -1836,6 +1890,7 @@ fn diff_command(
         diff::present_with_observer(
             &store,
             &bundle,
+            &selection,
             selected_harness_name,
             harness,
             config.diff.show_omitted_count,
@@ -1851,9 +1906,10 @@ fn diff_command(
         let presentation = diff::presentation_output(&store, &record)?;
         writeln!(
             stdout,
-            "Important changes from {} captured filesystem changes",
-            bundle.files.len()
+            "Important changes from {} shown filesystem changes ({} captured)",
+            selection.presented_change_count, selection.source_change_count
         )?;
+        write_diff_selection_disclosure(stdout, &selection)?;
         writeln!(stdout, "Reviewed by harness: {}", record.harness_name)?;
         writeln!(stdout, "Presentation: {}\n", record.presentation_id)?;
         write!(stdout, "{presentation}")?;
@@ -1865,23 +1921,65 @@ fn diff_command(
     }
     writeln!(
         stderr,
-        "AgentLab: diff harness {} returned {}; showing the complete deterministic diff.",
+        "AgentLab: diff harness {} returned {}; showing the deterministic presentation selection.",
         record.harness_name, record.status
     )?;
     for warning in &record.warnings {
         writeln!(stderr, "AgentLab: {warning}")?;
     }
-    write!(stdout, "{}", diff::render_complete(&bundle, None)?)?;
+    write!(stdout, "{}", diff::render_selection(&selection)?)?;
     Ok(())
 }
 
 fn set_diff_view(selected: &mut Option<DiffView>, requested: DiffView) -> Result<()> {
     if let Some(existing) = selected {
         if *existing != requested {
-            bail!("choose only one of --complete, --important, or --inventory");
+            bail!("choose only one of --agent, --no-agent, or --inventory");
         }
     }
     *selected = Some(requested);
+    Ok(())
+}
+
+fn write_diff_selection_disclosure(
+    stdout: &mut dyn Write,
+    selection: &diff::DiffSelection,
+) -> Result<()> {
+    if !selection.ignored_paths.is_empty() {
+        writeln!(
+            stdout,
+            "{} {} hidden by {}.",
+            selection.ignored_paths.len(),
+            if selection.ignored_paths.len() == 1 {
+                "change"
+            } else {
+                "changes"
+            },
+            selection
+                .ignore_source
+                .as_deref()
+                .unwrap_or("the diff presentation configuration")
+        )?;
+    }
+    if !selection.collapsed_paths.is_empty() {
+        writeln!(
+            stdout,
+            "{} implied directory {} collapsed.",
+            selection.collapsed_paths.len(),
+            if selection.collapsed_paths.len() == 1 {
+                "change"
+            } else {
+                "changes"
+            }
+        )?;
+    }
+    if !selection.ignored_paths.is_empty() || !selection.collapsed_paths.is_empty() {
+        writeln!(
+            stdout,
+            "Raw evidence: agentlab diff --raw {}",
+            selection.run_id
+        )?;
+    }
     Ok(())
 }
 
@@ -1910,14 +2008,14 @@ fn print_help(output: &mut dyn Write) -> Result<()> {
     let version = build_version();
     writeln!(
         output,
-        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--complete | --important | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes or a configured important-changes presentation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation may use only a trusted host harness configured in ~/.agentlab/config.toml; deterministic evidence remains available without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
+        "AgentLab {version}\n\nContent-addressed workspace snapshots and isolated agent execution.\n\nUsage:\n  agentlab --version\n  agentlab snapshot [--workspace PATH] [--respect-gitignore] [--json]\n  agentlab run [--workspace PATH | --snapshot DIGEST] --image IMAGE [OPTIONS] -- COMMAND [ARG ...]\n  agentlab run --accepted ACCEPTANCE_ID [OPTIONS] -- COMMAND [ARG ...]\n  agentlab list [--json]\n  agentlab inspect [--json] [--verify] [--verbose] SNAPSHOT_RUN_OR_ACCEPTANCE\n  agentlab diff [--agent | --no-agent | --inventory] [--harness NAME] [--file PATH] [--raw] [--json] RUN\n  agentlab compare [--json] LEFT_RUN RIGHT_RUN\n  agentlab evaluate [--name NAME] [--json] RUN... -- COMMAND [ARG ...]\n  agentlab report [--evaluator NAME] [--score KEY]... [--json] RUN...\n  agentlab review [--json] RUN --workspace CURRENT -- COMMAND [ARG ...]\n  agentlab apply [--json] [--acknowledge-conflicts] [--acknowledge-unresolved] REVIEW_ID --workspace CURRENT\n  agentlab accept [--json] RUN [--from-apply APPLY_ID]\n  agentlab stop [--json] RUN\n  agentlab resume [--json] [--pi-auth] [--secret-file NAME=HOST_PATH]... RUN [-- COMMAND [ARG ...]]\n  agentlab fork [--json] RUN\n  agentlab rm [--json] RUN\n\nCommands:\n  snapshot    capture every supported workspace path into an immutable snapshot\n  run         execute once from a captured, stored, or explicitly accepted input\n  list        list locally recorded runs and live container state\n  inspect     inspect and verify snapshots, runs, accepted inputs, and their lineage\n  diff        show deterministic per-file changes with optional agent curation\n  compare     report equality and differences across actual resolved run inputs\n  evaluate    invoke an arbitrary external evaluator for one or more results\n  report      align real run-input identities and evaluator scores without interpreting them\n  review      obtain a validated proposal from a trusted host command without applying it\n  apply       apply exactly one review's authorized workspace operations with a backup\n  accept      explicitly accept the exact workspace and OCI image input tested by a run\n  stop        stop the stable retained-container process\n  resume      restart the container and optionally execute a credentialed continuation\n  fork        create a private filesystem-level fork\n  rm          delete one unreferenced run's container, image tag, and local artifacts\n\nRun `agentlab COMMAND --help` for command-specific usage. Workspace capture includes every supported path by default. Use --respect-gitignore only when exclusions are deliberate. Diff presentation ignores and a trusted host harness may be configured only in ~/.agentlab/config.toml; they never alter evidence, and --raw always shows every captured machine change without AI. Review gives a trusted host command sensitive copies and applies nothing; apply is the separate mutating authorization. Accept records explicit tested lineage without promoting retest session output. Filesystem state survives stop/resume, but process trees and live memory do not. Evaluator scores and exit status are observations, not universal judgments."
     )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shell_word;
+    use super::{run, shell_word};
 
     #[test]
     fn follow_up_workspace_paths_are_shell_safe() {
@@ -1926,5 +2024,46 @@ mod tests {
             shell_word("/tmp/Chris's workspace"),
             "'/tmp/Chris'\"'\"'s workspace'"
         );
+    }
+
+    #[test]
+    fn diff_help_exposes_the_small_presentation_interface() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = run(
+            vec!["diff".to_owned(), "--help".to_owned()],
+            &mut stdout,
+            &mut stderr,
+        );
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert_eq!(status, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("--agent"));
+        assert!(stdout.contains("--no-agent"));
+        assert!(stdout.contains("--raw"));
+        assert!(!stdout.contains("--complete"));
+        assert!(!stdout.contains("--important"));
+    }
+
+    #[test]
+    fn retired_diff_flags_have_actionable_migration_errors() {
+        for (flag, expected) in [
+            ("--complete", "deterministic per-file diff is the baseline"),
+            ("--important", "was renamed to --agent"),
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let status = run(
+                vec!["diff".to_owned(), flag.to_owned(), "run-id".to_owned()],
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(status, 1);
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr).unwrap().contains(expected),
+                "missing migration guidance for {flag}"
+            );
+        }
     }
 }

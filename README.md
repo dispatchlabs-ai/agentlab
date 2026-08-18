@@ -118,7 +118,7 @@ SNAPSHOT=$(./target/release/agentlab snapshot \
 ```bash
 ./target/release/agentlab inspect --verify RUN_ID
 ./target/release/agentlab diff RUN_ID
-./target/release/agentlab diff --complete RUN_ID
+./target/release/agentlab diff --no-agent RUN_ID
 ./target/release/agentlab diff --file /workspace/path/to/file RUN_ID
 ./target/release/agentlab diff --raw RUN_ID
 ```
@@ -127,15 +127,19 @@ AgentLab creates a content-addressed record for every selected changed path.
 Text files receive ordinary unified patches; binary files, directories,
 symlinks, permissions, and unavailable historical content receive explicit
 metadata records rather than misleading text. Without configuration,
-`agentlab diff RUN_ID` shows the complete deterministic per-file view.
-`--raw` alone preserves the lower-level path inventory for every machine
-change, while `--complete --raw` renders content for that unfiltered set.
-`--json` without a presentation flag preserves the original deterministic
-delta-manifest contract for scripts.
+`agentlab diff RUN_ID` shows the deterministic per-file presentation.
+`--raw` renders every captured machine change without presentation ignores,
+directory collapsing, or an agent. `--file PATH` reads that same raw evidence
+and selects one exact path regardless of either kind of ignore rule. `--json`
+without an explicit `--agent` or `--file` preserves the deterministic
+delta-manifest contract for scripts and never invokes a model.
 
-An optional trusted host harness can reduce the complete diff to the parts a
-human needs to see. Configuration is global and private, never loaded from the
-workspace under test:
+The normal presentation can hide explicitly configured paths and can ask an
+optional trusted host harness to reduce the remaining diff to the parts a
+human needs to see. These are presentation choices only: the immutable raw and
+portable deltas and content-addressed per-file evidence remain unchanged.
+Configuration is global and private, never loaded from the workspace under
+test:
 
 ```toml
 # ~/.agentlab/config.toml
@@ -157,33 +161,52 @@ input = "stdin"
 timeout_seconds = 600
 
 [diff]
-presentation = "important"
+use_agent = true
+ignore = [
+  "/tmp/jiti/**",
+  "/workspace/.pi/sessions/*.lock.*",
+  "/root/.pi/agent/models-store.json",
+]
 show_omitted_count = true
-fallback = "complete"
 ```
 
-The named command receives one complete review request on standard input and
-runs from a private temporary directory. Add model, provider, or thinking
+`diff.ignore` accepts ordered Git-compatible patterns. AgentLab filters those
+paths before any content is sent to the configured harness and reports how
+many changes were hidden. It also collapses an added directory record when
+added child paths already account for that directory. Both decisions are
+deterministic and reversible with `--raw`; no default ignore list is built in.
+Use `.agentlabignore` only when a path should be excluded from the portable
+run delta itself.
+
+The named command receives one filtered review request on standard input and
+runs from a private temporary directory. Hidden patterns, paths, and contents
+remain local; the request includes only their aggregate count. Add model,
+provider, or thinking
 flags directly to its argument array when desired. The presenter is an
-observer: AgentLab re-verifies the run-result identity, selected delta,
-per-file bundle, and prior presentation receipts; records the exact request,
-command, output, timing, status, and input digest; and applies nothing. Use
-`agentlab inspect --verify RUN_ID` for a full byte-level audit of every large
-run artifact. A missing, failed, timed-out, empty, or non-UTF-8 presentation falls
-back to the complete deterministic view. CLI choices override the config:
+observer: AgentLab re-verifies the run-result identity, selected delta, source
+per-file evidence, filtered selection, and prior presentation receipts;
+records the exact source and presented digests, ignore-rule digest and paths,
+collapsed directories, request, command, output, timing, and status; and
+applies nothing. Use `agentlab inspect --verify RUN_ID` for a full byte-level
+audit of every large run artifact. A missing, failed, timed-out, empty, or
+non-UTF-8 presentation falls back to the deterministic filtered selection.
+CLI choices override the config:
 
 ```bash
-agentlab diff --important RUN_ID
-agentlab diff --important --harness ANOTHER_NAME RUN_ID
-agentlab diff --complete RUN_ID
+agentlab diff --agent RUN_ID
+agentlab diff --agent --harness ANOTHER_NAME RUN_ID
+agentlab diff --no-agent RUN_ID
 agentlab diff --inventory RUN_ID
+agentlab diff --raw RUN_ID
 ```
 
 Enabling agent presentation may send captured file content to the configured
 model provider. The original command can copy a runtime credential into a new
 file, and such a copied file is ordinary captured evidence; use this feature
-only with a trusted harness and provider. The full per-file bundle remains the
-authority regardless of what the presenter omits.
+only with a trusted harness and provider. Presentation ignore patterns are
+therefore also a privacy boundary for the harness request, but never a deletion
+mechanism. The source per-file bundle remains the authority regardless of what
+the configured filter or presenter omits.
 
 Use `--capture /guest/path=NAME` to export a selected path as a tar artifact and `--change-ignore PATH` to override the snapshotted workspace-root `.agentlabignore`. Network access defaults to Docker `bridge` mode so model-backed harnesses work without another flag. Use `--network none` when the run must be offline.
 
